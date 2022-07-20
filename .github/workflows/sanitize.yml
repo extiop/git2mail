@@ -1,0 +1,38 @@
+name: Ensure repository healthy state over time
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  changelog-format:
+    # Ensure CHANGELOG respect the KeepAChangelog format
+    strategy:
+      matrix:
+        changelog: [git2mail]
+        include:
+          - changelog: git2mail
+
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Get ${{ matrix.changelog }} Changelog Entry
+      uses: mindsers/changelog-reader-action@v2
+      id: changelog_reader
+      with:
+        # Check format for the last 10 entries
+        validation_depth: 10
+        path: CHANGELOG.md
+    - name: Information
+      run: |
+          echo -e "\e[1mVersion\e[0m ${{ steps.changelog_reader.outputs.version }}"
+          echo -e "\e[1mStatus\e[0m ${{ steps.changelog_reader.outputs.status }}"
+          echo -en "\e[1mBody\e[0m"
+          cat << 'EOF'
+          ${{ steps.changelog_reader.outputs.changes }}
+          EOF

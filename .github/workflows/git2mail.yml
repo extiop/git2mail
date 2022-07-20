@@ -1,0 +1,127 @@
+name: git2mail release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  GITHUB_REF: "${{ github.ref }}"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        build: [linux, macos, windows]
+        include:
+          - build: linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cargo_build: --target x86_64-unknown-linux-musl
+          - build: macos
+            os: macos-latest
+          - build: windows
+            os: windows-latest
+            extension: .exe
+
+    runs-on: ${{matrix.os}}
+
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+    - name: If target is musl, install musl-tools (including musl-gcc) and set target
+      if: matrix.target == 'x86_64-unknown-linux-musl'
+      run: |
+        sudo apt update
+        sudo apt install musl-tools -y
+        rustup target add ${{ matrix.target }}
+    - name: Build
+      uses: actions-rs/cargo@v1
+      with:
+        command: build
+        args: --release --all-features --package git2mail --verbose ${{ matrix.cargo_build }}
+    - name: Strip resulting binary
+      if: matrix.build == 'linux'
+      run: strip ./target/${{ matrix.target }}/release/git2mail${{ matrix.extension }}
+    - name: Upload resulting 'git2mail'
+      uses: actions/upload-artifact@v1
+      with:
+        name: git2mail-${{ matrix.build }}
+        path: ./target/${{ matrix.target }}/release/git2mail${{ matrix.extension }}
+
+  release:
+    # From https://github.com/cloudflare/wrangler/blob/master/.github/workflows/release.yml
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query version number
+        id: get_version
+        shell: bash
+        run: |
+          echo "using version tag ${GITHUB_REF:15}"
+          echo ::set-output name=version::"${GITHUB_REF:15}"
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Get Changelog Entry
+        id: changelog_reader
+        uses: mindsers/changelog-reader-action@v2
+        with:
+          path: CHANGELOG.md
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: git2mail-${{ steps.get_version.outputs.VERSION }}
+          release_name: git2mail-${{ steps.get_version.outputs.VERSION }}
+          body: ${{ steps.changelog_reader.outputs.changes }}
+          draft: true
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v1
+        with:
+          name: git2mail-linux
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v1
+        with:
+          name: git2mail-windows
+
+      - name: Download MacOS artifact
+        uses: actions/download-artifact@v1
+        with:
+          name: git2mail-macos
+
+      - name: Release Linux artifact
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./git2mail-linux/git2mail
+          asset_content_type: application/octet-stream
+          asset_name: git2mail-linux-static-${{ steps.get_version.outputs.VERSION }}
+
+      - name: Release Windows artifact
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./git2mail-windows/git2mail.exe
+          asset_content_type: application/octet-stream
+          asset_name: git2mail-windows-${{ steps.get_version.outputs.VERSION }}
+
+      - name: Release MacOS artifact
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./git2mail-macos/git2mail
+          asset_content_type: application/octet-stream
+          asset_name: git2mail-macos-${{ steps.get_version.outputs.VERSION }}
