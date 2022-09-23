@@ -1,6 +1,6 @@
 [package]
 name = "git2mail"
-version = "0.3.3"
+version = "0.3.4"
 authors = ["exti0p"]
 edition = "2021"
 license = "LGPL-3.0-only"

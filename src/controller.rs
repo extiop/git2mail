@@ -283,25 +283,31 @@ impl SearchTrait for Search {
                                 Some(commits) => {
                                     for iterator in 0..COMMITS_PER_PAGE {
                                         match commits.get(iterator as usize) {
-                                            Some(commit) => match commit.get("author") {
-                                                Some(author) => match author.get("email") {
-                                                    Some(email) => {
-                                                        // found profile email
-                                                        let email =
-                                                            email.to_string().replace('"', "");
-                                                        // also check that the email is not a noreply email from GitHub or else
-                                                        if !email.is_empty()
-                                                            && !found_emails.contains(&email)
-                                                            && !email.contains("noreply")
-                                                        {
-                                                            found_emails.push(email);
+                                            Some(commit) => {
+                                                match commit.get("author") {
+                                                    Some(author) => {
+                                                        match author.get("email") {
+                                                            Some(email) => {
+                                                                // found profile email
+                                                                let email = email
+                                                                    .to_string()
+                                                                    .replace('"', "");
+                                                                // also check that the email is not a noreply email from GitHub or else
+                                                                if !email.is_empty()
+                                                                    && !found_emails
+                                                                        .contains(&email)
+                                                                    && !email.contains("noreply")
+                                                                {
+                                                                    found_emails.push(email);
+                                                                }
+                                                                break;
+                                                            }
+                                                            _ => continue,
                                                         }
-                                                        break;
                                                     }
                                                     _ => continue,
-                                                },
-                                                _ => continue,
-                                            },
+                                                }
+                                            }
                                             _ => continue,
                                         }
                                     }
@@ -675,21 +681,26 @@ fn write_result(dir_path: &Path, file_name: String, found_emails: Vec<String>) {
             // prevent multiple syscall to get pwd
             static ref PROJECT_ROOT: PathBuf = match get_project_root() {
                 Ok(path) => path,
-                _ => panic!("[-] Couldn't get project root"),
+                _ => match env::current_dir() {
+                    Ok(path) => path,
+                    _ => panic!("[-] Couldn't get project root"),
+                },
             };
         }
 
-        let file_path: String = format!("{}/{}", dir_path.display(), file_name);
-        let absolute_path: String = format!("{}/{}", PROJECT_ROOT.display(), file_path);
+        let dir_absolute_path: String =
+            format!("{}/{}", PROJECT_ROOT.display(), dir_path.display());
+        let absolute_path: String = format!("{}/{}", dir_absolute_path, file_name);
 
         println!("[+] Result is available at {}", absolute_path);
 
-        if let Some(p) = dir_path.to_str() {
+        if let Some(p) = Path::new(&dir_absolute_path).to_str() {
             match create_dir_all(p) {
                 Ok(path) => path,
                 _ => error!("[-] Failed to create directory"),
             }
         };
+
         let mut file = File::create(absolute_path).expect("Unable to create output file");
         for email in &found_emails {
             let formatted_email: String = format!("{}\n", email);
@@ -717,7 +728,7 @@ mod tests {
             "".to_string(),
             "Chess.com API".to_string(),
             "Rust".to_string(),
-            "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".to_string(),
+            "".to_string(),
             "".to_string(),
             1,
         );
@@ -742,7 +753,7 @@ mod tests {
             "https://github.com/anowell".to_string(),
             "".to_string(),
             "".to_string(),
-            "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".to_string(),
+            "".to_string(),
             "".to_string(),
             1,
         );
@@ -768,7 +779,7 @@ mod tests {
             "https://github.com/elibenporat/hikaru".to_string(),
             "".to_string(),
             "".to_string(),
-            "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".to_string(),
+            "".to_string(),
             "".to_string(),
             1,
         );

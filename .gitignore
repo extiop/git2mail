@@ -11,7 +11,4 @@ tokens.json
 !.gitkeep
 
 # results directory
-results/keyword
-results/query
-results/repository
-results/profile
+/results
