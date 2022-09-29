@@ -1,6 +1,6 @@
 [package]
 name = "git2mail"
-version = "0.3.4"
+version = "0.3.5"
 authors = ["exti0p"]
 edition = "2021"
 license = "LGPL-3.0-only"
@@ -13,14 +13,14 @@ categories = ["command-line-utilities"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = "3.2.12"
-itertools = "0.10.3"
+clap = "4.0.4"
+itertools = "0.10.5"
 lazy_static = "1.4.0"
-openssl = { version = "0.10.41", features = ["vendored"] }
+openssl = { version = "0.10.42", features = ["vendored"] }
 regex = "1.6.0"
-reqwest = { version = "0.11.11", features = ["blocking", "json"] }
-serde = { version = "1.0.139", features = ["derive"] }
-serde_json = "1.0.82"
+reqwest = { version = "0.11.12", features = ["blocking", "json"] }
+serde = { version = "1.0.145", features = ["derive"] }
+serde_json = "1.0.85"
 
 # logging
 log = "0.4.17"

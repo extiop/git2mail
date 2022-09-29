@@ -11,69 +11,75 @@ use controller::{Search, SearchTrait};
 fn run() {
     log::info!("Starting git2mail!");
 
-    let argv: ArgMatches = Command::new("git2mail")
-        .author("exti0p")
-        .about("Pure Rust OSINT tool to find a GitHub user's email")
-        .arg(
-            Arg::new("url")
-                .short('u')
-                .long("url")
-                .help("GitHub repository or profile URL you want to scan")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::new("query")
-                .short('q')
-                .long("query")
-                .help("Query to find interesting GitHub repositories for you")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::new("language")
-                .short('l')
-                .long("language")
-                .help("Select a language to enhance your repository searches")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::new("limit")
-                .long("limit")
-                .default_value("5")
-                .help("Defines the limit of scanned repositories")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::new("token")
-                .short('t')
-                .long("token")
-                .help("Authenticate to the GitHub API with your GitHub token")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::new("token-file")
-                .long("token-file")
-                .help(
-                    "JSON file that contains your GitHub tokens to authenticate to the GitHub API",
-                )
-                .takes_value(true),
-        )
-        .get_matches();
+    let argv: ArgMatches =
+        Command::new("git2mail")
+            .author("exti0p")
+            .about("Pure Rust OSINT tool to find a GitHub user's email")
+            .arg(
+                Arg::new("url")
+                    .short('u')
+                    .long("url")
+                    .help("GitHub repository or profile URL you want to scan"),
+            )
+            .arg(
+                Arg::new("query")
+                    .short('q')
+                    .long("query")
+                    .help("Query to find interesting GitHub repositories for you"),
+            )
+            .arg(
+                Arg::new("language")
+                    .short('l')
+                    .long("language")
+                    .help("Select a language to enhance your repository searches"),
+            )
+            .arg(
+                Arg::new("limit")
+                    .long("limit")
+                    .default_value("5")
+                    .help("Defines the limit of scanned repositories"),
+            )
+            .arg(
+                Arg::new("token")
+                    .short('t')
+                    .long("token")
+                    .help("Authenticate to the GitHub API with your GitHub token"),
+            )
+            .arg(Arg::new("token-file").long("token-file").help(
+                "JSON file that contains your GitHub tokens to authenticate to the GitHub API",
+            ))
+            .get_matches();
+
+    let url: String = argv
+        .get_one::<String>("url")
+        .unwrap_or(&"".to_string())
+        .to_string();
+    let query: String = argv
+        .get_one::<String>("query")
+        .unwrap_or(&"".to_string())
+        .to_string();
 
     let mut search = <Search as SearchTrait>::new(
-        argv.value_of("url").unwrap_or_default().to_string(),
-        argv.value_of("query").unwrap_or_default().to_string(),
-        argv.value_of("language").unwrap_or_default().to_string(),
-        argv.value_of("token").unwrap_or_default().to_string(),
-        argv.value_of("token-file").unwrap_or_default().to_string(),
-        argv.value_of("limit")
-            .unwrap_or_default()
+        url.clone(),
+        query.clone(),
+        argv.get_one::<String>("language")
+            .unwrap_or(&"".to_string())
+            .to_string(),
+        argv.get_one::<String>("token")
+            .unwrap_or(&"".to_string())
+            .to_string(),
+        argv.get_one::<String>("token-file")
+            .unwrap_or(&"".to_string())
+            .to_string(),
+        argv.get_one::<String>("limit")
+            .unwrap_or(&"".to_string())
             .parse::<u8>()
             .unwrap_or_default(),
     );
 
-    if argv.is_present("url") {
+    if !url.is_empty() {
         search.scan_target();
-    } else if argv.is_present("query") {
+    } else if !query.is_empty() {
         search.aggregate_search();
     }
 }
