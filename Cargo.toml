@@ -13,14 +13,14 @@ categories = ["command-line-utilities"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = "4.0.4"
+clap = "4.0.29"
 itertools = "0.10.5"
 lazy_static = "1.4.0"
-openssl = { version = "0.10.42", features = ["vendored"] }
-regex = "1.6.0"
-reqwest = { version = "0.11.12", features = ["blocking", "json"] }
-serde = { version = "1.0.145", features = ["derive"] }
-serde_json = "1.0.85"
+openssl = { version = "0.10.44", features = ["vendored"] }
+regex = "1.7.0"
+reqwest = { version = "0.11.13", features = ["blocking", "json"] }
+serde = { version = "1.0.151", features = ["derive"] }
+serde_json = "1.0.90"
 
 # logging
 log = "0.4.17"

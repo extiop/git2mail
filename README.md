@@ -165,6 +165,7 @@ This project is limited to GitHub repositories.
 - [x] From a GitHub repository, search for commits and email of authors with GitHub metadata and parsing
 - [x] From a GitHub keyword search, retrieve GitHub repositories URLs
 - [ ] Correlate emails, language and project preferences with `results/$language/$author` which contains `$author` email
+- [ ] Handle properly errors and limit, or even remove, panics
 - [ ] Support more advanced parameters (_cf._ <https://github.com/search/advanced>)
 
 ## 💭 Thoughts
