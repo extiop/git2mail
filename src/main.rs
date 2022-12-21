@@ -1,15 +1,12 @@
 mod controller;
 mod parsers;
 
-extern crate clap;
-extern crate log;
-extern crate pretty_env_logger;
-
 use clap::{Arg, ArgMatches, Command};
 use controller::{Search, SearchTrait};
+use log::info;
 
-fn run() {
-    log::info!("Starting git2mail!");
+fn run<'a>() -> Result<(), &'a str> {
+    info!("Starting git2mail!");
 
     let argv: ArgMatches =
         Command::new("git2mail")
@@ -59,8 +56,7 @@ fn run() {
         .unwrap_or(&"".to_string())
         .to_string();
 
-    let mut search = <Search as SearchTrait>::new(
-        url.clone(),
+    let search = <Search as SearchTrait>::new(
         query.clone(),
         argv.get_one::<String>("language")
             .unwrap_or(&"".to_string())
@@ -73,18 +69,26 @@ fn run() {
             .to_string(),
         argv.get_one::<String>("limit")
             .unwrap_or(&"".to_string())
-            .parse::<u8>()
+            .parse::<usize>()
             .unwrap_or_default(),
     );
 
     if !url.is_empty() {
-        search.scan_target();
+        search
+            .scan_target(false, url)
+            .expect("[-] Scan target failed");
+        Ok(())
     } else if !query.is_empty() {
-        search.aggregate_search();
+        search
+            .aggregate_search()
+            .expect("[-] Aggregate search failed");
+        Ok(())
+    } else {
+        Err("[-] Missing mandatory parameters!")
     }
 }
 
 fn main() {
     pretty_env_logger::init();
-    run();
+    run().expect("[-] git2mail run failed");
 }

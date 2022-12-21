@@ -1,4 +1,3 @@
-use lazy_static::lazy_static;
 use regex::Regex;
 
 struct RegexFields;
@@ -11,62 +10,59 @@ impl RegexFields {
 }
 
 /// From a project URL, retrieves its author with regex processing.
-pub fn get_author(github_url: &str) -> &str {
-    lazy_static! {
-        static ref REGEX: Regex = match Regex::new(RegexFields::GITHUB_URL) {
-            Ok(regex) => regex,
-            _ => panic!("[-] Regex processing went wrong!"),
-        };
-        static ref REGEX_PROFILE: Regex = match Regex::new(RegexFields::GITHUB_URL_PROFILE) {
-            Ok(regex) => regex,
-            _ => panic!("[-] Regex processing went wrong!"),
-        };
-    }
-    let author: &str = match REGEX.captures(github_url) {
-        Some(captures) => {
-            // we know that it is in group 6 that the author
-            match captures.get(6) {
-                Some(item) => item.as_str(),
-                _ => panic!("[-] Repository author not found, aborting scan"),
+pub fn get_author<'a>(github_url: String) -> Result<String, &'a str> {
+    match Regex::new(RegexFields::GITHUB_URL) {
+        Ok(regex) => {
+            match Regex::new(RegexFields::GITHUB_URL_PROFILE) {
+                Ok(regex_profile) => {
+                    match regex.captures(github_url.as_str()) {
+                        Some(captures) => {
+                            // we know that it is in group 6 that the author is
+                            match captures.get(6) {
+                                Some(item) => Ok(item.as_str().to_string()),
+                                _ => Err("[-] Repository author not found, aborting scan"),
+                            }
+                        }
+                        _ => match regex_profile.captures(github_url.as_str()) {
+                            Some(captures) => match captures.get(6) {
+                                Some(item) => Ok(item.as_str().to_string()),
+                                _ => Err("[-] Author could not be found, aborting scan"),
+                            },
+                            _ => Err("[-] Repository author not found, aborting scan"),
+                        },
+                    }
+                }
+                _ => Err("[-] Regex processing went wrong!"),
             }
         }
-        _ => match REGEX_PROFILE.captures(github_url) {
-            Some(captures) => match captures.get(6) {
-                Some(item) => item.as_str(),
-                _ => panic!("[-] Author could not be found, aborting scan"),
-            },
-            _ => panic!("[-] Repository author not found, aborting scan"),
-        },
-    };
-    author
+        _ => Err("[-] Regex processing went wrong!"),
+    }
 }
 
 /// From a project URL, retrieves its repository with regex processing.
-pub fn get_repository(github_url: &str) -> &str {
-    lazy_static! {
-        static ref REGEX: Regex = match Regex::new(RegexFields::GITHUB_URL) {
-            Ok(regex) => regex,
-            _ => panic!("[-] Regex processing went wrong!"),
-        };
+pub fn get_repository<'a>(github_url: String) -> Result<String, &'a str> {
+    match Regex::new(RegexFields::GITHUB_URL) {
+        Ok(regex) => {
+            match regex.captures(github_url.as_str()) {
+                Some(captures) => {
+                    // we know that it is in group 7 that the author
+                    match captures.get(7) {
+                        Some(item) => Ok(item.as_str().to_string()),
+                        _ => Err("[-] Repository name not found, aborting scan"),
+                    }
+                }
+                _ => {
+                    // only author case, URL targets an user profile
+                    if !get_author(github_url)?.is_empty() {
+                        Ok("".to_string())
+                    } else {
+                        Err("[-] Repository name not found, aborting scan")
+                    }
+                }
+            }
+        }
+        _ => Err("[-] Regex processing went wrong!"),
     }
-    let repository: &str = match REGEX.captures(github_url) {
-        Some(captures) => {
-            // we know that it is in group 7 that the author
-            match captures.get(7) {
-                Some(item) => item.as_str(),
-                _ => panic!("[-] Repository name not found, aborting scan"),
-            }
-        }
-        _ => {
-            // only author case, URL targets an user profile
-            if !get_author(github_url).is_empty() {
-                ""
-            } else {
-                panic!("[-] Repository name not found, aborting scan");
-            }
-        }
-    };
-    repository
 }
 
 #[cfg(test)]
@@ -78,82 +74,119 @@ mod tests {
 
     #[test]
     fn get_author_git() {
-        assert_eq!(get_author("git://github.com/exti0p/ctf"), "exti0p");
+        assert_eq!(
+            get_author("git://github.com/exti0p/ctf".to_string()),
+            Ok("exti0p".to_string())
+        );
     }
 
     #[test]
     fn get_author_git_at() {
-        assert_eq!(get_author("git@github.com/exti0p/ctf"), "exti0p");
+        assert_eq!(
+            get_author("git@github.com/exti0p/ctf".to_string()),
+            Ok("exti0p".to_string())
+        );
     }
 
     #[test]
     fn get_author_https() {
-        assert_eq!(get_author("https://github.com/exti0p/ctf"), "exti0p");
+        assert_eq!(
+            get_author("https://github.com/exti0p/ctf".to_string()),
+            Ok("exti0p".to_string())
+        );
     }
 
     #[test]
     fn get_author_ssh() {
-        assert_eq!(get_author("ssh://github.com/exti0p/ctf"), "exti0p");
+        assert_eq!(
+            get_author("ssh://github.com/exti0p/ctf".to_string()),
+            Ok("exti0p".to_string())
+        );
     }
 
     #[test]
-    #[should_panic(expected = "[-] Repository author not found, aborting scan")]
     fn get_author_too_short() {
-        assert_eq!(get_author("https://github.com"), "exti0p");
+        assert_eq!(
+            get_author("https://github.com".to_string()),
+            Err("[-] Repository author not found, aborting scan")
+        );
     }
 
     #[test]
     fn get_author_too_long() {
         // author is not retrieved as expected
-        assert_eq!(get_author("https://github.com/github/exti0p/ctf"), "github");
+        assert_eq!(
+            get_author("https://github.com/github/exti0p/ctf".to_string()),
+            Ok("github".to_string())
+        );
     }
 
     #[test]
     fn get_author_swapped() {
         // author is not retrieved as expected as author and repository are swapped
-        assert_eq!(get_author("https://github.com/ctf/exti0p"), "ctf");
+        assert_eq!(
+            get_author("https://github.com/ctf/exti0p".to_string()),
+            Ok("ctf".to_string())
+        );
     }
 
     // repository
 
     #[test]
     fn get_get_repository_git() {
-        assert_eq!(get_repository("git://github.com/exti0p/ctf"), "ctf");
+        assert_eq!(
+            get_repository("git://github.com/exti0p/ctf".to_string()),
+            Ok("ctf".to_string())
+        );
     }
 
     #[test]
     fn get_get_repository_git_at() {
-        assert_eq!(get_repository("git@github.com/exti0p/ctf"), "ctf");
+        assert_eq!(
+            get_repository("git@github.com/exti0p/ctf".to_string()),
+            Ok("ctf".to_string())
+        );
     }
 
     #[test]
     fn get_get_repository_https() {
-        assert_eq!(get_repository("https://github.com/exti0p/ctf"), "ctf");
+        assert_eq!(
+            get_repository("https://github.com/exti0p/ctf".to_string()),
+            Ok("ctf".to_string())
+        );
     }
 
     #[test]
     fn get_get_repository_ssh() {
-        assert_eq!(get_repository("ssh://github.com/exti0p/ctf"), "ctf");
+        assert_eq!(
+            get_repository("ssh://github.com/exti0p/ctf".to_string()),
+            Ok("ctf".to_string())
+        );
     }
 
     #[test]
-    // #[should_panic(expected = "[-] Repository name not found, aborting scan")]
     fn get_repository_no_project() {
-        assert_eq!(get_repository("https://github.com/exti0p"), "");
+        assert_eq!(
+            get_repository("https://github.com/exti0p".to_string()),
+            Ok("".to_string())
+        );
     }
 
     #[test]
     fn get_repository_too_long() {
         // repository is not retrieved as expected
         assert_eq!(
-            get_repository("https://github.com/github/exti0p/ctf"),
-            "exti0p/ctf"
+            get_repository("https://github.com/github/exti0p/ctf".to_string()),
+            Ok("exti0p/ctf".to_string())
         );
     }
 
     #[test]
     fn get_repository_swapped() {
         // repository is not retrieved as expected as author and repository are swapped
-        assert_eq!(get_repository("https://github.com/ctf/exti0p"), "exti0p");
+        assert_eq!(
+            get_repository("https://github.com/ctf/exti0p".to_string()),
+            Ok("exti0p".to_string())
+        );
     }
 }

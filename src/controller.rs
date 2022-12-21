@@ -1,6 +1,5 @@
 use crate::parsers;
 use itertools::Either;
-use lazy_static::lazy_static;
 use log::{error, info};
 use serde_json::{Map, Value};
 use std::ffi::OsString;
@@ -12,21 +11,20 @@ use std::{env, io};
 /// Describes types and methods for a GitHub search query.
 pub trait SearchTrait {
     /// Concatenate emails found from each repository scanning and sort them.
-    fn aggregate_scan(&mut self, found_repositories: Vec<String>) -> Vec<String>;
+    fn aggregate_scan(&self, found_repositories: Vec<String>) -> Result<Vec<String>, &str>;
 
     /// Get repositories according to an user request made with metadata.
     ///
     /// For each found repository, it scans it and get its developers emails.
-    fn aggregate_search(&mut self);
+    fn aggregate_search(&self) -> Result<(), &str>;
 
     /// Creates a custom Search object from given user parameters.
     fn new(
-        url: String,
         query: String,
         language: String,
         token: String,
         token_file: String,
-        limit: u8,
+        limit: usize,
     ) -> Self;
 
     /// Fetches a GitHub profile and its events, via GitHub API.
@@ -34,81 +32,68 @@ pub trait SearchTrait {
     /// It gets every events from it, check their metadata to hopefully retrieve his email.
     /// If no email found with profile events, check all user repositories commits.
     /// The latter can lead to retrieve multiple developers emails.
-    fn scan_profile(&mut self, author: &str);
+    fn scan_profile(&self, author: &str) -> Result<(), &str>;
     /// Fetches a GitHub repository's commits URLs via GitHub API.
     ///
     /// It uses `parsers` module to extract from a GitHub project URL, its author and its repository.
     /// Then it gets every commit from it, check their metadata to hopefully retrieve some author's email.
     ///
     /// Thus, it can lead to retrieve multiple developers emails.
-    fn scan_target(&mut self) -> Either<Vec<String>, ()>;
+    fn scan_target(&self, aggregate: bool, url: String) -> Result<Either<Vec<String>, ()>, &str>;
 }
 
 /// Representation of a GitHub search query.
 #[derive(Default, Clone)]
 pub struct Search {
-    pub url: Option<String>,
     pub query: Option<String>,
     pub language: Option<String>,
     pub token: Option<String>,
     pub token_file: Option<String>,
-    pub limit: Option<u8>,
-    aggregate: bool,
+    pub limit: Option<usize>,
 }
 
 impl Search {
     const USER_AGENT_HEADER: &'static str =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0";
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:107.0) Gecko/20100101 Firefox/107.0";
     const GITHUB_ACCEPT_HEADER: &'static str = "application/vnd.github.v3+json";
 }
 
 /// Describes methods for a GitHub search query.
 impl SearchTrait for Search {
     /// Concatenate emails found from each repository scanning and sort them.
-    fn aggregate_scan(&mut self, found_repositories: Vec<String>) -> Vec<String> {
+    fn aggregate_scan(&self, found_repositories: Vec<String>) -> Result<Vec<String>, &str> {
         let mut found_emails: Vec<String> = Vec::new();
-
-        self.aggregate = true;
 
         // get found_emails from scan_target function
         for repository_url in found_repositories.iter() {
-            self.url = Some(repository_url.to_string());
-            let emails: Vec<String> = match self.scan_target().left() {
-                Some(emails) => emails,
-                _ => panic!("[-] Found emails could not be retrieved"),
-            };
-
-            for email in emails.iter() {
-                // prevent duplicate emails from different repositories
-                if !found_emails.contains(email) {
-                    found_emails.push(email.to_string());
+            match self.scan_target(true, repository_url.clone())?.left() {
+                Some(emails) => {
+                    for email in emails.iter() {
+                        // prevent duplicate emails from different repositories
+                        if !found_emails.contains(email) {
+                            found_emails.push(email.to_string());
+                        }
+                    }
                 }
+                _ => return Err("[-] Found emails could not be retrieved"),
             }
         }
         // sort alphabetically found emails
         found_emails.sort_by_key(|a| a.to_lowercase());
 
-        self.aggregate = false;
-
-        found_emails
+        Ok(found_emails)
     }
 
     /// Get repositories according to an user request made with metadata.
     ///
     /// For each found repository, it scans it and get its developers emails.
-    fn aggregate_search(&mut self) {
-        let query: &str = match self.query.as_ref() {
-            Some(query) => query,
-            _ => panic!("[-] Input query is invalid!"),
-        };
-        let language: &str = match self.language.as_ref() {
-            Some(language) => language,
-            _ => panic!("[-] Input language is invalid!"),
-        };
-        let limit: usize = match self.limit {
-            Some(limit) => limit.into(),
-            _ => panic!("[-] Input limit is invalid!"),
-        };
+    fn aggregate_search(&self) -> Result<(), &str> {
+        let query: &str = self.query.as_ref().expect("[-] Input query is invalid!");
+        let language: &str = self
+            .language
+            .as_ref()
+            .expect("[-] Input language is invalid!");
+        let limit: usize = self.limit.expect("[-] Input limit is invalid!");
 
         // fetch all repositories pages via GitHub API
         const REPOSITORIES_PER_PAGE: u8 = 100;
@@ -123,7 +108,7 @@ impl SearchTrait for Search {
                 .as_ref()
                 .unwrap_or(&"".to_string())
                 .to_string(),
-        );
+        )?;
         let tokens: Map<String, Value> = computed_tokens.0;
         let mut current_token: String = computed_tokens.1;
 
@@ -137,39 +122,41 @@ impl SearchTrait for Search {
             );
 
             let response: reqwest::blocking::Response =
-                process_get_request(client.clone(), (*current_token).to_string(), search_url);
+                process_get_request(client.clone(), (*current_token).to_string(), search_url)?;
 
             if response.status().is_success() {
                 // for each commit retrieved from previous request, get $i.commit.author.email
-                let json: serde_json::Value = match response.json::<serde_json::Value>() {
-                    Ok(json) => json,
-                    _ => panic!("[-] Targeted API response could not be parsed"),
-                };
-
-                match json.get("items") {
-                    Some(items) if format!("{}", items) == "[]" => break,
-                    Some(items) => {
-                        for iterator in 0..REPOSITORIES_PER_PAGE {
-                            match items.get(iterator as usize) {
-                                Some(repository) => match repository.get("html_url") {
-                                    Some(repository_url) => {
-                                        let repository_url =
-                                            repository_url.to_string().replace('"', "");
-                                        // check if repository limit is not reached
-                                        if found_repositories.len() < limit {
-                                            found_repositories.push(repository_url);
-                                        } else {
-                                            break;
-                                        }
+                match response.json::<serde_json::Value>() {
+                    Ok(json) => {
+                        match json.get("items") {
+                            // check if response is not empty, thus if we reached a page with no more commit
+                            Some(items) if format!("{}", items) == "[]" => break,
+                            Some(items) => {
+                                for iterator in 0..REPOSITORIES_PER_PAGE {
+                                    match items.get(iterator as usize) {
+                                        Some(repository) => match repository.get("html_url") {
+                                            Some(repository_url) => {
+                                                let repository_url =
+                                                    repository_url.to_string().replace('"', "");
+                                                // check if repository limit is not reached
+                                                if found_repositories.len() < limit {
+                                                    found_repositories.push(repository_url);
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                            _ => break,
+                                        },
+                                        _ => break,
                                     }
-                                    _ => break,
-                                },
-                                _ => break,
+                                }
                             }
+                            _ => break,
                         }
+                        Ok(())
                     }
-                    _ => break,
-                }
+                    _ => Err("[-] Targeted API response could not be parsed"),
+                }?;
                 page_number += 1;
             } else {
                 // authenticated: 5000 req/account/repo/hour
@@ -183,7 +170,7 @@ impl SearchTrait for Search {
 
                 match tokens.get(&token_counter.to_string()) {
                     Some(token) => {
-                        println!("[+] Coping with a rate limit: switching to next token!");
+                        info!("[+] Coping with a rate limit: switching to next token!");
                         current_token = token.to_string().replace('"', "")
                     }
                     _ => {
@@ -198,7 +185,7 @@ impl SearchTrait for Search {
         }
         // for every found repository, scan it and concatenate found emails
         // clone might not have the best performance, but it respects the borrow checker
-        let found_emails: Vec<String> = self.clone().aggregate_scan(found_repositories);
+        let found_emails: Vec<String> = self.aggregate_scan(found_repositories)?;
 
         let dir_path: &Path = Path::new("results/keyword");
         let file_name: String = if language.is_empty() {
@@ -206,26 +193,24 @@ impl SearchTrait for Search {
         } else {
             format!("{query}_{language}")
         };
-        write_result(dir_path, file_name, found_emails);
+        write_result(dir_path, file_name, found_emails)?;
+        Ok(())
     }
 
     /// Creates a custom Search object from given user parameters.
     fn new(
-        url: String,
         query: String,
         language: String,
         token: String,
         token_file: String,
-        limit: u8,
+        limit: usize,
     ) -> Self {
         Search {
-            url: Some(url),
             query: Some(query),
             language: Some(language),
             token: Some(token),
             token_file: Some(token_file),
             limit: Some(limit),
-            aggregate: false,
         }
     }
 
@@ -234,7 +219,7 @@ impl SearchTrait for Search {
     /// It gets every events from it, check their metadata to hopefully retrieve his email.
     /// If no email found with profile events, check all user repositories commits.
     /// The latter can lead to retrieve multiple developers emails.
-    fn scan_profile(&mut self, author: &str) {
+    fn scan_profile(&self, author: &str) -> Result<(), &str> {
         // fetch all commits log pages via GitHub API
         const COMMITS_PER_PAGE: u8 = 100;
         let mut found_emails: Vec<String> = Vec::new();
@@ -248,7 +233,7 @@ impl SearchTrait for Search {
                 .as_ref()
                 .unwrap_or(&"".to_string())
                 .to_string(),
-        );
+        )?;
         let tokens: Map<String, Value> = computed_tokens.0;
         let mut current_token: String = computed_tokens.1;
 
@@ -262,45 +247,46 @@ impl SearchTrait for Search {
             );
 
             let response: reqwest::blocking::Response =
-                process_get_request(client.clone(), (*current_token).to_string(), events_url);
+                process_get_request(client.clone(), (*current_token).to_string(), events_url)?;
 
             if response.status().is_success() {
                 // for each commit retrieved from previous request, get $i.commit.author.email
-                let json: serde_json::Value = match response.json::<serde_json::Value>() {
-                    Ok(json) => json,
-                    _ => panic!("[-] Targeted API response could not be parsed"),
-                };
-
-                // check if response is not empty, thus if we reached a page with no more commit
-                if format!("{}", json) == "[]" {
-                    break;
-                }
-
-                for iterator in 0..COMMITS_PER_PAGE {
-                    match json.get(iterator as usize) {
-                        Some(item) => match item.get("payload") {
-                            Some(payload) => match payload.get("commits") {
-                                Some(commits) => {
-                                    for iterator in 0..COMMITS_PER_PAGE {
-                                        match commits.get(iterator as usize) {
-                                            Some(commit) => {
-                                                match commit.get("author") {
-                                                    Some(author) => {
-                                                        match author.get("email") {
-                                                            Some(email) => {
-                                                                // found profile email
-                                                                let email = email
-                                                                    .to_string()
-                                                                    .replace('"', "");
-                                                                // also check that the email is not a noreply email from GitHub or else
-                                                                if !email.is_empty()
-                                                                    && !found_emails
-                                                                        .contains(&email)
-                                                                    && !email.contains("noreply")
-                                                                {
-                                                                    found_emails.push(email);
+                match response.json::<serde_json::Value>() {
+                    Ok(json) => {
+                        // check if response is not empty, thus if we reached a page with no more commit
+                        if format!("{}", json) == "[]" {
+                            break;
+                        };
+                        for iterator in 0..COMMITS_PER_PAGE {
+                            match json.get(iterator as usize) {
+                                Some(item) => match item.get("payload") {
+                                    Some(payload) => match payload.get("commits") {
+                                        Some(commits) => {
+                                            for iterator in 0..COMMITS_PER_PAGE {
+                                                match commits.get(iterator as usize) {
+                                                    Some(commit) => {
+                                                        match commit.get("author") {
+                                                            Some(author) => {
+                                                                match author.get("email") {
+                                                                    Some(email) => {
+                                                                        // found profile email
+                                                                        let email = email
+                                                                            .to_string()
+                                                                            .replace('"', "");
+                                                                        // also check that the email is not a noreply email from GitHub or else
+                                                                        if !email.is_empty()
+                                                                            && !found_emails
+                                                                                .contains(&email)
+                                                                            && !email
+                                                                                .contains("noreply")
+                                                                        {
+                                                                            found_emails
+                                                                                .push(email);
+                                                                        }
+                                                                        break;
+                                                                    }
+                                                                    _ => continue,
                                                                 }
-                                                                break;
                                                             }
                                                             _ => continue,
                                                         }
@@ -308,17 +294,18 @@ impl SearchTrait for Search {
                                                     _ => continue,
                                                 }
                                             }
-                                            _ => continue,
                                         }
-                                    }
-                                }
+                                        _ => continue,
+                                    },
+                                    _ => continue,
+                                },
                                 _ => continue,
-                            },
-                            _ => continue,
-                        },
-                        _ => continue,
+                            }
+                        }
+                        Ok(())
                     }
-                }
+                    _ => Err("[-] Targeted API response could not be parsed"),
+                }?;
                 page_number += 1;
             } else {
                 // authenticated: 5000 req/account/repo/hour
@@ -332,7 +319,7 @@ impl SearchTrait for Search {
 
                 match tokens.get(&token_counter.to_string()) {
                     Some(token) => {
-                        println!("[+] Coping with a rate limit: switching to next token!");
+                        info!("[+] Coping with a rate limit: switching to next token!");
                         current_token = token.to_string().replace('"', "")
                     }
                     _ => {
@@ -347,20 +334,25 @@ impl SearchTrait for Search {
         }
         // if no email found with profile events, check all user repositories commits
         if found_emails.is_empty() {
-            let found_repositories: Vec<String> = get_author_repositories(
+            match get_author_repositories(
                 author,
                 self.token.as_ref().unwrap_or(&"".to_string()).to_string(),
                 self.token_file
                     .as_ref()
                     .unwrap_or(&"".to_string())
                     .to_string(),
-            );
-            // for every found repository, scan it and concatenate found emails
-            found_emails.append(&mut self.aggregate_scan(found_repositories));
+            ) {
+                Ok(found_repositories) => {
+                    // for every found repository, scan it and concatenate found emails
+                    found_emails.append(&mut self.aggregate_scan(found_repositories)?)
+                }
+                _ => return Err("Could not find repositories"),
+            }
         }
         let dir_path: &Path = Path::new("results/profile");
         let file_name: String = author.to_string();
-        write_result(dir_path, file_name, found_emails);
+        write_result(dir_path, file_name, found_emails)?;
+        Ok(())
     }
 
     /// Fetches a GitHub repository's commits URLs via GitHub API.
@@ -371,21 +363,17 @@ impl SearchTrait for Search {
     /// The same process is done with profile events when no repository is specified.
     ///
     /// Thus, regarding repositories, scans can lead to retrieve multiple developers emails.
-    fn scan_target(&mut self) -> Either<Vec<String>, ()> {
+    fn scan_target(&self, aggregate: bool, url: String) -> Result<Either<Vec<String>, ()>, &str> {
         // extract from URL author and repository
-        let url: &str = match self.url.as_ref() {
-            Some(url) => url,
-            _ => panic!("[-] Input URL is invalid!"),
-        };
 
-        let author: &str = parsers::get_author(url);
-        let repository: &str = parsers::get_repository(url);
+        let author: String = parsers::get_author(url.clone())?;
+        let repository: String = parsers::get_repository(url)?;
 
         // scan profile case, as there is no repository
         if repository.is_empty() {
             // clone might not have the best performance, but it respects the borrow checker
-            self.clone().scan_profile(author);
-            return itertools::Either::Right(());
+            self.scan_profile(author.as_str())?;
+            return Ok(itertools::Either::Right(()));
         }
 
         // fetch all commits log pages via GitHub API
@@ -401,7 +389,7 @@ impl SearchTrait for Search {
                 .as_ref()
                 .unwrap_or(&"".to_string())
                 .to_string(),
-        );
+        )?;
         let tokens: Map<String, Value> = computed_tokens.0;
         let mut current_token: String = computed_tokens.1;
 
@@ -415,44 +403,44 @@ impl SearchTrait for Search {
             );
 
             let response: reqwest::blocking::Response =
-                process_get_request(client.clone(), (*current_token).to_string(), commits_url);
+                process_get_request(client.clone(), (*current_token).to_string(), commits_url)?;
 
             if response.status().is_success() {
                 // for each commit retrieved from previous request, get $i.commit.author.email
-                let json: serde_json::Value = match response.json::<serde_json::Value>() {
-                    Ok(json) => json,
-                    _ => panic!("[-] Targeted API response could not be parsed"),
-                };
-
-                // check if response is not empty, thus if we reached a page with no more commit
-                if format!("{}", json) == "[]" {
-                    break;
-                }
-
-                for iterator in 0..COMMITS_PER_PAGE {
-                    match json.get(iterator as usize) {
-                        Some(item) => match item.get("commit") {
-                            Some(commit) => match commit.get("author") {
-                                Some(author) => match author.get("email") {
-                                    Some(email) => {
-                                        let email = email.to_string().replace('"', "");
-                                        // also check that the email is not a noreply email from GitHub or else
-                                        if !email.is_empty()
-                                            && !found_emails.contains(&email)
-                                            && !email.contains("noreply")
-                                        {
-                                            found_emails.push(email);
-                                        }
-                                    }
+                match response.json::<serde_json::Value>() {
+                    Ok(json) => {
+                        // check if response is not empty, thus if we reached a page with no more commit
+                        if format!("{}", json) == "[]" {
+                            break;
+                        };
+                        for iterator in 0..COMMITS_PER_PAGE {
+                            match json.get(iterator as usize) {
+                                Some(item) => match item.get("commit") {
+                                    Some(commit) => match commit.get("author") {
+                                        Some(author) => match author.get("email") {
+                                            Some(email) => {
+                                                let email = email.to_string().replace('"', "");
+                                                // also check that the email is not a noreply email from GitHub or else
+                                                if !email.is_empty()
+                                                    && !found_emails.contains(&email)
+                                                    && !email.contains("noreply")
+                                                {
+                                                    found_emails.push(email);
+                                                }
+                                            }
+                                            _ => break,
+                                        },
+                                        _ => break,
+                                    },
                                     _ => break,
                                 },
                                 _ => break,
-                            },
-                            _ => break,
-                        },
-                        _ => break,
+                            }
+                        }
+                        Ok(())
                     }
-                }
+                    _ => Err("[-] Targeted API response could not be parsed"),
+                }?;
                 page_number += 1;
             } else {
                 // authenticated: 5000 req/account/repo/hour
@@ -466,7 +454,7 @@ impl SearchTrait for Search {
 
                 match tokens.get(&token_counter.to_string()) {
                     Some(token) => {
-                        println!("[+] Coping with a rate limit: switching to next token!");
+                        info!("[+] Coping with a rate limit: switching to next token!");
                         current_token = token.to_string().replace('"', "")
                     }
                     _ => {
@@ -484,19 +472,23 @@ impl SearchTrait for Search {
         found_emails.sort_by_key(|a| a.to_lowercase());
 
         // if function is called by aggregate search
-        if self.aggregate {
-            itertools::Either::Left(found_emails)
+        if aggregate {
+            Ok(itertools::Either::Left(found_emails))
         } else {
             let dir_path: &Path = Path::new("results/repository");
             let file_name: String = format!("{author}_{repository}");
-            write_result(dir_path, file_name, found_emails);
-            itertools::Either::Right(())
+            write_result(dir_path, file_name, found_emails)?;
+            Ok(itertools::Either::Right(()))
         }
     }
 }
 
 /// Get all repositories from a GitHub account.
-fn get_author_repositories(author: &str, token: String, token_file: String) -> Vec<String> {
+fn get_author_repositories(
+    author: &str,
+    token: String,
+    token_file: String,
+) -> Result<Vec<String>, &str> {
     // fetch all repositories log pages via GitHub API
     const REPOSITORIES_PER_PAGE: u8 = 100;
     let mut found_repositories: Vec<String> = Vec::new();
@@ -504,7 +496,7 @@ fn get_author_repositories(author: &str, token: String, token_file: String) -> V
 
     // define current token if a single token is specified
     let mut token_counter: u8 = 0;
-    let computed_tokens: (Map<String, Value>, String) = get_tokens(token, token_file);
+    let computed_tokens: (Map<String, Value>, String) = get_tokens(token, token_file)?;
     let tokens: Map<String, Value> = computed_tokens.0;
     let mut current_token: String = computed_tokens.1;
 
@@ -521,35 +513,35 @@ fn get_author_repositories(author: &str, token: String, token_file: String) -> V
             client.clone(),
             (*current_token).to_string(),
             repositories_url,
-        );
+        )?;
 
         if response.status().is_success() {
             // for each commit retrieved from previous request, get $i.commit.author.email
-            let json: serde_json::Value = match response.json::<serde_json::Value>() {
-                Ok(json) => json,
-                _ => panic!("[-] Targeted API response could not be parsed"),
-            };
-
-            // check if response is not empty, thus if we reached a page with no more commit
-            if format!("{}", json) == "[]" {
-                break;
-            }
-
-            for iterator in 0..REPOSITORIES_PER_PAGE {
-                match json.get(iterator as usize) {
-                    Some(item) => match item.get("html_url") {
-                        Some(html_url) => {
-                            // found an user repository
-                            let repository = html_url.to_string().replace('"', "");
-                            if !repository.is_empty() {
-                                found_repositories.push(repository);
-                            }
+            match response.json::<serde_json::Value>() {
+                Ok(json) => {
+                    // check if response is not empty, thus if we reached a page with no more commit
+                    if format!("{}", json) == "[]" {
+                        break;
+                    };
+                    for iterator in 0..REPOSITORIES_PER_PAGE {
+                        match json.get(iterator as usize) {
+                            Some(item) => match item.get("html_url") {
+                                Some(html_url) => {
+                                    // found an user repository
+                                    let repository = html_url.to_string().replace('"', "");
+                                    if !repository.is_empty() {
+                                        found_repositories.push(repository);
+                                    }
+                                }
+                                _ => continue,
+                            },
+                            _ => continue,
                         }
-                        _ => continue,
-                    },
-                    _ => continue,
+                    }
+                    Ok(())
                 }
-            }
+                _ => Err("[-] Targeted API response could not be parsed"),
+            }?;
             page_number += 1;
         } else {
             // authenticated: 5000 req/account/repo/hour
@@ -563,7 +555,7 @@ fn get_author_repositories(author: &str, token: String, token_file: String) -> V
 
             match tokens.get(&token_counter.to_string()) {
                 Some(token) => {
-                    println!("[+] Coping with a rate limit: switching to next token!");
+                    info!("[+] Coping with a rate limit: switching to next token!");
                     current_token = token.to_string().replace('"', "")
                 }
                 _ => {
@@ -576,7 +568,7 @@ fn get_author_repositories(author: &str, token: String, token_file: String) -> V
             };
         }
     }
-    found_repositories
+    Ok(found_repositories)
 }
 
 /// Get a project's root by looking for Cargo.lock file.
@@ -587,7 +579,10 @@ fn get_project_root() -> io::Result<PathBuf> {
     for path in path_ancestors {
         let has_cargo: bool = read_dir(path)?
             .into_iter()
-            .any(|path| match path { Ok(path) => path.file_name(), _ => panic!("Current path could not be handled")} == *OsString::from("Cargo.lock"));
+            .any(|path| match path {
+                Ok(path) => Ok(path.file_name()),
+                _ => Err("Current path could not be handled")
+            } == Ok(OsString::from("Cargo.lock")));
         if has_cargo {
             return Ok(PathBuf::from(path));
         }
@@ -601,44 +596,58 @@ fn get_project_root() -> io::Result<PathBuf> {
 /// Retrieve tokens from a JSON token file.
 /// Format should follow an array of indexes and their value is a GitHub API token.
 /// `tokens.example.json` at the project root is a correct example.
-fn get_tokens(token: String, token_file: String) -> (Map<String, Value>, String) {
+fn get_tokens<'a>(
+    token: String,
+    token_file: String,
+) -> Result<(Map<String, Value>, String), &'a str> {
     // define current token if a single token is specified
     let current_token: String;
     let token_counter: u8 = 0;
-    let mut tokens: Map<String, Value> = Map::new();
+    let tokens: Map<String, Value> = Map::new();
 
     if !token.is_empty() {
         current_token = token
     } else {
         // parse tokens from token-file if defined
         if !token_file.is_empty() {
-            let reader =
-                std::fs::read_to_string(token_file).expect("Unable to read JSON token file");
-            let parsed: serde_json::Value =
-                serde_json::from_str(&reader).expect("Unable to parse JSON token file");
-            tokens = match parsed.as_object() {
-                Some(tokens) => tokens.clone(),
-                _ => panic!("[-] Tokens could not be parsed!"),
-            };
-            // as token file exists, let's get our first token
-            match tokens.get(&token_counter.to_string()) {
-                Some(token) => current_token = token.to_string().replace('"', ""),
-                _ => panic!("[-] No token provided!"),
+            match std::fs::read_to_string(token_file) {
+                Ok(reader) => {
+                    match serde_json::from_str::<serde_json::Value>(&reader) {
+                        Ok(parsed) => {
+                            match parsed.as_object() {
+                                Some(parsed_tokens) => {
+                                    // as token file exists, let's get our first token
+                                    match parsed_tokens.get(&token_counter.to_string()) {
+                                        Some(token) => {
+                                            current_token = token.to_string().replace('"', "");
+                                            return Ok((parsed_tokens.clone(), current_token));
+                                        }
+                                        _ => return Err("[-] No token provided!"),
+                                    }
+                                }
+                                _ => return Err("[-] Tokens could not be parsed!"),
+                            }
+                        }
+                        _ => return Err("Unable to parse JSON token file"),
+                    }
+                }
+                _ => return Err("Unable to read JSON token file"),
             }
         } else {
             // no token provided, default is empty string, leads to limited API access
-            current_token = token;
+            current_token = token
         }
     }
-    (tokens, current_token)
+    // default token case
+    Ok((tokens, current_token))
 }
 
 /// Provides HTTP GET request handling for different cases such as with a token or not.
-fn process_get_request(
+fn process_get_request<'a>(
     client: reqwest::blocking::Client,
     token: String,
     url: String,
-) -> reqwest::blocking::Response {
+) -> Result<reqwest::blocking::Response, &'a str> {
     // following headers are recommended by GitHub API to fetch it nicely
     // if no token is provided, `token` is empty
     if token.is_empty() {
@@ -648,8 +657,8 @@ fn process_get_request(
             .header(reqwest::header::ACCEPT, Search::GITHUB_ACCEPT_HEADER)
             .send()
         {
-            Ok(response) => response,
-            _ => panic!("[-] HTTP GET request failed"),
+            Ok(response) => Ok(response),
+            _ => Err("[-] HTTP GET request failed"),
         }
     } else {
         match client
@@ -659,56 +668,56 @@ fn process_get_request(
             .header(reqwest::header::AUTHORIZATION, format!("token {}", token))
             .send()
         {
-            Ok(response) => response,
-            _ => panic!("[-] HTTP GET request failed"),
+            Ok(response) => Ok(response),
+            _ => Err("[-] HTTP GET request failed"),
         }
     }
 }
 
 /// Keep found results in a file at specific paths according to the user request parameters.
 /// Every results is stored in the results directory at the project root.
-fn write_result(dir_path: &Path, file_name: String, found_emails: Vec<String>) {
+fn write_result(
+    dir_path: &Path,
+    file_name: String,
+    found_emails: Vec<String>,
+) -> Result<PathBuf, &str> {
     if !found_emails.is_empty() {
-        println!("--------------------------------");
+        info!("--------------------------------");
         let length = found_emails.len();
         if length > 1 {
-            println!("[+] Found {} emails", length);
+            info!("[+] Found {} emails", length);
         } else {
-            println!("[+] Found 1 email");
+            info!("[+] Found 1 email");
         }
 
-        lazy_static! {
-            // prevent multiple syscall to get pwd
-            static ref PROJECT_ROOT: PathBuf = match get_project_root() {
-                Ok(path) => path,
-                _ => match env::current_dir() {
-                    Ok(path) => path,
-                    _ => panic!("[-] Couldn't get project root"),
-                },
-            };
-        }
+        match get_project_root() {
+            Ok(project_root) => {
+                let dir_absolute_path: String =
+                    format!("{}/{}", project_root.display(), dir_path.display());
+                let absolute_path: String = format!("{}/{}", dir_absolute_path, file_name);
 
-        let dir_absolute_path: String =
-            format!("{}/{}", PROJECT_ROOT.display(), dir_path.display());
-        let absolute_path: String = format!("{}/{}", dir_absolute_path, file_name);
+                info!("[+] Result is available at {}", absolute_path);
 
-        println!("[+] Result is available at {}", absolute_path);
+                if let Some(p) = Path::new(&dir_absolute_path).to_str() {
+                    create_dir_all(p).expect("[-] Failed to create directory")
+                };
 
-        if let Some(p) = Path::new(&dir_absolute_path).to_str() {
-            match create_dir_all(p) {
-                Ok(path) => path,
-                _ => error!("[-] Failed to create directory"),
+                let mut file =
+                    File::create(absolute_path).expect("[-] Unable to create output file");
+                for email in &found_emails {
+                    let formatted_email: String = format!("{}\n", email);
+                    file.write_all((*formatted_email).as_bytes())
+                        .expect("[-] Unable to write data to output file");
+                }
+                Ok(project_root)
             }
-        };
-
-        let mut file = File::create(absolute_path).expect("Unable to create output file");
-        for email in &found_emails {
-            let formatted_email: String = format!("{}\n", email);
-            file.write_all((*formatted_email).as_bytes())
-                .expect("Unable to write data to output file");
+            _ => match env::current_dir() {
+                Ok(path) => Ok(path),
+                _ => Err("[-] Couldn't get project root"),
+            },
         }
     } else {
-        println!("[-] No email found");
+        Err("[-] No email found")
     }
 }
 
@@ -724,33 +733,28 @@ mod tests {
     #[ignore]
     #[test]
     fn aggregate_search() {
-        let mut search = <Search as SearchTrait>::new(
-            "".to_string(),
+        let search = <Search as SearchTrait>::new(
             "Chess.com API".to_string(),
             "Rust".to_string(),
             "".to_string(),
             "".to_string(),
             1,
         );
-        search.aggregate_search();
-        let project_root: PathBuf = match get_project_root() {
-            Ok(path) => path,
-            _ => panic!("[-] Couldn't get project root"),
-        };
+        search
+            .aggregate_search()
+            .expect("[-] Aggregate search failed");
+        let project_root: PathBuf = get_project_root().expect("[-] Couldn't get project root");
         let file_path: String = "results/keyword/Chess.com API_Rust".to_string();
         let absolute_path: String = format!("{}/{}", project_root.display(), file_path);
-        let found_email: String = match read_result(absolute_path) {
-            Ok(path) => path.trim().to_string(),
-            _ => panic!("[-] Couldn't get retrieved email"),
-        };
-        assert_eq!(found_email, "eli.bp@jottabyte.io");
+        let found_email: String =
+            read_result(absolute_path).expect("[-] Couldn't get retrieved email");
+        assert_eq!(found_email, "eli.bp@jottabyte.io\n");
     }
 
     #[ignore]
     #[test]
     fn scan_profile() {
         let search = <Search as SearchTrait>::new(
-            "https://github.com/anowell".to_string(),
             "".to_string(),
             "".to_string(),
             "".to_string(),
@@ -758,17 +762,15 @@ mod tests {
             1,
         );
         // clone might not have the best performance, but it respects the borrow checker
-        search.clone().scan_target();
-        let project_root: PathBuf = match get_project_root() {
-            Ok(path) => path,
-            _ => panic!("[-] Couldn't get project root"),
-        };
+        search
+            .clone()
+            .scan_target(false, "https://github.com/anowell".to_string())
+            .expect("[-] Target scan failed");
+        let project_root: PathBuf = get_project_root().expect("[-] Couldn't get project root");
         let file_path: String = "results/profile/anowell".to_string();
         let absolute_path: String = format!("{}/{}", project_root.display(), file_path);
-        let found_email: String = match read_result(absolute_path) {
-            Ok(path) => path.trim().to_string(),
-            _ => panic!("[-] Couldn't get retrieved email"),
-        };
+        let found_email: String =
+            read_result(absolute_path).expect("[-] Couldn't get retrieved email");
         assert!(found_email.contains("anowell@gmail.com"));
     }
 
@@ -776,7 +778,6 @@ mod tests {
     #[test]
     fn scan_target() {
         let search = <Search as SearchTrait>::new(
-            "https://github.com/elibenporat/hikaru".to_string(),
             "".to_string(),
             "".to_string(),
             "".to_string(),
@@ -784,18 +785,16 @@ mod tests {
             1,
         );
         // clone might not have the best performance, but it respects the borrow checker
-        search.clone().scan_target();
-        let project_root: PathBuf = match get_project_root() {
-            Ok(path) => path,
-            _ => panic!("[-] Couldn't get project root"),
-        };
+        search
+            .clone()
+            .scan_target(false, "https://github.com/elibenporat/hikaru".to_string())
+            .expect("[-] Target scan failed");
+        let project_root: PathBuf = get_project_root().expect("[-] Couldn't get project root");
         let file_path: String = "results/repository/elibenporat_hikaru".to_string();
         let absolute_path: String = format!("{}/{}", project_root.display(), file_path);
-        let found_email: String = match read_result(absolute_path) {
-            Ok(path) => path.trim().to_string(),
-            _ => panic!("[-] Couldn't get retrieved email"),
-        };
-        assert_eq!(found_email, "eli.bp@jottabyte.io");
+        let found_email: String =
+            read_result(absolute_path).expect("[-] Couldn't get retrieved email");
+        assert_eq!(found_email, "eli.bp@jottabyte.io\n");
     }
 
     fn read_result(file_path: String) -> Result<String, Box<dyn std::error::Error>> {
