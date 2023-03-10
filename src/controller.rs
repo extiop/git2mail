@@ -578,7 +578,6 @@ fn get_project_root() -> io::Result<PathBuf> {
 
     for path in path_ancestors {
         let has_cargo: bool = read_dir(path)?
-            .into_iter()
             .any(|path| match path {
                 Ok(path) => Ok(path.file_name()),
                 _ => Err("Current path could not be handled")

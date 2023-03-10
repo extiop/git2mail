@@ -1,6 +1,6 @@
 [package]
 name = "git2mail"
-version = "0.4.0"
+version = "0.4.1"
 authors = ["exti0p"]
 edition = "2021"
 license = "LGPL-3.0-only"
@@ -13,14 +13,21 @@ categories = ["command-line-utilities"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = "4.0.30"
+clap = "4.1.4"
 itertools = "0.10.5"
 openssl = { version = "0.10.45", features = ["vendored"] }
-regex = "1.7.0"
-reqwest = { version = "0.11.13", features = ["blocking", "json"] }
-serde = { version = "1.0.151", features = ["derive"] }
-serde_json = "1.0.91"
+regex = "1.7.1"
+reqwest = { version = "0.11.14", features = ["blocking", "json"] }
+serde = { version = "1.0.152", features = ["derive"] }
+serde_json = "1.0.92"
 
 # logging
 log = "0.4.17"
 pretty_env_logger = "0.4.0"
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Enable Link Time Optimization
+codegen-units = 1   # Reduce number of codegen units to increase optimizations
+panic = "abort"     # Abort on panic
+strip = true        # Automatically strip symbols from the binary
