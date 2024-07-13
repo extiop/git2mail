@@ -10,6 +10,16 @@ https://docs.rs/git2mail)
 
 Lean, fast and safe developers' email finder.
 
+## 👁️ Philosophy
+
+In opposition to https://github.com/mxrch/GitFive, git2mail is meant to be extremely fast for bulk offensive reconnaissance or OSINT. It can be used with multiple tokens (not only linked to one account then) to fetch a huge amount of emails.
+
+### ⚡ Performances
+
+As of current development (monothreaded and synchronous requests), on a big repository https://github.com/denoland/deno : 
+- More than 11 750 commits analyzed in **less than a minute**
+- Found **more than 760 emails**
+
 ## 🚀 Quickstart
 
 1. Get your executable according to your requirements with [git2mail releases](https://github.com/exti0p/git2mail/releases)

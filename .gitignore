@@ -12,3 +12,6 @@ tokens.json
 
 # results directory
 /results
+
+# firedbg
+/firedbg
