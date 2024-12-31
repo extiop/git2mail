@@ -14,7 +14,7 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 clap = "4.5.9"
-itertools = "0.13.0"
+itertools = "0.14.0"
 openssl = { version = "0.10.64", features = ["vendored"] }
 regex = "1.10.5"
 reqwest = { version = "0.12.5", features = ["blocking", "json"] }
