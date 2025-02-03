@@ -15,7 +15,7 @@ categories = ["command-line-utilities"]
 [dependencies]
 clap = "4.5.23"
 itertools = "0.14.0"
-openssl = { version = "0.10.68", features = ["vendored"] }
+openssl = { version = "0.10.70", features = ["vendored"] }
 regex = "1.11.1"
 reqwest = { version = "0.12.12", features = ["blocking", "json"] }
 serde = { version = "1.0.217", features = ["derive"] }
