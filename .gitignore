@@ -4,11 +4,5 @@ tokens.json
 # build directory
 /target
 
-# keep .gitkeep
-!.gitkeep
-
 # results directory
 /results
-
-# firedbg
-/firedbg
