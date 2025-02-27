@@ -83,17 +83,23 @@ jobs:
       - name: Download Linux artifact
         uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
         with:
-          name: git2mail-linux
+          path: git2mail-linux
+          pattern: git2mail-*
+          merge-multiple: true
 
       - name: Download Windows artifact
         uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
         with:
-          name: git2mail-windows
+          path: git2mail-windows
+          pattern: git2mail-*
+          merge-multiple: true
 
       - name: Download MacOS artifact
         uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
         with:
-          name: git2mail-macos
+          path: git2mail-macos
+          pattern: git2mail-*
+          merge-multiple: true
 
       - name: Release Linux artifact
         uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
