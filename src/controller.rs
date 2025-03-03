@@ -3,8 +3,8 @@ use itertools::Either;
 use log::{error, info};
 use serde_json::{Map, Value};
 use std::ffi::OsString;
-use std::fs::{create_dir_all, read_dir, File};
-use std::io::{prelude::*, ErrorKind};
+use std::fs::{File, create_dir_all, read_dir};
+use std::io::{ErrorKind, prelude::*};
 use std::path::{Path, PathBuf};
 use std::{env, io};
 
