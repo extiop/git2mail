@@ -1,29 +1,26 @@
 [package]
 name = "git2mail"
-version = "0.4.4"
-authors = ["exti0p"]
-edition = "2021"
+version = "0.4.5"
+authors = ["extiop"]
+edition = "2024"
 license = "LGPL-3.0-only"
 description = "Pure Rust OSINT tool to find a GitHub user's email"
-repository = "https://github.com/exti0p/git2mail"
+repository = "https://github.com/extiop/git2mail"
 readme = "README.md"
 keywords = ["github", "osint", "rust", "leak"]
 categories = ["command-line-utilities"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-clap = "4.5.31"
-itertools = "0.14.0"
-openssl = { version = "0.10.71", features = ["vendored"] }
-regex = "1.11.1"
-reqwest = { version = "0.12.12", features = ["blocking", "json"] }
-serde = { version = "1.0.218", features = ["derive"] }
-serde_json = "1.0.139"
-
+clap = "4.5"
+itertools = "0.14"
+openssl = { version = "0.10", features = ["vendored"] }
+regex = "1.11"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 # logging
-log = "0.4.26"
-pretty_env_logger = "0.5.0"
+log = "0.4"
+pretty_env_logger = "0.5"
 
 [profile.release]
 opt-level = "z"     # Optimize for size
