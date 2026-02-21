@@ -17,8 +17,7 @@ In opposition to https://github.com/mxrch/GitFive, git2mail is meant to be extre
 ### ⚡ Performances
 
 As of current development (monothreaded and synchronous requests), on a big repository https://github.com/denoland/deno : 
-- More than 11 750 commits analyzed in **less than a minute**
-- Found **more than 760 emails**
+- More than 15 000 commits analyzed in **less than a minute** to find **more than 900 emails**
 
 ## 🚀 Quickstart
 
