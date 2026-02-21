@@ -12,7 +12,7 @@ Lean, fast and safe developers' email finder.
 
 ## 👁️ Philosophy
 
-In opposition to https://github.com/mxrch/GitFive, git2mail is meant to be extremely fast for bulk offensive reconnaissance or OSINT. It can be used with multiple tokens (not only linked to one account then) to fetch a huge amount of emails.
+In opposition to https://github.com/mxrch/GitFive, git2mail is meant to be extremely fast for bulk offensive reconnaissance or OSINT. It can be used with multiple personal access tokens (cf. https://github.com/settings/tokens), not only linked to one account then, to fetch a huge amount of emails.
 
 ### ⚡ Performances
 
@@ -61,21 +61,21 @@ THEN
 Fetch some commits or profile events without authentication:
 
 ```bash
-./git2mail --url "$TARGET_URL"
+git2mail --url "$TARGET_URL"
 ```
 
 Note that the URL parameter can be a GitHub repository URL or a profile URL, for instance:
 
 ```bash
-./git2mail --url https://github.com/denoland/deno
+git2mail --url https://github.com/denoland/deno
 
-./git2mail --url https://github.com/denoland
+git2mail --url https://github.com/denoland
 ```
 
 Use a specific token to be authenticated and fetch a large amount of commits:
 
 ```bash
-./git2mail --url "$TARGET_URL" --token "$YOUR_TOKEN"
+git2mail --url "$TARGET_URL" --token "$YOUR_TOKEN"
 ```
 
 The repository URL must follow the following format:
@@ -99,13 +99,13 @@ ssh://git@domain.com/group
 And if you have multiple tokens, you can custom `tokens.example.json` to scrape a lot of commits:
 
 ```bash
-./git2mail --url "$TARGET_URL" --token-file "$YOUR_TOKEN_FILE"
+git2mail --url "$TARGET_URL" --token-file "$YOUR_TOKEN_FILE"
 ```
 
 With dummy values:
 
 ```bash
-./git2mail --url https://github.com/denoland/deno --token-file /tmp/tokens.json
+git2mail --url https://github.com/denoland/deno --token-file tokens.json
 ```
 
 `tokens.example.json` content, which is available at the root of the project:
@@ -132,13 +132,13 @@ In this mode, your results will be stored per profile with the following relativ
 You want to search, for instance, for some Rust developers that create `nmap` related tools:
 
 ```bash
-./git2mail --query nmap --language Rust --token-file /tmp/tokens.json
+git2mail --query nmap --language Rust --token-file tokens.json
 ```
 
 You can also limit the number of repositories scanned this way, for instance:
 
 ```bash
-./git2mail --query nmap --language Rust --token-file /tmp/tokens.json --limit 5
+git2mail --query nmap --language Rust --token-file tokens.json --limit 5
 ```
 
 In this mode, your results will be stored per query with the following relative path, from project root: `results/keyword/$query`. If a language is defined, it will be at `results/keyword/$query_$language`.
