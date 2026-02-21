@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.6] - 2026-02-21
 
+### Added
+
+- Optimize runtime performance at compilation
+
 ### Fixed
 
-- Bump dependencies
+- Bump and minimize dependencies
 
 ## [0.4.5] - 2025-03-03
 

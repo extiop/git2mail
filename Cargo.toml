@@ -23,8 +23,8 @@ log = "0.4"
 pretty_env_logger = "0.5"
 
 [profile.release]
-opt-level = "z"     # Optimize for size
+codegen-units = 1   # Use minimum codegen units for best size and runtime performances
+opt-level = 3       # Optimize for maximum runtime performance
 lto = true          # Enable Link Time Optimization
-codegen-units = 1   # Reduce number of codegen units to increase optimizations
+strip = true        # Removes symbols, reducing size
 panic = "abort"     # Abort on panic
-strip = true        # Automatically strip symbols from the binary
