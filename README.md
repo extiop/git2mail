@@ -2,7 +2,7 @@
   <img src="https://www.zupimages.net/up/22/23/qzk2.png" alt="git2mail logo"/>
 </div>
 
-[![Build & test](https://github.com/exti0p/git2mail/workflows/Build%20&%20test/badge.svg)](https://github.com/exti0p/git2mail/actions)
+[![Build & test](https://github.com/extiop/git2mail/workflows/Build%20&%20test/badge.svg)](https://github.com/extiop/git2mail/actions)
 [![Cargo git2mail](https://img.shields.io/badge/crates.io-git2mail-red)](
 https://crates.io/crates/git2mail)
 [![Documentation git2mail](https://img.shields.io/badge/docs.rs-git2mail-blue)](
@@ -22,7 +22,7 @@ As of current development (monothreaded and synchronous requests), on a big repo
 
 ## 🚀 Quickstart
 
-1. Get your executable according to your requirements with [git2mail releases](https://github.com/exti0p/git2mail/releases)
+1. Get your executable according to your requirements with [git2mail releases](https://github.com/extiop/git2mail/releases)
 
 OR
 
@@ -30,7 +30,7 @@ OR
 2. Get the optimized build for lightning-fast queries:
 
     ```bash
-    git clone https://github.com/exti0p/git2mail
+    git clone https://github.com/extiop/git2mail
     cd git2mail
     cargo build --release
     ```
@@ -38,7 +38,7 @@ OR
     Or, you can install its release version directly:
 
     ```bash
-    git clone https://github.com/exti0p/git2mail
+    git clone https://github.com/extiop/git2mail
     cd git2mail
     cargo install --path .
     ```
@@ -51,7 +51,7 @@ OR
 
 THEN
 
-1. Check [examples](https://github.com/exti0p/git2mail#-examples) below
+1. Check [examples](https://github.com/extiop/git2mail#-examples) below
 2. Scan your targets
 
 ## 📖 Examples
