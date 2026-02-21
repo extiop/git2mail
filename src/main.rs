@@ -10,7 +10,7 @@ fn run<'a>() -> Result<(), &'a str> {
 
     let argv: ArgMatches =
         Command::new("git2mail")
-            .author("exti0p")
+            .author("extiop")
             .about("Pure Rust OSINT tool to find a GitHub user's email")
             .arg(
                 Arg::new("url")

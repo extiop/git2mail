@@ -2,7 +2,7 @@
   <img src="https://www.zupimages.net/up/22/23/qzk2.png" alt="git2mail logo"/>
 </div>
 
-[![Build & test](https://github.com/exti0p/git2mail/workflows/Build%20&%20test/badge.svg)](https://github.com/exti0p/git2mail/actions)
+[![Build & test](https://github.com/extiop/git2mail/workflows/Build%20&%20test/badge.svg)](https://github.com/extiop/git2mail/actions)
 [![Cargo git2mail](https://img.shields.io/badge/crates.io-git2mail-red)](
 https://crates.io/crates/git2mail)
 [![Documentation git2mail](https://img.shields.io/badge/docs.rs-git2mail-blue)](
@@ -12,17 +12,16 @@ Lean, fast and safe developers' email finder.
 
 ## 👁️ Philosophy
 
-In opposition to https://github.com/mxrch/GitFive, git2mail is meant to be extremely fast for bulk offensive reconnaissance or OSINT. It can be used with multiple tokens (not only linked to one account then) to fetch a huge amount of emails.
+In opposition to https://github.com/mxrch/GitFive, git2mail is meant to be extremely fast for bulk offensive reconnaissance or OSINT. It can be used with multiple personal access tokens (cf. https://github.com/settings/tokens), not only linked to one account then, to fetch a huge amount of emails.
 
 ### ⚡ Performances
 
 As of current development (monothreaded and synchronous requests), on a big repository https://github.com/denoland/deno : 
-- More than 11 750 commits analyzed in **less than a minute**
-- Found **more than 760 emails**
+- More than 15 000 commits analyzed in **less than a minute** to find **more than 900 emails**
 
 ## 🚀 Quickstart
 
-1. Get your executable according to your requirements with [git2mail releases](https://github.com/exti0p/git2mail/releases)
+1. Get your executable according to your requirements with [git2mail releases](https://github.com/extiop/git2mail/releases)
 
 OR
 
@@ -30,7 +29,7 @@ OR
 2. Get the optimized build for lightning-fast queries:
 
     ```bash
-    git clone https://github.com/exti0p/git2mail
+    git clone https://github.com/extiop/git2mail
     cd git2mail
     cargo build --release
     ```
@@ -38,7 +37,7 @@ OR
     Or, you can install its release version directly:
 
     ```bash
-    git clone https://github.com/exti0p/git2mail
+    git clone https://github.com/extiop/git2mail
     cd git2mail
     cargo install --path .
     ```
@@ -51,7 +50,7 @@ OR
 
 THEN
 
-1. Check [examples](https://github.com/exti0p/git2mail#-examples) below
+1. Check [examples](https://github.com/extiop/git2mail#-examples) below
 2. Scan your targets
 
 ## 📖 Examples
@@ -61,21 +60,21 @@ THEN
 Fetch some commits or profile events without authentication:
 
 ```bash
-./git2mail --url "$TARGET_URL"
+git2mail --url "$TARGET_URL"
 ```
 
 Note that the URL parameter can be a GitHub repository URL or a profile URL, for instance:
 
 ```bash
-./git2mail --url https://github.com/denoland/deno
+git2mail --url https://github.com/denoland/deno
 
-./git2mail --url https://github.com/denoland
+git2mail --url https://github.com/denoland
 ```
 
 Use a specific token to be authenticated and fetch a large amount of commits:
 
 ```bash
-./git2mail --url "$TARGET_URL" --token "$YOUR_TOKEN"
+git2mail --url "$TARGET_URL" --token "$YOUR_TOKEN"
 ```
 
 The repository URL must follow the following format:
@@ -99,13 +98,13 @@ ssh://git@domain.com/group
 And if you have multiple tokens, you can custom `tokens.example.json` to scrape a lot of commits:
 
 ```bash
-./git2mail --url "$TARGET_URL" --token-file "$YOUR_TOKEN_FILE"
+git2mail --url "$TARGET_URL" --token-file "$YOUR_TOKEN_FILE"
 ```
 
 With dummy values:
 
 ```bash
-./git2mail --url https://github.com/denoland/deno --token-file /tmp/tokens.json
+git2mail --url https://github.com/denoland/deno --token-file tokens.json
 ```
 
 `tokens.example.json` content, which is available at the root of the project:
@@ -132,13 +131,13 @@ In this mode, your results will be stored per profile with the following relativ
 You want to search, for instance, for some Rust developers that create `nmap` related tools:
 
 ```bash
-./git2mail --query nmap --language Rust --token-file /tmp/tokens.json
+git2mail --query nmap --language Rust --token-file tokens.json
 ```
 
 You can also limit the number of repositories scanned this way, for instance:
 
 ```bash
-./git2mail --query nmap --language Rust --token-file /tmp/tokens.json --limit 5
+git2mail --query nmap --language Rust --token-file tokens.json --limit 5
 ```
 
 In this mode, your results will be stored per query with the following relative path, from project root: `results/keyword/$query`. If a language is defined, it will be at `results/keyword/$query_$language`.

@@ -75,32 +75,32 @@ mod tests {
     #[test]
     fn get_author_git() {
         assert_eq!(
-            get_author("git://github.com/exti0p/ctf".to_string()),
-            Ok("exti0p".to_string())
+            get_author("git://github.com/extiop/ctf".to_string()),
+            Ok("extiop".to_string())
         );
     }
 
     #[test]
     fn get_author_git_at() {
         assert_eq!(
-            get_author("git@github.com/exti0p/ctf".to_string()),
-            Ok("exti0p".to_string())
+            get_author("git@github.com/extiop/ctf".to_string()),
+            Ok("extiop".to_string())
         );
     }
 
     #[test]
     fn get_author_https() {
         assert_eq!(
-            get_author("https://github.com/exti0p/ctf".to_string()),
-            Ok("exti0p".to_string())
+            get_author("https://github.com/extiop/ctf".to_string()),
+            Ok("extiop".to_string())
         );
     }
 
     #[test]
     fn get_author_ssh() {
         assert_eq!(
-            get_author("ssh://github.com/exti0p/ctf".to_string()),
-            Ok("exti0p".to_string())
+            get_author("ssh://github.com/extiop/ctf".to_string()),
+            Ok("extiop".to_string())
         );
     }
 
@@ -116,7 +116,7 @@ mod tests {
     fn get_author_too_long() {
         // author is not retrieved as expected
         assert_eq!(
-            get_author("https://github.com/github/exti0p/ctf".to_string()),
+            get_author("https://github.com/github/extiop/ctf".to_string()),
             Ok("github".to_string())
         );
     }
@@ -125,7 +125,7 @@ mod tests {
     fn get_author_swapped() {
         // author is not retrieved as expected as author and repository are swapped
         assert_eq!(
-            get_author("https://github.com/ctf/exti0p".to_string()),
+            get_author("https://github.com/ctf/extiop".to_string()),
             Ok("ctf".to_string())
         );
     }
@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn get_get_repository_git() {
         assert_eq!(
-            get_repository("git://github.com/exti0p/ctf".to_string()),
+            get_repository("git://github.com/extiop/ctf".to_string()),
             Ok("ctf".to_string())
         );
     }
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn get_get_repository_git_at() {
         assert_eq!(
-            get_repository("git@github.com/exti0p/ctf".to_string()),
+            get_repository("git@github.com/extiop/ctf".to_string()),
             Ok("ctf".to_string())
         );
     }
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn get_get_repository_https() {
         assert_eq!(
-            get_repository("https://github.com/exti0p/ctf".to_string()),
+            get_repository("https://github.com/extiop/ctf".to_string()),
             Ok("ctf".to_string())
         );
     }
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn get_get_repository_ssh() {
         assert_eq!(
-            get_repository("ssh://github.com/exti0p/ctf".to_string()),
+            get_repository("ssh://github.com/extiop/ctf".to_string()),
             Ok("ctf".to_string())
         );
     }
@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn get_repository_no_project() {
         assert_eq!(
-            get_repository("https://github.com/exti0p".to_string()),
+            get_repository("https://github.com/extiop".to_string()),
             Ok("".to_string())
         );
     }
@@ -176,8 +176,8 @@ mod tests {
     fn get_repository_too_long() {
         // repository is not retrieved as expected
         assert_eq!(
-            get_repository("https://github.com/github/exti0p/ctf".to_string()),
-            Ok("exti0p/ctf".to_string())
+            get_repository("https://github.com/github/extiop/ctf".to_string()),
+            Ok("extiop/ctf".to_string())
         );
     }
 
@@ -185,8 +185,8 @@ mod tests {
     fn get_repository_swapped() {
         // repository is not retrieved as expected as author and repository are swapped
         assert_eq!(
-            get_repository("https://github.com/ctf/exti0p".to_string()),
-            Ok("exti0p".to_string())
+            get_repository("https://github.com/ctf/extiop".to_string()),
+            Ok("extiop".to_string())
         );
     }
 }
