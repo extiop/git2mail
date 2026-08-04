@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7] - 2026-08-04
+
+### Added
+
+- Professionalize repository structure to match ANSSI-FR/MLA conventions
+
+### Fixed
+
+- Modernize CI/CD workflows: replace deprecated `actions-rs/*` with `dtolnay/rust-toolchain`, direct cargo commands, `rustsec/audit-check`
+- Replace deprecated release actions with `actions/create-release` + `actions/upload-release-asset`
+- Fix release workflow version extraction and `cargo_arg` bug
+- Add `.cargo/config.toml` for Windows static linking
+- Bump dependencies to fix 11 security vulnerabilities
+
 ## [0.4.6] - 2026-02-21
 
 ### Added
