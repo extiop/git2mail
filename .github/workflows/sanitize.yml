@@ -1,5 +1,8 @@
 name: Ensure repository healthy state over time
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [ main ]
@@ -20,9 +23,9 @@ jobs:
 
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Get ${{ matrix.changelog }} Changelog Entry
-      uses: mindsers/changelog-reader-action@32aa5b4c155d76c94e4ec883a223c947b2f02656 # v2.2.3
+      uses: mindsers/changelog-reader-action@1faaf50aa09d5793d9a100819973df801febfb31 # v2.4.0
       id: changelog_reader
       with:
         # Check format for the last 10 entries

@@ -3,6 +3,10 @@ tokens.json
 
 # build directory
 /target
+/debug
 
 # results directory
 /results
+
+# pi-subagents
+.pi-subagents/

@@ -1,5 +1,8 @@
 name: git2mail release
 
+permissions:
+  contents: write
+
 on:
   push:
     tags:
@@ -23,35 +26,41 @@ jobs:
             cargo_arg: --release
           - build: windows
             os: windows-latest
+            target: x86_64-pc-windows-msvc
             cargo_arg: --release
             extension: .exe
 
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-    - uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
-      with:
-        toolchain: stable
-    - name: If target is musl, install musl-tools (including musl-gcc) and set target
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+    - name: Set target if any
+      if: matrix.target
+      run: rustup target add ${{ matrix.target }}
+    - name: If target is musl, install musl-tools (including musl-gcc)
       if: matrix.target == 'x86_64-unknown-linux-musl'
       run: |
         sudo apt update
         sudo apt install musl-tools -y
-        rustup target add ${{ matrix.target }}
     - name: Build
-      uses: actions-rs/cargo@ae10961054e4aa8b4aa7dffede299aaf087aa33b # v1.0.1
-      with:
-        command: build
-        args: --release --all-features --package git2mail --verbose ${{ matrix.cargo_build }}
+      run: cargo build ${{ matrix.cargo_arg }} --all-features --package git2mail --verbose ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+    - name: Prepare binary path
+      id: binary_path
+      shell: bash
+      run: |
+        if [ -n "${{ matrix.target }}" ]; then
+          echo "path=./target/${{ matrix.target }}/release/git2mail${{ matrix.extension || '' }}" >> $GITHUB_OUTPUT
+        else
+          echo "path=./target/release/git2mail${{ matrix.extension || '' }}" >> $GITHUB_OUTPUT
+        fi
     - name: Upload resulting 'git2mail'
-      uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b # v4.5.0
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: git2mail-${{ matrix.build }}
-        path: ./target/${{ matrix.target }}/release/git2mail${{ matrix.extension }}
+        path: ${{ steps.binary_path.outputs.path }}
 
   release:
-    # From https://github.com/cloudflare/wrangler/blob/master/.github/workflows/release.yml
     name: GitHub Release
     needs: build
     runs-on: ubuntu-latest
@@ -63,43 +72,40 @@ jobs:
           echo "using version tag ${GITHUB_REF:15}"
           echo "version=${GITHUB_REF:15}" >> $GITHUB_OUTPUT
       - name: Checkout code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Get Changelog Entry
         id: changelog_reader
-        uses: mindsers/changelog-reader-action@32aa5b4c155d76c94e4ec883a223c947b2f02656 # v2.2.3
+        uses: mindsers/changelog-reader-action@1faaf50aa09d5793d9a100819973df801febfb31 # v2.4.0
         with:
           path: CHANGELOG.md
+      - name: Download Linux artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: git2mail-linux
+          path: linux
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: git2mail-macos
+          path: macos
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: git2mail-windows
+          path: windows
+
       - name: Create Release
         id: create_release
         uses: actions/create-release@0cb9c9b65d5d1901c1f53e5e66eaf4afd303e70e # v1.1.4
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: git2mail-${{ steps.get_version.outputs.VERSION }}
-          release_name: git2mail-${{ steps.get_version.outputs.VERSION }}
+          tag_name: git2mail-${{ steps.get_version.outputs.version }}
+          release_name: git2mail-${{ steps.get_version.outputs.version }}
           body: ${{ steps.changelog_reader.outputs.changes }}
           draft: true
-
-      - name: Download Linux artifact
-        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
-        with:
-          path: git2mail-linux
-          pattern: git2mail-*
-          merge-multiple: true
-
-      - name: Download Windows artifact
-        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
-        with:
-          path: git2mail-windows
-          pattern: git2mail-*
-          merge-multiple: true
-
-      - name: Download MacOS artifact
-        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
-        with:
-          path: git2mail-macos
-          pattern: git2mail-*
-          merge-multiple: true
 
       - name: Release Linux artifact
         uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
@@ -107,9 +113,19 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./git2mail-linux/git2mail
+          asset_path: linux/git2mail
+          asset_name: git2mail-linux-static-${{ steps.get_version.outputs.version }}
           asset_content_type: application/octet-stream
-          asset_name: git2mail-linux-static-${{ steps.get_version.outputs.VERSION }}
+
+      - name: Release macOS artifact
+        uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: macos/git2mail
+          asset_name: git2mail-macos-${{ steps.get_version.outputs.version }}
+          asset_content_type: application/octet-stream
 
       - name: Release Windows artifact
         uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
@@ -117,16 +133,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./git2mail-windows/git2mail.exe
+          asset_path: windows/git2mail.exe
+          asset_name: git2mail-windows-${{ steps.get_version.outputs.version }}.exe
           asset_content_type: application/octet-stream
-          asset_name: git2mail-windows-${{ steps.get_version.outputs.VERSION }}
-
-      - name: Release MacOS artifact
-        uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./git2mail-macos/git2mail
-          asset_content_type: application/octet-stream
-          asset_name: git2mail-macos-${{ steps.get_version.outputs.VERSION }}
