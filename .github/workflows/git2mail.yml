@@ -8,9 +8,6 @@ on:
     tags:
       - "v*"
 
-env:
-  GITHUB_REF: "${{ github.ref }}"
-
 jobs:
   build:
     strategy:
@@ -35,6 +32,8 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      with:
+        toolchain: stable
     - name: Set target if any
       if: matrix.target
       run: rustup target add ${{ matrix.target }}
@@ -69,8 +68,8 @@ jobs:
         id: get_version
         shell: bash
         run: |
-          echo "using version tag ${GITHUB_REF:15}"
-          echo "version=${GITHUB_REF:15}" >> $GITHUB_OUTPUT
+          echo "using version tag ${{ github.ref_name }}"
+          echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Get Changelog Entry
@@ -102,7 +101,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: git2mail-${{ steps.get_version.outputs.version }}
+          tag_name: ${{ steps.get_version.outputs.version }}
           release_name: git2mail-${{ steps.get_version.outputs.version }}
           body: ${{ steps.changelog_reader.outputs.changes }}
           draft: true
