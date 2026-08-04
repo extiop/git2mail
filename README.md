@@ -10,6 +10,19 @@ https://docs.rs/git2mail)
 
 Lean, fast and safe developers' email finder.
 
+# Introduction
+
+git2mail is an OSINT tool that finds developers' email addresses from GitHub repositories and profiles. It scrapes commits metadata through the GitHub API to retrieve author emails, supporting both single and multi-token authentication for bulk reconnaissance.
+
+# Repository
+
+This repository contains:
+
+* `src`: the Rust source code implementing git2mail
+* `.github`: Continuous Integration needs, community files and issue/PR templates
+* `.cargo`: Cargo configuration for cross-platform builds
+* `tokens.example.json`: example token file for multi-account scraping
+
 ## 👁️ Philosophy
 
 In opposition to https://github.com/mxrch/GitFive, git2mail is meant to be extremely fast for bulk offensive reconnaissance or OSINT. It can be used with multiple personal access tokens (cf. https://github.com/settings/tokens), not only linked to one account then, to fetch a huge amount of emails.
@@ -184,7 +197,7 @@ This project is limited to GitHub repositories.
 
 ## 💻 Contributing
 
-Please if you want to bring your stone to the building, read and follow `CONTRIBUTING.md`.
+Please if you want to bring your stone to the building, read and follow [`CONTRIBUTING.md`](.github/CONTRIBUTING.md).
 
 ## ⚖️ License
 
