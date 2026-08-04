@@ -1,0 +1,5 @@
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = [
+    # Static linking on Windows (avoids requiring Visual Studio)
+    "-C", "target-feature=+crt-static",
+]

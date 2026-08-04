@@ -24,6 +24,7 @@ jobs:
             os: macos-latest
           - build: windows
             os: windows-latest
+            target: x86_64-pc-windows-msvc
             extension: .exe
 
     runs-on: ${{ matrix.os }}
@@ -33,17 +34,21 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: stable
+        targets: ${{ matrix.target }}
+    - name: Set target if any
+      if: matrix.target
+      run: rustup target add ${{ matrix.target }}
     - name: Build
       env:
         RUSTFLAGS: -D warnings
-      run: cargo build --release --all-features --all --verbose
+      run: cargo build --release --all-features --all --verbose ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
     - name: Run tests
-      run: cargo test --all --release --verbose
+      run: cargo test --all --release --verbose ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
     - name: Upload resulting 'git2mail'
       uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b # v4.5.0
       with:
         name: ${{ matrix.build }}
-        path: ./target/release/git2mail${{ matrix.extension }}
+        path: ${{ matrix.target && format('./target/{0}/release/git2mail{1}', matrix.target, matrix.extension || '') || format('./target/release/git2mail{0}', matrix.extension || '') }}
 
   fmt:
     runs-on: ubuntu-latest

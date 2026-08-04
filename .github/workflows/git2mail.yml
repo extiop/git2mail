@@ -26,6 +26,7 @@ jobs:
             cargo_arg: --release
           - build: windows
             os: windows-latest
+            target: x86_64-pc-windows-msvc
             cargo_arg: --release
             extension: .exe
 
@@ -34,12 +35,14 @@ jobs:
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - uses: dtolnay/rust-toolchain@stable
-    - name: If target is musl, install musl-tools (including musl-gcc) and set target
+    - name: Set target if any
+      if: matrix.target
+      run: rustup target add ${{ matrix.target }}
+    - name: If target is musl, install musl-tools (including musl-gcc)
       if: matrix.target == 'x86_64-unknown-linux-musl'
       run: |
         sudo apt update
         sudo apt install musl-tools -y
-        rustup target add ${{ matrix.target }}
     - name: Build
       run: cargo build ${{ matrix.cargo_arg }} --all-features --package git2mail --verbose ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
     - name: Prepare binary path
