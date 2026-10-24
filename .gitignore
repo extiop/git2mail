@@ -10,3 +10,7 @@ tokens.json
 
 # pi-subagents
 .pi-subagents/
+
+# internal release kit (handoff notes, PR drafts, tokens)
+.pi-release/
+/doc/book
