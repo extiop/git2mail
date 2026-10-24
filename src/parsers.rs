@@ -2,6 +2,96 @@ use crate::errors::Error;
 use regex::Regex;
 use std::sync::LazyLock;
 
+/// Cuts a pasted URL down to its address: leading/trailing whitespace is
+/// trimmed and the github.com page-navigation paste artifacts (`?query`,
+/// `#fragment` — `?tab=repositories`, `?plain=1#L12`, `#readme`…) are
+/// stripped, before either regex runs. Applied to both URL shapes so a
+/// `?tab=repositories` suffix on a profile URL is classified as a profile
+/// (no repository part) instead of a repository whose name holds the whole
+/// artifact, and so neither shape reaches the API percent-encoding a
+/// guaranteed-404 request. No GitHub login or repository name contains
+/// `?`, `#` or surrounding whitespace, so the cut can never mangle a real
+/// target (unlike the `.git` suffix, which is kept verbatim, documented).
+fn normalize_pasted_url(github_url: &str) -> &str {
+    github_url
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(github_url)
+}
+
+/// Upper bound on the URL length the parsers accept. A GitHub URL this tool
+/// can act on is a few dozen characters (login ≤ 39, repository name ≤ 100,
+/// plus scheme and paste artifacts); the capture-slot extraction over the
+/// regexes' greedy tail group costs on the order of a microsecond per
+/// character, so a megabyte-scale paste or hostile API-supplied `html_url`
+/// would otherwise burn seconds of CPU per parse before failing as
+/// unparseable anyway. Past the bound the URL fails with the same
+/// [`Error::InvalidUrl`] the shape regexes produce, immediately.
+const MAX_URL_LEN: usize = 2048;
+
+/// Fails an over-long URL before the regexes run: same [`Error::InvalidUrl`]
+/// contract as a shape mismatch, without the per-character parse cost.
+fn check_url_len(github_url: &str) -> Result<(), Error> {
+    if github_url.len() > MAX_URL_LEN {
+        return Err(Error::InvalidUrl(format!(
+            "URL is too long ({} bytes, the maximum is {MAX_URL_LEN})",
+            github_url.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The only hosts a web URL may point at (case-insensitively, the `www.`
+/// alias included): the documented web URL formats are all github.com.
+const WEB_URL_HOSTS: [&str; 2] = ["github.com", "www.github.com"];
+
+/// Rejects a http(s) or `git://` URL whose host is not github.com, before
+/// any regex or API work. The parsers used to accept any host: a pasted
+/// `https://gitlab.com/a/b` was silently re-targeted onto api.github.com
+/// and the scan reported "GitHub resource not found" after a guaranteed-404
+/// run — telling the user a *GitHub* resource was missing when the actual
+/// problem is that the URL was never a GitHub one (live repro). The
+/// documented `ssh://git@domain.com/group/app` passthrough is untouched:
+/// self-hosted Git SSH remotes are a legitimate input, and scheme-less
+/// (`git@github.com:…`) and other-scheme URLs keep the current behavior.
+fn check_url_host(github_url: &str) -> Result<(), Error> {
+    let Some((scheme, rest)) = github_url.split_once("://") else {
+        // no scheme (`git@github.com:extiop/ctf`): nothing to judge here
+        return Ok(());
+    };
+    if !matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "git" | "ftp" | "ftps"
+    ) {
+        return Ok(());
+    }
+    // the authority ends at the first `/` (or paste artifact, cut by
+    // normalize_pasted_url upstream); the userinfo is split on its own `@`
+    // first, so a `user:pass@host` prefix (whose `:` would otherwise be
+    // mistaken for a port separator) does not hide the host
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
+        .to_ascii_lowercase();
+    if host.is_empty() || WEB_URL_HOSTS.contains(&host.as_str()) {
+        // an empty authority is not a host problem: the shape regexes
+        // produce their usual errors for it
+        return Ok(());
+    }
+    // an explicit port is its own, more precise rejection: the URL clearly
+    // points at github.com but on a port the API client cannot use
+    if host.contains(':') {
+        return Err(Error::InvalidUrl(format!(
+            "unsupported port in {host}: git2mail talks to the GitHub API on the standard port only"
+        )));
+    }
+    Err(Error::InvalidUrl(format!(
+        "unsupported host {host}: git2mail only investigates github.com URLs"
+    )))
+}
+
 /// GitHub project URL (with a repository part).
 // The one allowed `expect` of the crate: a static regex failing to compile
 // is a programming error that no runtime error handling can recover from.
@@ -9,17 +99,28 @@ use std::sync::LazyLock;
 static GITHUB_URL: LazyLock<Regex> = LazyLock::new(|| {
     // Compiled once at first use: a static regex failing to compile is a
     // programming error, hence the one `expect` allowed at static
-    // initialization.
-    Regex::new(r"^((https?|ssh|git|ftps?)://)?(([^/@]+)@)?([^/:]+)[/:]([^/:]+)/(.+)(git)?$")
-        .expect("static GitHub URL regex must compile")
+    // initialization. The scheme group is matched
+    // case-insensitively by spelling both cases out (the crate's `regex`
+    // build has no `unicode-case` feature, so `(?i:)` is unavailable, and
+    // the scope is the scheme only, so logins keep their case): RFC 3986
+    // makes the scheme case-insensitive, and `HTTPS://GITHUB.COM/…` must
+    // parse exactly like its lowercase form (the host already does).
+    Regex::new(
+        r"^(([hH][tT][tT][pP][sS]?|[sS][sS][hH]|[gG][iI][tT]|[fF][tT][pP][sS]?)://)?(([^/@]+)@)?([^/:]+)[/:]([^/:]+)/(.+)(git)?$",
+    )
+    .expect("static GitHub URL regex must compile")
 });
 
 /// GitHub profile URL (only an author).
 // Same as [`GITHUB_URL`]: static-regex compilation cannot fail at runtime.
 #[expect(clippy::expect_used)]
 static GITHUB_URL_PROFILE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^((https?|ssh|git|ftps?)://)?(([^/@]+)@)?([^/:]+)[/:]([^/:]+)$")
-        .expect("static GitHub profile URL regex must compile")
+    // scheme case-insensitivity: same rule (and same hand-spelled classes)
+    // as [`GITHUB_URL`]
+    Regex::new(
+        r"^(([hH][tT][tT][pP][sS]?|[sS][sS][hH]|[gG][iI][tT]|[fF][tT][pP][sS]?)://)?(([^/@]+)@)?([^/:]+)[/:]([^/:]+)$",
+    )
+    .expect("static GitHub profile URL regex must compile")
 });
 
 /// From a project URL, retrieves its author with regex processing.
@@ -29,14 +130,23 @@ static GITHUB_URL_PROFILE: LazyLock<Regex> = LazyLock::new(|| {
 /// Returns [`Error::InvalidUrl`] when the URL matches neither a repository
 /// nor a profile shape (or is empty). Never panics.
 pub fn get_author(github_url: String) -> Result<String, Error> {
-    if let Some(captures) = GITHUB_URL.captures(&github_url) {
+    let github_url = normalize_pasted_url(&github_url);
+    check_url_len(github_url)?;
+    check_url_host(github_url)?;
+    if let Some(captures) = GITHUB_URL.captures(github_url) {
         // we know that it is in group 6 that the author is
         return captures
             .get(6)
             .map(|item| item.as_str().to_string())
-            .ok_or_else(|| Error::InvalidUrl("repository author not found".to_string()));
+            .ok_or_else(|| {
+                Error::InvalidUrl(
+                    "this URL does not point to a GitHub repository or profile — use \
+                     https://github.com/owner/repository or https://github.com/owner"
+                        .to_string(),
+                )
+            });
     }
-    match GITHUB_URL_PROFILE.captures(&github_url) {
+    match GITHUB_URL_PROFILE.captures(github_url) {
         Some(captures) => captures
             .get(6)
             .map(|item| item.as_str().to_string())
@@ -49,7 +159,11 @@ pub fn get_author(github_url: String) -> Result<String, Error> {
             "profile URL ends with '/': remove the trailing slash, e.g. https://github.com/some-user"
                 .to_string(),
         )),
-        None => Err(Error::InvalidUrl("repository author not found".to_string())),
+        None => Err(Error::InvalidUrl(
+            "this URL does not point to a GitHub repository or profile — use \
+             https://github.com/owner/repository or https://github.com/owner"
+                .to_string(),
+        )),
     }
 }
 
@@ -63,15 +177,34 @@ pub fn get_author(github_url: String) -> Result<String, Error> {
 /// Returns [`Error::InvalidUrl`] when the URL matches neither a repository
 /// nor a profile shape (or is empty). Never panics.
 pub fn get_repository(github_url: String) -> Result<String, Error> {
-    if let Some(captures) = GITHUB_URL.captures(&github_url) {
+    // the paste artifacts are cut from the whole URL before matching (see
+    // [`normalize_pasted_url`]): a profile URL pasted with its
+    // `?tab=repositories` suffix must resolve to the profile, not to a
+    // repository named after the artifact-stripped author
+    let github_url = normalize_pasted_url(&github_url);
+    check_url_len(github_url)?;
+    check_url_host(github_url)?;
+    if let Some(captures) = GITHUB_URL.captures(github_url) {
         // we know that it is in group 7 that the repository is
-        return captures
+        let repository = captures
             .get(7)
-            .map(|item| item.as_str().to_string())
-            .ok_or_else(|| Error::InvalidUrl("repository name not found".to_string()));
+            .map(|item| {
+                // a trailing `/` is a trivially common paste artifact
+                // (`https://github.com/extiop/ctf/`), never part of a
+                // repository name: left in, it would be percent-encoded
+                // into an unresolvable `/repos/extiop/ctf%2F/commits`
+                // request (a guaranteed 404 on an existing repository).
+                // Unlike the `.git` suffix, which is kept verbatim
+                // (documented behavior), it can never be part of a name.
+                item.as_str().trim_end_matches('/')
+            })
+            .filter(|name| !name.is_empty())
+            .map(String::from)
+            .ok_or_else(|| Error::InvalidUrl("repository name not found".to_string()))?;
+        return Ok(repository);
     }
     // only author case, URL targets an user profile: there is no repository
-    match get_author(github_url) {
+    match get_author(github_url.to_string()) {
         Ok(_) => Ok(String::new()),
         Err(err) => Err(err),
     }
@@ -87,6 +220,69 @@ mod tests {
     use crate::errors::Error;
 
     // author
+
+    #[test]
+    fn get_author_and_get_repository_reject_an_over_long_url() {
+        // the capture-slot extraction over the regexes' greedy tail group
+        // costs on the order of a microsecond per character: a megabyte-scale
+        // paste (or hostile API-supplied html_url) must hit the length bound
+        // and fail immediately, not burn seconds of CPU per parse before
+        // failing as unparseable anyway
+        let padded = format!("https://github.com/extiop/{}", "r".repeat(10_000));
+        let error = get_author(padded.clone()).expect_err("an over-long URL must be rejected");
+        assert!(matches!(error, Error::InvalidUrl(details) if details.contains("too long")));
+        let error = get_repository(padded).expect_err("an over-long URL must be rejected");
+        assert!(matches!(error, Error::InvalidUrl(details) if details.contains("too long")));
+        // a long-but-bounded URL still parses: the bound only stops the
+        // pathological tail
+        let long_but_valid = format!("https://github.com/extiop/{}", "r".repeat(2000));
+        assert_eq!(
+            get_author(long_but_valid.clone()).expect("a bounded URL must still parse"),
+            "extiop"
+        );
+        assert_eq!(
+            get_repository(long_but_valid).expect("a bounded URL must still parse"),
+            "r".repeat(2000)
+        );
+        // the bound applies to the normalized URL: paste artifacts cut
+        // before the check do not count against it
+        let artifact_padded = format!("https://github.com/extiop/ctf?{}", "x".repeat(10_000));
+        assert_eq!(
+            get_repository(artifact_padded).expect("the trimmed URL must still parse"),
+            "ctf"
+        );
+    }
+
+    #[test]
+    fn get_author_userinfo_does_not_hide_the_host() {
+        // a `user:pass@host` prefix must not be mistaken for a port-bearing
+        // authority (the old split-on-':' took `user` for the host): the
+        // real host is judged, and a foreign host under userinfo is refused
+        assert_eq!(
+            get_author("https://user:pass@github.com/extiop/ctf".to_string())
+                .expect("the userinfo prefix must not hide github.com"),
+            "extiop"
+        );
+        let error = get_author("https://github.com@evil.com/extiop/ctf".to_string())
+            .expect_err("the rightmost @ wins: evil.com is not github.com");
+        assert!(
+            matches!(&error, Error::InvalidUrl(details) if details.contains("evil.com")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn get_author_rejects_an_explicit_port_with_a_dedicated_message() {
+        // the guard used to reject a port-bearing URL with the generic
+        // "unsupported host github.com:443" wording, which read like a
+        // wrong-target complaint; the port now has its own message
+        let error = get_author("https://github.com:443/extiop/ctf".to_string())
+            .expect_err("a port-bearing URL must be rejected");
+        assert!(
+            matches!(&error, Error::InvalidUrl(details) if details.contains("port")),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn get_author_git() {
@@ -188,6 +384,18 @@ mod tests {
     }
 
     #[test]
+    fn get_author_profile_url_trailing_slash_is_rejected() {
+        // a profile URL has no name after its separator, so a trailing `/`
+        // cannot be trimmed away like the repository case: the paste
+        // artifact is rejected outright instead of resolving into a
+        // guaranteed-404 request against an empty name
+        assert!(matches!(
+            get_author("https://github.com/extiop/".to_string()),
+            Err(Error::InvalidUrl(_))
+        ));
+    }
+
+    #[test]
     fn get_author_empty_url() {
         assert!(get_author("".to_string()).is_err());
     }
@@ -198,10 +406,59 @@ mod tests {
     }
 
     #[test]
-    fn get_author_any_host_is_accepted() {
-        // the regex does not enforce the host: current behavior keeps parsing
+    fn get_author_rejects_a_non_github_web_host_instead_of_retargeting_the_scan() {
+        // the regexes do not enforce the host, and any-host parsing used to
+        // silently re-target the scan onto api.github.com: a pasted
+        // `https://gitlab.com/a/b` (or any other forge) reported "GitHub
+        // resource not found" after a guaranteed-404 run, telling the user
+        // a GitHub resource was missing when the URL was never a GitHub one
+        // (live repro). A http(s)/git:// URL on another host is now rejected
+        // with the offending host named, before any scan runs
+        for url in [
+            "https://gitlab.com/extiop/ctf",
+            "http://gitlab.com/extiop/ctf",
+            "git://gitlab.com/extiop/ctf",
+            "https://github.com.evil.com/extiop/ctf",
+            "HTTPS://GitLab.COM/extiop",
+        ] {
+            let error =
+                get_author(url.to_string()).expect_err("a non-github web host must be rejected");
+            assert!(
+                matches!(&error, Error::InvalidUrl(details) if details.contains("unsupported host")),
+                "unexpected error for {url}: {error:?}"
+            );
+            let error = get_repository(url.to_string())
+                .expect_err("a non-github web host must be rejected");
+            assert!(
+                matches!(&error, Error::InvalidUrl(details) if details.contains("unsupported host")),
+                "unexpected error for {url}: {error:?}"
+            );
+        }
+        // the error names the offending host
+        let error = get_author("https://gitlab.com/extiop/ctf".to_string()).expect_err("must fail");
+        assert!(
+            error.to_string().contains("gitlab.com"),
+            "the error must name the offending host: {error}"
+        );
+        // the github.com hosts are accepted, case-insensitively, `www.`
+        // alias included
         assert_eq!(
-            get_author("https://gitlab.com/extiop/ctf".to_string()).expect("must parse"),
+            get_author("https://GitHub.com/extiop/ctf".to_string()).expect("must parse"),
+            "extiop"
+        );
+        assert_eq!(
+            get_author("https://www.github.com/extiop/ctf".to_string()).expect("must parse"),
+            "extiop"
+        );
+        // the documented ssh:// passthrough is untouched: self-hosted Git
+        // SSH remotes are a legitimate input
+        assert_eq!(
+            get_author("ssh://git@domain.com/group/app".to_string()).expect("must parse"),
+            "group"
+        );
+        // and so is the scheme-less documented form
+        assert_eq!(
+            get_author("git@github.com:extiop/ctf".to_string()).expect("must parse"),
             "extiop"
         );
     }
@@ -211,7 +468,11 @@ mod tests {
         // stringly-typed errors are gone: the error is the crate Error
         match get_author("https://github.com".to_string()) {
             Err(Error::InvalidUrl(details)) => {
-                assert_eq!(details, "repository author not found");
+                assert_eq!(
+                    details,
+                    "this URL does not point to a GitHub repository or profile — use \
+                     https://github.com/owner/repository or https://github.com/owner"
+                );
             }
             other => panic!("expected Error::InvalidUrl, got {other:?}"),
         }
@@ -220,7 +481,7 @@ mod tests {
     // repository
 
     #[test]
-    fn get_get_repository_git() {
+    fn get_repository_git_protocol() {
         assert_eq!(
             get_repository("git://github.com/extiop/ctf".to_string()).expect("must parse"),
             "ctf"
@@ -228,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn get_get_repository_git_at() {
+    fn get_repository_git_at_syntax() {
         assert_eq!(
             get_repository("git@github.com/extiop/ctf".to_string()).expect("must parse"),
             "ctf"
@@ -236,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn get_get_repository_https() {
+    fn get_repository_https_url() {
         assert_eq!(
             get_repository("https://github.com/extiop/ctf".to_string()).expect("must parse"),
             "ctf"
@@ -249,6 +510,16 @@ mod tests {
             get_repository("https://github.com/extiop".to_string()).expect("must parse"),
             ""
         );
+    }
+
+    #[test]
+    fn get_repository_profile_trailing_slash_is_rejected() {
+        // the same profile-shape rejection seen from the repository parser:
+        // a lone trailing `/` after the author is not a repository name
+        assert!(matches!(
+            get_repository("https://github.com/extiop/".to_string()),
+            Err(Error::InvalidUrl(_))
+        ));
     }
 
     #[test]
@@ -297,10 +568,64 @@ mod tests {
     }
 
     #[test]
-    fn get_repository_trailing_slash_is_kept() {
+    fn get_repository_trailing_slash_is_trimmed() {
+        // a trailing `/` is a paste artifact, never part of a repository
+        // name: percent-encoding it (`ctf%2F`) would make the scan a
+        // guaranteed 404 on an existing repository
         assert_eq!(
             get_repository("https://github.com/extiop/ctf/".to_string()).expect("must parse"),
-            "ctf/"
+            "ctf"
+        );
+        // several trailing slashes are paste noise too, and a name made only
+        // of slashes is not a repository
+        assert_eq!(
+            get_repository("https://github.com/extiop/ctf//".to_string()).expect("must parse"),
+            "ctf"
+        );
+        assert!(matches!(
+            get_repository("https://github.com/extiop//".to_string()),
+            Err(Error::InvalidUrl(_))
+        ));
+    }
+
+    #[test]
+    fn get_repository_strips_query_and_fragment_paste_artifacts() {
+        // github.com page-navigation paste artifacts (`?tab=readme-ov-file`,
+        // `?plain=1#L12`, `#readme`) are never part of a repository name:
+        // left in, they are percent-encoded into an unresolvable
+        // `/repos/octocat/Hello-World%3Ftab%3D…` request — a misleading
+        // "GitHub resource not found" on an existing repository (live
+        // repro). No GitHub repository name contains `?` or `#`.
+        for url in [
+            "https://github.com/octocat/Hello-World?tab=readme-ov-file",
+            "https://github.com/octocat/Hello-World?plain=1#L12",
+            "https://github.com/octocat/Hello-World#readme",
+            "https://github.com/octocat/Hello-World/",
+        ] {
+            assert_eq!(
+                get_repository(url.to_string()).expect("must parse"),
+                "Hello-World",
+                "wrong repository for {url}"
+            );
+            assert_eq!(
+                get_author(url.to_string()).expect("must parse"),
+                "octocat",
+                "wrong author for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_repository_git_suffix_is_still_kept_verbatim() {
+        // the documented `.git` passthrough is unaffected by the trailing-
+        // slash trim: only slashes are trimmed, never a `.git` suffix
+        assert_eq!(
+            get_repository("https://github.com/extiop/ctf.git".to_string()).expect("must parse"),
+            "ctf.git"
+        );
+        assert_eq!(
+            get_repository("https://github.com/extiop/ctf.git/".to_string()).expect("must parse"),
+            "ctf.git"
         );
     }
 
@@ -324,5 +649,77 @@ mod tests {
     #[test]
     fn get_repository_empty_url() {
         assert!(get_repository("".to_string()).is_err());
+    }
+
+    // scheme case-insensitivity (RFC 3986): an uppercase-scheme URL must
+    // parse exactly like its lowercase form, with the login/repository case
+    // preserved (the host already matched case-insensitively)
+    #[test]
+    fn get_author_and_repository_accept_an_uppercase_scheme() {
+        for url in [
+            "HTTPS://GITHUB.COM/ELIBENPORAT/HIKARU",
+            "Http://GitHub.com/ELIBENPORAT/HIKARU",
+            "SSH://github.com/ELIBENPORAT/HIKARU",
+            "GIT@GitHub.com:ELIBENPORAT/HIKARU",
+        ] {
+            assert_eq!(
+                get_author(url.to_string()).expect("must parse"),
+                "ELIBENPORAT",
+                "wrong author for {url}"
+            );
+            assert_eq!(
+                get_repository(url.to_string()).expect("must parse"),
+                "HIKARU",
+                "wrong repository for {url}"
+            );
+        }
+    }
+
+    // the single most-pasted profile URL suffix (`?tab=repositories`) and
+    // its fragment cousin must classify the URL as a profile (no repository
+    // part), not as a repository named after the artifact-stripped author —
+    // the pre-fix behavior sent `/repos/{author}/{author}/commits` and
+    // failed with a misleading "GitHub resource not found" on an existing
+    // profile (live repro)
+    #[test]
+    fn get_repository_profile_paste_artifacts_resolve_to_profile_mode() {
+        for url in [
+            "https://github.com/elibenporat?tab=repositories",
+            "https://github.com/elibenporat#repositories",
+            "https://github.com/elibenporat?tab=repositories&foo=1#bar",
+        ] {
+            assert_eq!(
+                get_repository(url.to_string()).expect("must parse"),
+                "",
+                "{url} must resolve to a profile scan"
+            );
+            assert_eq!(
+                get_author(url.to_string()).expect("must parse"),
+                "elibenporat",
+                "wrong author for {url}"
+            );
+        }
+    }
+
+    // surrounding whitespace is a paste artifact too: a trailing space is
+    // otherwise percent-encoded into a guaranteed-404 `%20` request (live
+    // repro on the repository shape)
+    #[test]
+    fn get_author_and_repository_strip_surrounding_whitespace() {
+        assert_eq!(
+            get_author("  https://github.com/octocat/Hello-World\t".to_string())
+                .expect("must parse"),
+            "octocat"
+        );
+        assert_eq!(
+            get_repository("https://github.com/octocat/Hello-World ".to_string())
+                .expect("must parse"),
+            "Hello-World"
+        );
+        assert_eq!(
+            get_repository("https://github.com/octocat ".to_string()).expect("must parse"),
+            "",
+            "a whitespace-padded profile URL stays a profile"
+        );
     }
 }

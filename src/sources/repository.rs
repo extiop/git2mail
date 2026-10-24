@@ -4,31 +4,81 @@
 
 use crate::correlate::{CommitAuthor, RepoScan};
 use crate::errors::Error;
-use crate::github::{Client, fetch_paginated};
+use crate::github::{Client, fetch_paginated_with_page_size};
+use crate::output::sanitize_log_text as log_safe;
 use crate::sources::{PER_PAGE, is_usable_email, merge_emails, sort_emails};
 use serde_json::Value;
+use std::cell::Cell;
+
+/// Cap on the number of commit pages one repository scan lists (the same
+/// honesty budget as the reverse lookup's candidate verification): only the
+/// most recent `MAX_COMMIT_PAGES * PER_PAGE` commits of the default branch
+/// are walked, so a single large repository (or an `org` scan across many
+/// of them) can never burn the whole hourly token pool on one commit
+/// history and abort a nearly-complete investigation with
+/// [`Error::RateLimitExhausted`]. When the budget cuts the walk, a warning
+/// says the history may be incomplete instead of the scan silently
+/// pretending it saw all of it.
+pub(crate) const MAX_COMMIT_PAGES: usize = 10;
 
 /// Fetches a GitHub repository's commits pages and returns the authors'
 /// emails, deduplicated, noreply addresses excluded, sorted, together with
 /// the per-author attribution (name, email, commit count) of the
 /// correlation report.
+///
+/// `base` is the API base URL: the production callers pass the GitHub API
+/// base, and the offline tests run this same code against a loopback mock.
+///
+/// The listing is capped at [`MAX_COMMIT_PAGES`] pages of commits (counted
+/// in raw commits): when the budget cuts the walk, a warning says the
+/// history may be incomplete instead of the scan silently pretending it
+/// saw all of it.
 pub(crate) fn scan_repository(
     client: &Client,
+    base: &str,
     author: &str,
     repository: &str,
 ) -> Result<RepoScan, Error> {
     // one CommitAuthor per kept commit: pages are merged below, summing the
-    // hits of every (name, email) pair across pages
-    let kept_commits: Vec<CommitAuthor> = fetch_paginated(
+    // hits of every (name, email) pair across pages. The raw commit count
+    // streams through this cell so a budget cut can be warned about after
+    // the walk
+    let listed_commits = Cell::new(0usize);
+    let commit_ceiling = MAX_COMMIT_PAGES * usize::from(PER_PAGE);
+    let kept_commits: Vec<CommitAuthor> = fetch_paginated_with_page_size(
         client,
         |page| {
+            // the names are parser- or listing-derived (a profile's repos
+            // listing, an email candidate's `html_url`): percent-encoding
+            // keeps a hostile `?`, `#`, `&` or `/` from re-targeting the
+            // authenticated request to another path or query
             format!(
-                "https://api.github.com/repos/{author}/{repository}/commits?per_page={PER_PAGE}&page={page}"
+                "{base}/repos/{}/{}/commits?per_page={PER_PAGE}&page={page}",
+                crate::sources::percent_encode(author),
+                crate::sources::percent_encode(repository)
             )
         },
-        parse_commit_page,
-        None,
+        |json| {
+            let (page_authors, raw_count) = parse_commit_page(json)?;
+            listed_commits.set(listed_commits.get() + raw_count);
+            Ok((page_authors, raw_count))
+        },
+        Some(commit_ceiling),
+        PER_PAGE,
     )?;
+    if listed_commits.get() >= commit_ceiling {
+        // the raw-count ceiling was reached: the walk was cut at the
+        // repository budget (a repository with exactly `commit_ceiling`
+        // commits also lands here — the "may" phrasing keeps the warning
+        // honest for that boundary case too). Say so instead of letting the
+        // report look complete
+        log::warn!(
+            "repository {}/{}: only the most recent {} commits were scanned (built-in limit), older commits may hold emails that were missed",
+            log_safe(author),
+            log_safe(repository),
+            listed_commits.get()
+        );
+    }
 
     // merge sums the hits of a (name, email) pair seen on several pages
     let mut authors: Vec<CommitAuthor> = Vec::new();
@@ -69,15 +119,17 @@ fn merge_author(authors: &mut Vec<CommitAuthor>, author: CommitAuthor) {
 /// number of commits the page holds: the raw count is the end-of-listing
 /// signal of `fetch_paginated`, so a page whose every author uses a
 /// `noreply` address (parsed to zero authors) does not end the listing.
-///
-/// Every kept email is attributed to its author name (the correlation
-/// report, issue #5): a commit with no author name falls back to the email
-/// itself as the author key, so every kept email is correlated.
+/// A 200 body that is not a JSON array is an intermediary or a shape
+/// change, not an empty page, and fails explicitly instead of silently
+/// ending the scan as a complete-looking zero-email result (the same
+/// explicit-requirement rule as every other listing of the crate).
 fn parse_commit_page(json: &Value) -> Result<(Vec<CommitAuthor>, usize), Error> {
-    let mut authors: Vec<CommitAuthor> = Vec::new();
     let Some(items) = json.as_array() else {
-        return Ok((authors, 0));
+        return Err(Error::InvalidProfile(
+            "commits payload: not an array".to_string(),
+        ));
     };
+    let mut authors: Vec<CommitAuthor> = Vec::new();
     for item in items {
         let Some(author) = item.get("commit").and_then(|commit| commit.get("author")) else {
             continue;
@@ -132,6 +184,103 @@ mod tests {
             parse_commit_page(&serde_json::json!([])).expect("parsing must succeed");
         assert!(authors.is_empty());
         assert_eq!(raw_count, 0);
+    }
+
+    #[test]
+    fn parse_commit_page_fails_explicitly_on_a_body_that_is_not_an_array() {
+        // a 200 body that is not a JSON array (captive portal, proxy, shape
+        // change) is not an empty page: it must fail explicitly instead of
+        // silently ending the scan as a complete-looking zero-email result
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!("[]"),
+            serde_json::json!(null),
+        ] {
+            let error =
+                parse_commit_page(&body).expect_err("a non-array body must fail explicitly");
+            assert!(matches!(error, Error::InvalidProfile(details) if details.contains("array")));
+        }
+    }
+
+    #[test]
+    fn scan_repository_percent_encodes_the_author_and_repository_path_segments() {
+        // the names composed into the API path can be parser- or
+        // listing-derived: a hostile `?`, `#`, `&` or space must be
+        // percent-encoded, never passed raw (it would re-target the
+        // authenticated request to another path or query)
+        let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
+            let request_line = &request[0];
+            assert!(
+                request_line.starts_with("GET /repos/a%3Fb/c%23d%26e/commits?"),
+                "unexpected request line: {request_line}"
+            );
+            (200, vec![], "[]".to_string())
+        });
+
+        let client = crate::github::Client::anonymous().expect("client must build");
+        scan_repository(&client, &address, "a?b", "c#d&e")
+            .expect("the encoded names must still scan");
+        server.join();
+    }
+
+    #[test]
+    fn a_trailing_slash_url_scans_the_existing_repository_end_to_end() {
+        // the pasted URL `https://github.com/extiop/ctf/` must reach the
+        // API as `/repos/extiop/ctf/commits`, not the unresolvable
+        // `/repos/extiop/ctf%2F/commits` (a guaranteed 404 on an existing
+        // repository): the parser trims the paste artifact, the scan runs
+        // on the real name
+        let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
+            let request_line = &request[0];
+            assert!(
+                request_line.starts_with("GET /repos/extiop/ctf/commits?"),
+                "unexpected request line: {request_line}"
+            );
+            (200, vec![], "[]".to_string())
+        });
+
+        let client = crate::github::Client::anonymous().expect("client must build");
+        let author = crate::parsers::get_author("https://github.com/extiop/ctf/".to_string())
+            .expect("the pasted URL must parse");
+        let repository =
+            crate::parsers::get_repository("https://github.com/extiop/ctf/".to_string())
+                .expect("the pasted URL must parse");
+        scan_repository(&client, &address, &author, &repository)
+            .expect("the trimmed name must still scan");
+        server.join();
+    }
+
+    #[test]
+    fn parse_commit_page_drops_hostile_emails_at_the_parse_seam() {
+        // the plain-output acceptance rule is enforced here, in
+        // `parse_commit_page` (not only in the `is_usable_email` helper):
+        // a commit email carrying a control character (a crafted newline
+        // would inject lines into the one-email-per-line results file) or
+        // whitespace must never be kept
+        let json: Value = serde_json::json!([
+            { "commit": { "author": { "email": "dev@x.com\n evil@x.com" } } },
+            { "commit": { "author": { "email": "dev@x.com\u{1b}[31m" } } },
+            { "commit": { "author": { "email": "dev\t@x.com" } } },
+            { "commit": { "author": { "email": "dev @x.com" } } },
+            { "commit": { "author": { "email": "real@x.com" } } },
+            // git permits any author-email string: a domainless value (a
+            // bare username, seen live in real commit payloads) is not a
+            // mailbox and must never be reported as a found email — the
+            // `email` subcommand itself rejects it as invalid
+            { "commit": { "author": { "name": "Thomas", "email": "jdoe" } } }
+        ]);
+        let (authors, raw_count) = parse_commit_page(&json).expect("parsing must succeed");
+        // the raw count still counts the page's commits (end-of-listing
+        // signal), but only the usable email is kept
+        assert_eq!(raw_count, 6);
+        assert_eq!(
+            authors,
+            vec![CommitAuthor {
+                name: "real@x.com".to_string(),
+                email: "real@x.com".to_string(),
+                hits: 1,
+            }]
+        );
     }
 
     #[test]
@@ -214,6 +363,38 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn scan_repository_commit_listing_is_capped_per_repository() {
+        // a repository whose history never ends (every page holds 100
+        // commits with a fresh, usable email) must not walk its entire
+        // commit history: the repository budget caps the listing at
+        // MAX_COMMIT_PAGES pages counted in raw commits, and the walk stops
+        // instead of draining the token pool page after page
+        let (address, server) = crate::github::mock::serve_requests(move |index, _request| {
+            let commits: Vec<String> = (0..100)
+                .map(|i| {
+                    format!(
+                        r#"{{"commit": {{"author": {{"name": "Dev{}", "email": "dev{}{}@x.com"}}}}}}"#,
+                        index, index, i
+                    )
+                })
+                .collect();
+            (200, vec![], format!("[{}]", commits.join(",")))
+        });
+
+        let client = crate::github::Client::anonymous().expect("client must build");
+        let scan = scan_repository(&client, &address, "extiop", "huge")
+            .expect("the capped listing must succeed");
+        let handled = server.join();
+
+        // the ceiling is reached on the 10th full page: no 11th request, no
+        // empty page to wait for
+        assert_eq!(handled, MAX_COMMIT_PAGES);
+        // every kept author of the capped pages is reported
+        assert_eq!(scan.authors.len(), MAX_COMMIT_PAGES * 100);
+        assert_eq!(scan.emails.len(), MAX_COMMIT_PAGES * 100);
     }
 
     #[test]

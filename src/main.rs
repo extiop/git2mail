@@ -1,11 +1,16 @@
-//! `git2mail` command-line interface: `scan` a GitHub URL or `search`
-//! repositories by keyword, then write the found developers' emails to
-//! the `results/` outputs (see the lib crate for the implementation).
+//! `git2mail` command-line interface: `scan` a GitHub URL, `search`
+//! repositories by keyword, run the full `user` profile investigation or
+//! the `org` organization investigation, then write the found developers'
+//! emails to the `results/` outputs (see the lib crate for the
+//! implementation).
 use clap::{Parser, Subcommand};
+use git2mail::email;
 use git2mail::errors::Error;
+use git2mail::org;
 use git2mail::output;
 use git2mail::parsers;
 use git2mail::sources::{ScanOutcome, Scanner, SearchQualifiers};
+use git2mail::user;
 use log::info;
 use std::path::PathBuf;
 
@@ -13,10 +18,10 @@ use std::path::PathBuf;
 #[derive(clap::Args)]
 struct SharedArgs {
     /// Authenticate with your GitHub token (raises the limit from 60 to
-    /// 5000 requests/hour; create one at github.com/settings/tokens —
-    /// visible in your shell history and process list: prefer
-    /// `--token-file`; wins over --token-file when both are given;
-    /// `--token ""` forces anonymous)
+    /// 5000 requests/hour). Create one at github.com/settings/tokens.
+    /// Typing it here leaves it visible in your shell history and to other
+    /// programs — prefer `--token-file`; when both are given, a non-empty
+    /// --token wins. `--token ""` on its own runs anonymously
     #[arg(short, long)]
     token: Option<String>,
     /// File holding one or more GitHub tokens, e.g. {"0": "ghp_…"} — each
@@ -25,10 +30,10 @@ struct SharedArgs {
     #[arg(long, value_name = "TOKENS_JSON")]
     token_file: Option<PathBuf>,
     /// Also write a JSON report at this path (a structured text file any
-    /// editor can open): the found emails plus a per-author summary (each
-    /// developer's emails, repositories and main language). The text
-    /// output is skipped when the scan finds nothing; the JSON report
-    /// still is
+    /// editor can open): the found emails plus a per-author summary for
+    /// `scan`/`search`, the traced accounts for `email`/`emails`, the full
+    /// profile investigation for `user`, the organization investigation for
+    /// `org`; the path `-` prints the report on screen instead
     #[arg(long, value_name = "PATH")]
     json: Option<PathBuf>,
 }
@@ -38,9 +43,16 @@ struct SharedArgs {
     name = "git2mail",
     author,
     version,
-    about,
+    about = "Find developers' public email addresses on GitHub — from repositories, profiles, organizations and keyword searches",
     arg_required_else_help = true,
-    after_help = "Examples:\n  git2mail scan --url https://github.com/denoland/deno\n  git2mail search --query nmap --language rust\nRun `git2mail <command> --help` for every option."
+    after_help = "Examples:
+  git2mail scan --url https://github.com/denoland/deno
+  git2mail search --query nmap --language rust
+  git2mail user janedoe
+  git2mail org acme   (every developer behind one company)
+  git2mail email jane@acme.com
+  git2mail emails addresses.txt   (bulk: one address per line in the file)
+Run `git2mail <subcommand> --help` for every option."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -54,13 +66,8 @@ struct Cli {
 #[expect(clippy::large_enum_variant)]
 enum Command {
     /// Scan a GitHub repository or profile URL for developers' emails
-    ///
-    /// Examples:
-    ///   git2mail scan --url https://github.com/denoland/deno
-    ///   git2mail scan --url https://github.com/denoland --token-file tokens.json
-    ///
-    /// Results are written to ./results/<mode>/<name>; without a token the
-    /// scan runs anonymously (GitHub: 60 requests/hour).
+    /// (results land in ./results/…; --json <path> writes a report wherever
+    /// you want)
     Scan {
         /// GitHub repository or profile URL you want to scan
         #[arg(short, long)]
@@ -68,15 +75,78 @@ enum Command {
         #[command(flatten)]
         shared: SharedArgs,
     },
+    /// Trace one email address back to its GitHub account (best effort:
+    /// GitHub has no email search, so matching repositories are guessed
+    /// from the address, then their commits are checked). The result
+    /// prints on screen; add `--json <path>` (or `--json -`) to save it
+    Email {
+        /// Email address you want to trace back to its GitHub account
+        address: String,
+        #[command(flatten)]
+        shared: SharedArgs,
+    },
+    /// Trace many email addresses at once (one per line in the file):
+    /// same lookup as `email`, run in parallel over your tokens. The
+    /// report prints on screen; add `--json <path>` (or `--json -`) to
+    /// save it
+    Emails {
+        /// File containing the email addresses to trace back, one per line
+        /// (`#` comments allowed)
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        #[command(flatten)]
+        shared: SharedArgs,
+    },
+    /// Investigate a GitHub profile: past identities, real and guessed
+    /// email addresses, other accounts, SSH keys, outside repositories.
+    ///
+    /// The full report prints on screen (add `--json <path>` or `--json -`
+    /// to save it): past usernames and names found in the account's commit
+    /// noreply addresses (like 12345+jane@users.noreply.github.com — the
+    /// address GitHub puts in commits when you keep your email private),
+    /// real email addresses used, likely addresses guessed from the
+    /// person's name, other accounts that may belong to the same person,
+    /// public SSH keys and work on other people's repositories
+    User {
+        /// GitHub username you want to investigate
+        username: String,
+        /// Try extra guessed email shapes built from the person's name,
+        /// e.g. `{last}{first}` or `{first}.{initial}{last}` (repeatable;
+        /// checked against GitHub like the built-in ones)
+        #[arg(long, value_name = "PATTERN", value_parser = variant_pattern_value)]
+        variant_pattern: Vec<String>,
+        #[command(flatten)]
+        shared: SharedArgs,
+    },
+    /// Investigate a GitHub organization: its public members, its public
+    /// repositories and the developers' emails found scanning them (the
+    /// emails are also saved to the file results/org/<org>; add `--json`
+    /// for the full report)
+    Org {
+        /// GitHub organization name — the word in its page address, e.g.
+        /// `acme` in github.com/acme
+        org: String,
+        /// Scan only the first N repositories (default: every one — big
+        /// organizations take a long time, so try `--limit 10` first)
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+        )]
+        limit: Option<usize>,
+        #[command(flatten)]
+        shared: SharedArgs,
+    },
     /// Search GitHub repositories by keyword and scan them for developers' emails
     Search {
-        /// Query to find interesting GitHub repositories for you
-        #[arg(short, long)]
+        /// Keywords describing the repositories you want (GitHub matches
+        /// them against repository names, descriptions and topics — to
+        /// investigate one person, use the `user` subcommand)
+        #[arg(short, long, value_parser = non_empty_query)]
         query: String,
-        /// Select a language to enhance your repository searches
+        /// Only search repositories written in this language (e.g. `rust`)
         #[arg(short, long)]
         language: Option<String>,
-        /// Defines the limit of scanned repositories
+        /// Only scan the first N repositories found (default: 5)
         #[arg(
             long,
             default_value_t = 5,
@@ -91,17 +161,17 @@ enum Command {
         /// (e.g. `>10`, `5..20`)
         #[arg(long, value_name = "RANGE")]
         forks: Option<String>,
-        /// Filter repositories by size in kilobytes, same syntax as
-        /// `--stars` (e.g. `>1000`, `100..5000`)
-        #[arg(long, value_name = "KB")]
+        /// Filter repositories by size in kilobytes, GitHub search range syntax
+        /// (e.g. `>1000`, `100..5000`), like `--stars`
+        #[arg(long, value_name = "RANGE")]
         size: Option<String>,
-        /// Filter repositories by creation date (e.g. `>2020-01-01`,
-        /// `>=2020`, `2019-01-01..2020-01-01`)
-        #[arg(long, value_name = "DATE")]
+        /// Filter repositories by creation date, GitHub search date syntax
+        /// (e.g. `>2020-01-01`, `>=2020`, `2019-01-01..2020-01-01`)
+        #[arg(long, value_name = "DATE_RANGE")]
         created: Option<String>,
         /// Filter repositories by last-push date, same syntax as `--created`
         /// (e.g. `>2024-01-01`, `>=2023`)
-        #[arg(long, value_name = "DATE")]
+        #[arg(long, value_name = "DATE_RANGE")]
         pushed: Option<String>,
         /// Filter repositories by license (e.g. `mit`, `apache-2.0`)
         #[arg(long, value_name = "ID")]
@@ -109,20 +179,58 @@ enum Command {
         /// Filter repositories by topic (e.g. `osint`, `recon`)
         #[arg(long, value_name = "NAME")]
         topic: Option<String>,
-        /// Restrict the search to one user's repositories (e.g. `--user extiop`)
+        /// Restrict the search to one user's repositories (e.g. `--user extiop`;
+        /// mutually exclusive with `--org`)
         #[arg(long, value_name = "LOGIN", conflicts_with = "org")]
         user: Option<String>,
         /// Restrict the search to one organization's repositories
-        /// (e.g. `--org acme`)
-        #[arg(long, value_name = "LOGIN")]
+        /// (e.g. `--org acme`; mutually exclusive with `--user`)
+        #[arg(long, value_name = "ORG")]
         org: Option<String>,
         #[command(flatten)]
         shared: SharedArgs,
     },
 }
 
+/// Rejects an empty or whitespace-only `--query`: it would compose a bare
+/// `q=` the search API answers with a raw 422, so the rejection happens
+/// client-side, before any request. The value is kept as typed otherwise.
+fn non_empty_query(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err("the query must not be empty".to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+/// The clap value parser of `user --variant-pattern`: the same client-side
+/// rejection as the library validation, surfaced as a clap usage error
+/// (exit 2) instead of a runtime error, like every malformed qualifier.
+fn variant_pattern_value(pattern: &str) -> Result<String, String> {
+    crate::user::validate_variant_pattern(pattern).map_err(|err| err.to_string())?;
+    Ok(pattern.to_string())
+}
+
 fn run() -> Result<(), Error> {
     let cli = Cli::parse();
+    // the startup line goes through the logger after clap: a `--help` or
+    // `--version` exit above must print only what was asked for, never a
+    // stray "Starting git2mail!" banner above the help text
+    info!("Starting git2mail!");
+    // every subcommand carries the same shared `--json` option: reject a
+    // target that can never succeed (an existing directory) before spending
+    // the run's API budget on a report that cannot be written
+    let json: Option<&PathBuf> = match &cli.command {
+        Command::Scan { shared, .. }
+        | Command::Email { shared, .. }
+        | Command::Emails { shared, .. }
+        | Command::User { shared, .. }
+        | Command::Org { shared, .. }
+        | Command::Search { shared, .. } => shared.json.as_ref(),
+    };
+    if let Some(path) = json {
+        output::ensure_report_target(path)?;
+    }
 
     match cli.command {
         Command::Scan { url, shared } => {
@@ -139,6 +247,74 @@ fn run() -> Result<(), Error> {
                 ("repository", format!("{author}_{repository}"))
             };
             write_outputs(&url, mode, mode, &file_name, outcome, shared.json, &scanner)
+        }
+        Command::Email { address, shared } => {
+            let scanner = Scanner::new(shared.token.as_deref(), shared.token_file.as_deref())?;
+            let report = email::reverse(&scanner, &address)?;
+            if let Some(path) = shared.json {
+                output::write_report_json(&path, &report)?;
+            }
+            Ok(())
+        }
+        Command::Emails { file, shared } => {
+            let scanner = Scanner::new(shared.token.as_deref(), shared.token_file.as_deref())?;
+            let report = email::reverse_bulk(&scanner, &file)?;
+            if let Some(path) = shared.json {
+                output::write_report_json(&path, &report)?;
+            }
+            Ok(())
+        }
+        Command::User {
+            username,
+            variant_pattern,
+            shared,
+        } => {
+            let scanner = Scanner::new(shared.token.as_deref(), shared.token_file.as_deref())?;
+            let report = user::investigate(&scanner, &username, &variant_pattern)?;
+            if let Some(path) = shared.json {
+                output::write_report_json(&path, &report)?;
+            }
+            Ok(())
+        }
+        Command::Org {
+            org: org_login,
+            limit,
+            shared,
+        } => {
+            let scanner = Scanner::new(shared.token.as_deref(), shared.token_file.as_deref())?;
+            let report = org::investigate(&scanner, &org_login, limit)?;
+            // the same one-email-per-line result file the scan subcommands
+            // write: the outreach workflow needs a paste-able list, not a
+            // terminal wall or a JSON file. An empty list stays silent (the
+            // JSON report still records the run); a real text-write failure
+            // surfaces like the scan paths. The JSON report is attempted in
+            // EVERY case: an explicit `--json` deliverable must not vanish
+            // on the empty run (the org scan spends the most API budget of
+            // any subcommand — scan-path parity). write_text logs the path
+            // itself: log nothing extra here
+            let org_text = output::write_text("org", &report.org.login, &report.emails.all);
+            if matches!(&org_text, Err(err) if !matches!(err, Error::NoResults)) {
+                // the text write failed: the user-requested JSON report must
+                // still be written (scan-path parity with `write_outputs` —
+                // the findings must not vanish from both outputs at once);
+                // a JSON failure on top is warned about, then the text
+                // error is surfaced
+                if let Some(path) = shared.json.as_ref()
+                    && let Err(json_err) = output::write_report_json(path, &report)
+                {
+                    log::warn!("the JSON report could not be written either: {json_err}");
+                }
+                org_text.map(|_| ())?;
+            } else {
+                // text written (or nothing found): the JSON deliverable is
+                // propagated like on the scan path — a requested report that
+                // could not be written must fail the run, not vanish
+                if let Some(path) = shared.json.as_ref() {
+                    output::write_report_json(path, &report)?;
+                }
+                org_text.map(|_| ())?;
+            }
+            Ok(())
         }
         Command::Search {
             query,
@@ -204,30 +380,34 @@ fn write_outputs(
     json: Option<PathBuf>,
     scanner: &Scanner,
 ) -> Result<(), Error> {
-    let text_written = match output::write_text(directory, file_name, &outcome.emails) {
-        Ok(_) => true,
-        Err(Error::NoResults) => false,
-        Err(err) => {
-            // the legacy text write failed: the user-requested JSON report
-            // must still be written, so a successful scan's findings do not
-            // vanish from both outputs at once. The text failure stays the
-            // surfaced error; a JSON failure on top is warned about
-            if let Some(path) = json
-                && let Err(json_err) = output::write_json(
-                    &path,
-                    target,
-                    mode,
-                    &outcome.emails,
-                    outcome.repos_scanned,
-                    scanner.requests_made(),
-                    &outcome.correlation,
-                )
-            {
-                log::warn!("the JSON report could not be written either: {json_err}");
-            }
-            return Err(err);
+    let text_result = output::write_text(directory, file_name, &outcome.emails);
+    if matches!(&text_result, Err(err) if !matches!(err, Error::NoResults)) {
+        // the legacy text write failed: the user-requested JSON report must
+        // still be written, so a successful scan's findings do not vanish
+        // from both outputs at once (the JSON write itself would have
+        // succeeded — e.g. a stray file blocking the `results/` layout, or
+        // a read-only CWD). The text failure stays the surfaced error; if
+        // the JSON write fails too, it is warned about on top of it
+        if let Some(path) = json
+            && let Err(json_err) = output::write_json(
+                &path,
+                target,
+                mode,
+                &outcome.emails,
+                outcome.repos_scanned,
+                scanner.requests_made(),
+                outcome.partial,
+                &outcome.correlation,
+            )
+        {
+            log::warn!("the JSON report could not be written either: {json_err}");
         }
-    };
+        return text_result.map(|_| ());
+    }
+    // every non-`NoResults` error early-returned above, so `is_ok()` is
+    // exactly "the legacy text file was written" — without a panicking
+    // fallback arm that a future condition widening would turn live
+    let text_written = text_result.is_ok();
     if let Some(path) = json {
         output::write_json(
             &path,
@@ -236,6 +416,7 @@ fn write_outputs(
             &outcome.emails,
             outcome.repos_scanned,
             scanner.requests_made(),
+            outcome.partial,
             &outcome.correlation,
         )?;
     }
@@ -249,13 +430,24 @@ fn write_outputs(
     }
 }
 
-/// Builds the terminal logger: the default is the `info` level so the
-/// report is visible without any environment setup (a plain
-/// `pretty_env_logger::init()` filters everything below `error` and a
-/// successful scan would print nothing at all); a set `RUST_LOG` replaces
-/// the default, like the env_logger precedence users already know. The
-/// ambient value is injected as a parameter so the contract stays testable
-/// without mutating the process environment.
+/// Builds the global logger exactly the way `main` installs it: the
+/// human-readable terminal report goes through `log::info!`, so the default
+/// is the `info` level (the report is visible without any environment
+/// setup), while `RUST_LOG` keeps its precedence when it is set (the
+/// `filter_level` directive is replaced by the ones parsed from
+/// `RUST_LOG`). Returned unbuilt so tests can pin the effective default
+/// filter without installing a global logger.
+fn build_logger() -> pretty_env_logger::env_logger::Builder {
+    // the value is only read: mutating the environment in tests would race
+    // the other tests' concurrent `getenv` calls (which is why `set_var` is
+    // `unsafe`), so the ambient value is injected as a parameter instead
+    build_logger_with_ambient_filter(std::env::var("RUST_LOG").ok().as_deref())
+}
+
+/// The same builder with the ambient `RUST_LOG` value injected: `None` (or a
+/// blank value) leaves the default `info` filter, a set value replaces it
+/// entirely (the same semantics as parsing the variable). Tests inject the
+/// value instead of mutating the process environment.
 fn build_logger_with_ambient_filter(
     rust_log: Option<&str>,
 ) -> pretty_env_logger::env_logger::Builder {
@@ -263,10 +455,27 @@ fn build_logger_with_ambient_filter(
     // (`#[doc(hidden)] pub extern crate`), which lets the helper name the
     // returned builder type without adding a direct dependency
     let mut builder = pretty_env_logger::formatted_builder();
+    // The terminal report vocabulary is `[+]` success / `[-]` error, so a
+    // warning must carry its own scannable marker (`[!]`) — otherwise a
+    // partial-scan warning looks like progress chatter once colors are
+    // stripped (redirect, screen reader, plain terminal). The marker is
+    // applied here at the format level (one site) instead of editing every
+    // `warn!` call: warn/error lines get the marker, other levels print
+    // their message as-is (the `[+]` report lines already carry their own).
+    // Documented in doc/src/OUTPUT.md.
+    builder.format(|buf, record| {
+        use std::io::Write as _;
+        let marker = match record.level() {
+            log::Level::Warn => "[!] ",
+            log::Level::Error => "[-] ",
+            _ => "",
+        };
+        writeln!(buf, "{}{}", marker, record.args())
+    });
     if let Some(filter) = rust_log.map(str::trim).filter(|value| !value.is_empty()) {
         builder.parse_filters(filter);
     } else {
-        // the env_logger builder methods take `&mut self`: configure in
+        // the env_logger 0.10 builder methods take `&mut self`: configure in
         // place, then move the builder out
         builder.filter_level(log::LevelFilter::Info);
     }
@@ -274,11 +483,11 @@ fn build_logger_with_ambient_filter(
 }
 
 fn main() {
-    let ambient = std::env::var("RUST_LOG").ok();
-    build_logger_with_ambient_filter(ambient.as_deref()).init();
-    info!("Starting git2mail!");
+    build_logger().init();
 
     if let Err(err) = run() {
+        // one terminal line only: the logger would repeat the same failure
+        // under the default `info` level (visible as a second ERROR line)
         eprintln!("[-] {err}");
         std::process::exit(1);
     }
@@ -293,6 +502,11 @@ mod tests {
 
     #[test]
     fn the_logger_defaults_to_info_and_rust_log_replaces_it() {
+        // the ambient RUST_LOG value is injected as a parameter instead of
+        // mutating the process environment: `set_var` is `unsafe` because
+        // `setenv`/`getenv` are not synchronized on all platforms, and the
+        // other tests of the suite call `getenv` concurrently (through
+        // `std::env::temp_dir` and the like)
         // without RUST_LOG, the terminal report's `info` level is the
         // default: the report is visible without any environment setup
         let default_filter = build_logger_with_ambient_filter(None).build().filter();
@@ -314,13 +528,9 @@ mod tests {
         assert_eq!(
             rust_log_filter,
             log::LevelFilter::Error,
-            "a set RUST_LOG must replace the default, not be ANDed with it"
+            "RUST_LOG must keep its precedence when it is set"
         );
-        assert_eq!(
-            blank_filter,
-            log::LevelFilter::Info,
-            "a blank RUST_LOG must behave like an unset one"
-        );
+        assert_eq!(blank_filter, log::LevelFilter::Info);
     }
 
     #[test]
@@ -342,6 +552,29 @@ mod tests {
     fn scan_requires_a_url() {
         let cli = Cli::try_parse_from(["git2mail", "scan"]);
         assert!(cli.is_err(), "a scan without --url has no target");
+    }
+
+    #[test]
+    fn search_rejects_an_empty_query() {
+        for bad in ["", "   ", "\t\n"] {
+            let cli = Cli::try_parse_from(["git2mail", "search", "--query", bad]);
+            assert!(
+                cli.is_err(),
+                "an empty {bad:?} query would reach the API as a raw 422"
+            );
+        }
+    }
+
+    #[test]
+    fn search_keeps_a_query_with_surrounding_whitespace_as_typed() {
+        // only a whitespace-only query is rejected: trimming the value
+        // would silently rewrite what the user searched for
+        let cli = Cli::try_parse_from(["git2mail", "search", "--query", " nmap "])
+            .expect("a query with surrounding whitespace must parse");
+        let Command::Search { query, .. } = cli.command else {
+            panic!("expected the search subcommand");
+        };
+        assert_eq!(query, " nmap ");
     }
 
     #[test]
@@ -512,6 +745,192 @@ mod tests {
     }
 
     #[test]
+    fn user_accepts_the_shared_flags_and_a_positional_username() {
+        let cli = Cli::try_parse_from([
+            "git2mail",
+            "user",
+            "jane-doe",
+            "--token",
+            "ghp_x",
+            "--json",
+            "report.json",
+        ])
+        .expect("the user subcommand must parse");
+        let Command::User {
+            username,
+            shared,
+            variant_pattern: _,
+        } = cli.command
+        else {
+            panic!("expected the user subcommand");
+        };
+        assert_eq!(username, "jane-doe");
+        assert_eq!(shared.token.as_deref(), Some("ghp_x"));
+        assert_eq!(
+            shared.json.as_deref(),
+            Some(std::path::Path::new("report.json"))
+        );
+    }
+
+    #[test]
+    fn user_requires_a_username() {
+        let cli = Cli::try_parse_from(["git2mail", "user"]);
+        assert!(
+            cli.is_err(),
+            "a user investigation without a target has no sense"
+        );
+    }
+
+    #[test]
+    fn a_malformed_variant_pattern_is_rejected_at_parse_time() {
+        // the clap value_parser must carry the client-side validation: a
+        // reverted value_parser would only fail later (or never) — this pins
+        // the parse-time rejection (exit 2, usage error, no network)
+        for pattern in ["{first", "{unknown}", "{first} {last}", "a}b{first}"] {
+            let cli =
+                Cli::try_parse_from(["git2mail", "user", "jane", "--variant-pattern", pattern]);
+            assert!(
+                cli.is_err(),
+                "the malformed pattern {pattern:?} must be rejected at parse time"
+            );
+        }
+    }
+
+    #[test]
+    fn org_accepts_the_shared_flags_a_positional_login_and_an_optional_limit() {
+        let cli = Cli::try_parse_from([
+            "git2mail",
+            "org",
+            "acme",
+            "--token",
+            "ghp_x",
+            "--limit",
+            "5",
+            "--json",
+            "report.json",
+        ])
+        .expect("the org subcommand must parse");
+        let Command::Org { org, limit, shared } = cli.command else {
+            panic!("expected the org subcommand");
+        };
+        assert_eq!(org, "acme");
+        assert_eq!(limit, Some(5));
+        assert_eq!(shared.token.as_deref(), Some("ghp_x"));
+        assert_eq!(
+            shared.json.as_deref(),
+            Some(std::path::Path::new("report.json"))
+        );
+    }
+
+    #[test]
+    fn org_defaults_to_no_limit() {
+        let cli = Cli::try_parse_from(["git2mail", "org", "acme"])
+            .expect("a plain org investigation must parse");
+        let Command::Org { org, limit, .. } = cli.command else {
+            panic!("expected the org subcommand");
+        };
+        assert_eq!(org, "acme");
+        assert_eq!(limit, None, "without --limit every repository is listed");
+    }
+
+    #[test]
+    fn org_rejects_a_zero_limit() {
+        let cli = Cli::try_parse_from(["git2mail", "org", "acme", "--limit", "0"]);
+        assert!(
+            cli.is_err(),
+            "--limit 0 would only fetch one page for nothing"
+        );
+    }
+
+    #[test]
+    fn org_requires_a_login() {
+        let cli = Cli::try_parse_from(["git2mail", "org"]);
+        assert!(
+            cli.is_err(),
+            "an organization investigation without a target has no sense"
+        );
+    }
+
+    #[test]
+    fn email_accepts_the_shared_flags_and_a_positional_address() {
+        let cli = Cli::try_parse_from([
+            "git2mail",
+            "email",
+            "jane@acme.com",
+            "--token",
+            "ghp_x",
+            "--json",
+            "report.json",
+        ])
+        .expect("the email subcommand must parse");
+        let Command::Email { address, shared } = cli.command else {
+            panic!("expected the email subcommand");
+        };
+        assert_eq!(address, "jane@acme.com");
+        assert_eq!(shared.token.as_deref(), Some("ghp_x"));
+        assert_eq!(
+            shared.json.as_deref(),
+            Some(std::path::Path::new("report.json"))
+        );
+    }
+
+    #[test]
+    fn email_requires_an_address() {
+        let cli = Cli::try_parse_from(["git2mail", "email"]);
+        assert!(
+            cli.is_err(),
+            "a reverse lookup without a target has no sense"
+        );
+    }
+
+    #[test]
+    fn emails_accepts_the_shared_flags_and_a_positional_file() {
+        let cli = Cli::try_parse_from([
+            "git2mail",
+            "emails",
+            "addresses.txt",
+            "--token-file",
+            "tokens.json",
+            "--json",
+            "report.json",
+        ])
+        .expect("the emails subcommand must parse");
+        let Command::Emails { file, shared } = cli.command else {
+            panic!("expected the emails subcommand");
+        };
+        assert_eq!(file, std::path::PathBuf::from("addresses.txt"));
+        assert_eq!(
+            shared.token_file.as_deref(),
+            Some(std::path::Path::new("tokens.json"))
+        );
+        assert_eq!(
+            shared.json.as_deref(),
+            Some(std::path::Path::new("report.json"))
+        );
+    }
+
+    #[test]
+    fn emails_requires_a_file() {
+        let cli = Cli::try_parse_from(["git2mail", "emails"]);
+        assert!(
+            cli.is_err(),
+            "a bulk reverse lookup without a file has no sense"
+        );
+    }
+
+    #[test]
+    fn help_lists_all_subcommands() {
+        use clap::CommandFactory as _;
+        let help = Cli::command().render_help().to_string();
+        for subcommand in ["scan", "search", "user", "org", "email", "emails"] {
+            assert!(
+                help.contains(subcommand),
+                "the help must present the {subcommand} subcommand"
+            );
+        }
+    }
+
+    #[test]
     fn help_documents_the_advanced_qualifier_flags() {
         use clap::CommandFactory as _;
         // the flags live on the search subcommand, not on the top-level help
@@ -533,20 +952,52 @@ mod tests {
         ] {
             assert!(help.contains(flag), "the help must document {flag}");
         }
+        // the value names are part of the help contract too: `--size` is
+        // named by its range syntax (`--size <RANGE>`, like `--stars` and
+        // `--forks`) and the date flags by theirs (`<DATE_RANGE>`) — a
+        // reverted `value_name` falls back to clap's default placeholder
+        // (a bare `<SIZE>`), which this pins against
+        for flag_value in ["--stars <RANGE>", "--forks <RANGE>", "--size <RANGE>"] {
+            assert!(
+                help.contains(flag_value),
+                "the help must name {flag_value} by its range syntax"
+            );
+        }
+        for flag_value in ["--created <DATE_RANGE>", "--pushed <DATE_RANGE>"] {
+            assert!(
+                help.contains(flag_value),
+                "the help must name {flag_value} by its date-range syntax"
+            );
+        }
+        // the user subcommand must document the custom variant patterns
+        // (repeatable flag, PATTERN value name)
+        let mut user = Cli::command()
+            .find_subcommand("user")
+            .expect("the user subcommand must exist")
+            .clone();
+        let user_help = user.render_help().to_string();
+        assert!(
+            user_help.contains("--variant-pattern <PATTERN>"),
+            "the user help must document --variant-pattern <PATTERN>: {user_help}"
+        );
     }
 
     #[test]
-    fn help_lists_both_subcommands() {
+    fn the_json_help_lists_every_subcommand_report_shape() {
         use clap::CommandFactory as _;
-        let help = Cli::command().render_help().to_string();
-        assert!(
-            help.contains("scan"),
-            "the help must present the scan subcommand"
-        );
-        assert!(
-            help.contains("search"),
-            "the help must present the search subcommand"
-        );
+        // the --json flag is shared: its help must enumerate the report
+        // shape of every subcommand that writes one
+        let mut search = Cli::command()
+            .find_subcommand("search")
+            .expect("the search subcommand must exist")
+            .clone();
+        let help = search.render_help().to_string();
+        for mention in ["scan", "search", "email", "emails", "user", "org"] {
+            assert!(
+                help.contains(mention),
+                "the --json help must mention the {mention} report shape"
+            );
+        }
     }
 
     #[test]
@@ -576,5 +1027,89 @@ mod tests {
                 .expect("report must be valid JSON");
         assert_eq!(report["emails"], serde_json::json!([]));
         std::fs::remove_file(&json_path).ok();
+    }
+
+    /// A CWD-isolated body for the tests that exercise the legacy
+    /// `results/` layout: the text writer writes relative to the current
+    /// directory, so the blocker-file scenarios must not touch the real
+    /// workspace (the lock keeps parallel tests from racing the chdir).
+    fn in_temp_cwd<T>(f: impl FnOnce() -> T) -> T {
+        use std::path::Path;
+        use std::sync::{Mutex, OnceLock};
+        static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = CWD_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let original = std::env::current_dir().expect("test setup: current dir");
+        let temp =
+            std::env::temp_dir().join(format!("git2mail_main_cwd_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).expect("test setup: temp cwd");
+        std::env::set_current_dir(&temp).expect("test setup: enter temp cwd");
+        // panic-safe restore: a test panicking inside `f` must not leave the
+        // process CWD inside the temp directory the teardown deletes (every
+        // later `current_dir()` of the suite would then fail with NotFound)
+        struct RestoreCwd<'a>(&'a Path);
+        impl Drop for RestoreCwd<'_> {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(self.0);
+            }
+        }
+        let _restore = RestoreCwd(&original);
+        let result = f();
+        drop(_restore);
+        std::env::set_current_dir(&original).expect("test teardown: restore cwd");
+        let _ = std::fs::remove_dir_all(&temp);
+        drop(lock);
+        result
+    }
+
+    #[test]
+    fn write_outputs_still_writes_the_json_report_when_the_text_output_fails() {
+        // a stray file named `results` (planted by a previous `--json
+        // results` run, or a read-only CWD) blocks the legacy text layout:
+        // the scan itself succeeded, so the user-requested JSON report must
+        // still be written — a hard text-write failure used to abort before
+        // `write_json`, discarding the successful scan's findings from both
+        // outputs at once. The text failure stays the surfaced error
+        in_temp_cwd(|| {
+            std::fs::write("results", "not a directory").expect("test setup: blocker file");
+            let scanner = Scanner::new(None, None).expect("anonymous scanner must build");
+            let outcome = ScanOutcome {
+                emails: vec!["dev@example.com".to_string()],
+                repos_scanned: 1,
+                ..ScanOutcome::default()
+            };
+            let json_path = std::env::temp_dir().join(format!(
+                "git2mail_main_test_{}_blocked_report.json",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&json_path);
+
+            let error = write_outputs(
+                "target",
+                "repository",
+                "repository",
+                "acme_lib",
+                outcome,
+                Some(json_path.clone()),
+                &scanner,
+            )
+            .expect_err("the blocked text write must surface");
+            assert!(
+                matches!(error, Error::OutputWrite(ref details) if details.contains("results")),
+                "the text failure must stay the surfaced error: {error:?}"
+            );
+
+            // ... but the JSON report exists, with the scan's findings
+            let report: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&json_path).expect("the JSON report must exist"),
+            )
+            .expect("report must be valid JSON");
+            assert_eq!(report["emails"], serde_json::json!(["dev@example.com"]));
+            assert_eq!(report["scanned"]["repos"], 1);
+            std::fs::remove_file(&json_path).ok();
+        });
     }
 }

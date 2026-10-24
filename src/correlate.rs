@@ -1,4 +1,4 @@
-//! Per-author attribute correlation (issue #5, roadmap 0.6.0): aggregates
+//! Per-author attribute correlation (issue #5): aggregates
 //! the scan results per author with the attributes git2mail already
 //! collects — the repositories scanned, their primary language (when the
 //! search API metadata reports it) and the commit counts — into a
@@ -13,9 +13,10 @@
 //! and therefore defines no error variant (the crate philosophy: hand-made
 //! errors only where something can actually fail).
 
+use crate::output::sanitize_log_text as log_safe;
 use log::info;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// One commit author as attributed by a repository scan: the author name the
 /// commits expose (falling back to the email when the commit carries no
@@ -85,13 +86,43 @@ impl Correlation {
     /// Logs a human-readable summary of the top authors with their dominant
     /// language (terminal output only: the plain-text result files stay
     /// byte-identical to the legacy format). Silent when no author was
-    /// correlated.
+    /// correlated. Every interpolated string is sanitized first by the
+    /// shared log sanitizer plus a summary-shape neutralization (see
+    /// `summary_field`): a hostile commit author name or email can never
+    /// forge or spoof terminal-report lines. Never panics.
     pub fn log_summary(&self) {
         if self.authors.is_empty() {
             return;
         }
-        let summary: Vec<String> = self
-            .authors
+        // one line per author, not one joined line: a single ";"-joined
+        // line is unscannable once the terminal wraps it, and hostile to
+        // screen readers — each author gets its own `[+] Top author N:`
+        // line, so the reader navigates entry by entry
+        for (index, entry) in self.summary_entries().iter().enumerate() {
+            info!("[+] Top author {}: {}", index + 1, entry);
+        }
+    }
+
+    /// Sanitizes one metadata field of a summary entry: beyond the shared
+    /// log sanitizer (control characters become `_`), the characters that
+    /// make up the summary's own line shape (`;` the entry separator, `—`
+    /// and `<`/`>` the fixed `name <email> — language, N commits` field
+    /// separators) are neutralized too, so a hostile author name like
+    /// `Alice <a@x.com> — Rust, 999 commits; Fake Dev` renders as one
+    /// visibly mangled field instead of extra plausible "top author"
+    /// entries. Never panics.
+    fn summary_field(text: &str) -> String {
+        log_safe(text).replace([';', '—', '<', '>'], "_")
+    }
+
+    /// The sanitized `name <email> — language, N commits` entries the
+    /// terminal summary is built from. The author name and email come
+    /// straight from hostile commit metadata and the language from the
+    /// search API payload, so all three go through [`Self::summary_field`]
+    /// (shared log sanitizer plus summary-shape neutralization), like every
+    /// other terminal-report site of the crate. Never panics.
+    fn summary_entries(&self) -> Vec<String> {
+        self.authors
             .iter()
             .take(Self::SUMMARY_TOP)
             .map(|author| {
@@ -106,13 +137,14 @@ impl Correlation {
                     .map(String::as_str)
                     .unwrap_or("unknown language");
                 format!(
-                    "{} <{email}> — {language}, {} commits",
-                    crate::output::sanitize_log_text(&author.author),
+                    "{} <{}> — {}, {} commits",
+                    Self::summary_field(&author.author),
+                    Self::summary_field(email),
+                    Self::summary_field(language),
                     author.total_hits
                 )
             })
-            .collect();
-        info!("[+] Top authors: {}", summary.join("; "));
+            .collect()
     }
 }
 
@@ -146,7 +178,18 @@ pub struct AuthorReport {
 #[derive(Default)]
 struct AuthorAggregate {
     emails: Vec<String>,
+    /// Exact-match membership set mirroring `emails`: the per-author email
+    /// dedup must stay O(1) — the reduce is single-threaded and the email
+    /// list is unbounded across repositories (commit metadata is fully
+    /// attacker-controlled), so the previous linear `Vec::any` scan made a
+    /// hostile multi-repository scan quadratic in the analyst's CPU
+    /// (measured: ~4x wall time per doubling of repositories).
+    email_set: HashSet<String>,
     repos: Vec<RepoLanguage>,
+    /// Exact-match membership set of the repository names in `repos`:
+    /// same dedup-cost rule as `email_set` (an author seen in many
+    /// repositories must not pay a linear scan per incoming repository).
+    repo_names: HashSet<String>,
     first_seen_repo: Option<String>,
     total_hits: usize,
     /// Commit hits per repository language (languages only; repositories
@@ -181,14 +224,10 @@ impl CorrelationBuilder {
     pub fn add_repo(&mut self, contribution: RepoContribution) {
         for author in contribution.authors {
             let aggregate = self.authors.entry(author.name).or_default();
-            if !aggregate.emails.iter().any(|email| email == &author.email) {
+            if aggregate.email_set.insert(author.email.clone()) {
                 aggregate.emails.push(author.email);
             }
-            if !aggregate
-                .repos
-                .iter()
-                .any(|repo| repo.name == contribution.name)
-            {
+            if aggregate.repo_names.insert(contribution.name.clone()) {
                 aggregate.repos.push(RepoLanguage {
                     name: contribution.name.clone(),
                     language: contribution.language.clone(),
@@ -432,5 +471,135 @@ mod tests {
         builder.add_repo(contribution("a/one", Some("Rust"), &[]));
         let correlation = builder.finish();
         assert!(correlation.authors.is_empty());
+    }
+
+    #[test]
+    fn the_terminal_summary_sanitizes_hostile_commit_metadata() {
+        // the author name, email and language come from commit metadata and
+        // search payloads a hostile repository controls: control characters
+        // (ANSI escape openers, carriage returns forging report lines) must
+        // never survive into the terminal summary
+        let mut builder = CorrelationBuilder::new();
+        builder.add_repo(contribution(
+            "a/one",
+            Some("Rust\u{1b}[31m"),
+            &[("\u{1b}[31mAlice\r[+] pwned", "a@x.com\rX", 3)],
+        ));
+        let entries = builder.finish().summary_entries();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        // the control characters (ESC opening the ANSI sequence, the CR
+        // forging a report line) are replaced; the printable remainder is
+        // inert
+        assert_eq!(
+            entry,
+            "_[31mAlice_[+] pwned <a@x.com_X> — Rust_[31m, 3 commits"
+        );
+        assert!(
+            !entry.chars().any(char::is_control),
+            "no control character may survive: {entry:?}"
+        );
+    }
+
+    #[test]
+    fn a_hostile_author_name_cannot_forge_extra_summary_entries_or_fields() {
+        // the summary line joins sanitized entries with `; ` and shapes each
+        // one as `name <email> — language, N commits`: a hostile author name
+        // carrying those printable delimiters must not render as visually
+        // distinct extra "top author" entries inside the single summary line
+        let mut builder = CorrelationBuilder::new();
+        builder.add_repo(contribution(
+            "a/one",
+            Some("Rust"),
+            &[(
+                "Alice <a@x.com> — Rust, 999 commits; Fake Dev",
+                "real@x.com",
+                3,
+            )],
+        ));
+        let entries = builder.finish().summary_entries();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        // every summary-shape delimiter inside the hostile metadata is
+        // neutralized (the comma of the fixed `language, N commits` shape
+        // stays: it cannot forge an entry without the `;` separator, and
+        // stripping it would mangle legitimate names like `Acme, Inc`)
+        assert_eq!(
+            entry,
+            "Alice _a@x.com_ _ Rust, 999 commits_ Fake Dev <real@x.com> — Rust, 3 commits"
+        );
+        assert_eq!(entry.matches(';').count(), 0);
+        assert_eq!(entry.matches("—").count(), 1);
+        assert_eq!(entry.matches('<').count(), 1);
+        assert_eq!(entry.matches('>').count(), 1);
+    }
+
+    #[test]
+    fn the_terminal_summary_sanitizes_every_top_author() {
+        // all SUMMARY_TOP entries go through the sanitizer, not only the
+        // first one
+        let mut builder = CorrelationBuilder::new();
+        for i in 0..(Correlation::SUMMARY_TOP + 1) as u64 {
+            builder.add_repo(contribution(
+                &format!("r{i}"),
+                None,
+                &[(
+                    &format!("name{i}"),
+                    &format!("a{i}@x.com"),
+                    (100 - i) as usize,
+                )],
+            ));
+        }
+        let entries = builder.finish().summary_entries();
+        assert_eq!(entries.len(), Correlation::SUMMARY_TOP);
+        for entry in &entries {
+            assert!(!entry.chars().any(char::is_control));
+        }
+    }
+
+    /// The cross-repository aggregation must stay near-linear: the same
+    /// hostile author display name seen with N distinct emails across N
+    /// repositories (fully forgeable commit metadata: one name, one unique
+    /// email per commit) must not cost a linear scan of the unbounded
+    /// per-author accumulator per incoming author. The pre-fix quadratic
+    /// dedup measured ~4x wall time per repository doubling (160 crafted
+    /// repositories ≈ 113 s of pure release-build CPU, dwarfing the scan's
+    /// entire network cost); the hash-set dedup handles the same shape in
+    /// milliseconds. The generous ceiling keeps the assertion stable on a
+    /// loaded runner while still failing the quadratic version by orders of
+    /// magnitude (a reintroduced linear scan blows past it within seconds).
+    #[test]
+    fn add_repo_stays_near_linear_on_a_hostile_shared_name_with_unique_emails() {
+        const REPOS: usize = 100;
+        const AUTHORS_PER_REPO: usize = 1000;
+        let began = std::time::Instant::now();
+        let mut builder = CorrelationBuilder::new();
+        for repo in 0..REPOS {
+            let authors: Vec<CommitAuthor> = (0..AUTHORS_PER_REPO)
+                .map(|n| CommitAuthor {
+                    name: "John Smith".to_string(),
+                    email: format!("user{}@repo{repo}.example.com", repo * AUTHORS_PER_REPO + n),
+                    hits: 1,
+                })
+                .collect();
+            builder.add_repo(RepoContribution {
+                name: format!("org/repo{repo}"),
+                language: Some("Rust".to_string()),
+                authors,
+            });
+        }
+        let report = builder.finish();
+        let elapsed = began.elapsed();
+        // correctness invariants unchanged by the dedup structure
+        assert_eq!(report.authors.len(), 1, "one shared name, one aggregate");
+        let author = &report.authors[0];
+        assert_eq!(author.emails.len(), REPOS * AUTHORS_PER_REPO);
+        assert_eq!(author.repos.len(), REPOS);
+        assert_eq!(author.total_hits, REPOS * AUTHORS_PER_REPO);
+        assert_eq!(author.first_seen_repo, "org/repo0");
+        assert!(
+            elapsed.as_secs() < 10,
+            "aggregation became super-linear: {REPOS} repositories took {elapsed:?}"
+        );
     }
 }

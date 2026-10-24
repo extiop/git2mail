@@ -1,6 +1,6 @@
 [package]
 name = "git2mail"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["extiop"]
 edition = "2024"
 license = "LGPL-3.0-only"
@@ -24,16 +24,19 @@ missing_docs = "deny"
 # `clippy::all` is denied through the `-D warnings` convention (CI and the
 # verification gate run `cargo clippy --all-targets -- -D warnings`), so the
 # table only pins the restriction-group lints that `-D warnings` would leave
-# allow-by-default: the runtime path must never unwrap, expect, panic, or
-# stub out code. The allowances are the two static regex `LazyLock` inits of
-# `src/parsers.rs` (a static regex failing to compile is a programming
-# error), the `clippy::large_enum_variant` on the CLI `Command` enum (the
-# search subcommand legitimately carries nine optional qualifier flags;
-# boxing them would only obscure the definition), plus the test modules,
+# allow-by-default: the runtime path must never unwrap, expect, panic,
+# hit an `unreachable!` fallback, or stub out code. The only allowances are the two static regex `LazyLock`
+# inits of `src/parsers.rs` (a static regex failing to compile is a
+# programming error), the two justified production-code expects
+# (`#[expect(clippy::large_enum_variant)]` on the CLI `Command` enum in
+# `src/main.rs` and `#[expect(clippy::too_many_arguments)]` on the
+# `output::write_json` report writer — `expect` instead of `allow`, so the
+# build fails when they stop applying), and the test modules,
 # where failing loudly is the point.
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
 
