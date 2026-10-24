@@ -1,6 +1,6 @@
 [package]
 name = "git2mail"
-version = "0.4.6"
+version = "0.5.0"
 authors = ["extiop"]
 edition = "2024"
 license = "LGPL-3.0-only"
@@ -10,16 +10,39 @@ readme = "README.md"
 keywords = ["github", "osint", "rust", "leak"]
 categories = ["command-line-utilities"]
 
+# MLA-style strict lints (single-crate equivalent of the MLA workspace
+# `[workspace.lints]` table): the panic-family lints enforce the zero-panic
+# runtime path of the hand-made error handling, `missing_docs` makes the
+# public documentation part of the API surface.
+[lints.rust]
+# Every public item of the lib (errors, github, output, sources, parsers)
+# must be documented: what it does, which errors it returns, and that it
+# never panics at runtime.
+missing_docs = "deny"
+
+[lints.clippy]
+# `clippy::all` is denied through the `-D warnings` convention (CI and the
+# verification gate run `cargo clippy --all-targets -- -D warnings`), so the
+# table only pins the restriction-group lints that `-D warnings` would leave
+# allow-by-default: the runtime path must never unwrap, expect, panic, or
+# stub out code. The only allowances are the two static regex `LazyLock`
+# inits of `src/parsers.rs` (a static regex failing to compile is a
+# programming error) and the test modules, where failing loudly is the point.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 [dependencies]
-clap = { version = "4.6", default-features = false, features = ["wrap_help", "derive", "std"] }
-itertools = "0.15"
-regex = "1.13"
+clap = { version = "4.6", default-features = false, features = ["wrap_help", "derive", "std", "usage"] }
+regex = { version = "1.13", default-features = false, features = ["std"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
 # logging
-log = "0.4"
-pretty_env_logger = "0.5"
+log = { version = "0.4", default-features = false, features = ["std"] }
+pretty_env_logger = { version = "0.5", default-features = false }
 
 [profile.release]
 codegen-units = 1   # Use minimum codegen units for best size and runtime performances
