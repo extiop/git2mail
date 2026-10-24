@@ -58,7 +58,14 @@ failure only when no token can serve the request.
 ## Search
 
 `search` runs `q=<query>` against `https://api.github.com/search/repositories`.
-`--language` appends the `language:` qualifier. `--limit` bounds how many
-repository results are scanned. A search request rejected by the API
+`--language` appends the `language:` qualifier, and nine further qualifiers
+compose with the query: `--stars`, `--forks` and `--size` take count ranges
+(`>100`, `10..50`), `--created` and `--pushed` take date ranges
+(`>2020-01-01`, `2019-01-01..2020-01-01`), and `--license`, `--topic`,
+`--user` and `--org` take plain values. Every provided qualifier is
+validated client-side before any request: a malformed range or an
+impossible date fails fast with an explicit error instead of surfacing as
+an empty result set from the API. `--limit` bounds how many repository
+results are scanned. A search request rejected by the API
 (itself a `422 Validation Failed`) propagates as an explicit failure
 instead of degrading into an empty report.
