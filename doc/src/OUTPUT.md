@@ -55,8 +55,9 @@ The report is written after the text output, at the end of the scan. The
 lists every address seen in their commits, the repositories they appear in
 (with the repository's primary language), the languages ordered dominant
 first (most commits, ties alphabetical), the repository where the author was first seen, and the total
-number of hits. A commit without an author name or a detected email is not
-attributed.
+number of hits. A commit without a detected (non-noreply) email is not
+attributed; a commit with no author name is attributed under the email
+itself.
 
 ## File names
 

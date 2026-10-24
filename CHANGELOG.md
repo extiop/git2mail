@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-25
+
+### Added
+
+- Per-author attribute correlation (issue #5): every scan now aggregates its results per author with the attributes it already collects — the emails used, the repositories seen in (with the primary language the search API metadata reports, `null` for `scan` runs that would need an extra call), the first repository where the author appeared and the total commit count — sorted by commit count, languages dominant first. Exposed in the opt-in `--json` report as a `correlation` object added on top of the unchanged legacy fields, and summarized in the terminal log (top authors with their dominant language). Documented delta from the roadmap sketch: the per-language `results/$language/$author` output layout is delivered as this JSON correlation report instead — the plain-text result files stay unchanged, so no extra output tree is created. The same author seen in several repositories (across pages, workers or scan stages) is merged: emails deduplicated, hits summed. The plain-text outputs stay byte-identical (pinned by a property test), with no new dependency and the zero-panic guarantee
+- Advanced repository-search qualifiers on the `search` subcommand (issue #6, following [GitHub's advanced search](https://github.com/search/advanced) semantics): `--stars`, `--forks`, `--size` (KB), `--created`, `--pushed`, `--license`, `--topic` and the mutually exclusive `--user`/`--org` owner filter. They compose with `--query`, `--language` and `--limit`; only the provided qualifiers are appended to the `q` parameter (space-joined, percent-encoded with the existing hand-rolled helper). Values are validated client-side before any network request: a malformed range or date fails fast with the new `Error::InvalidSearchQualifier` ([ANSSI-FR/MLA](https://github.com/ANSSI-FR/MLA)-style hand-made error, no new dependency), and `git2mail search --help` documents every flag with concrete examples
+
+### Changed
+
+- The default log level is now `info`: the scan report is visible without any environment setup (`RUST_LOG` still takes precedence when set). Previously a successful scan printed nothing below `error`
+- Token-pool events are visible in the log: each token's hourly allowance running out and GitHub's slow-down pauses are reported as they happen, instead of staying silent
+- The CLI `Command` enum's `clippy::large_enum_variant` allowance moves from `#[allow]` to `#[expect]` with its justification at the attribute (a stale or unfulfilled allowance now fails the build), and the `Cargo.toml` lint-table inventory documents the complete allowance set
+
 ## [0.5.0] - 2026-10-24
 
 ### Hardening
@@ -20,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Refactor the GitHub access layer: [ANSSI-FR/MLA](https://github.com/ANSSI-FR/MLA)-style hand-made `errors.rs` (`Result<T, Error>` everywhere, zero `expect()`/`unwrap()` on the runtime path), a validated token pool (`TokenPool`), and one generic paginated fetch loop (`fetch_paginated`) replacing the four copy-pasted fetch + token-rotation loops
 - Rotate tokens only on real rate limits (429, or 403 with an exhausted quota, a `Retry-After` header, or an abuse/secondary body); other 403s now surface as "GitHub resource is private or unavailable"
 - Distinguish primary quota exhaustion (`X-RateLimit-Remaining: 0`, the token is retired for the process) from secondary rate limits (429/`Retry-After`/abuse body, the token is only parked until its window passes and is then reused); rotate immediately to another live token instead of sleeping, and add 30 s request timeouts
-- Scan orchestration lives in `src/sources/{profile,repository,search}.rs` instead of the slimmed `src/controller.rs` sketched in the design spec §3 (same role: CLI → scans; pagination and token rotation live in `github/`)
+- Scan orchestration lives in `src/sources/{profile,repository,search}.rs` instead of the slimmed `src/controller.rs` (same role: CLI → scans; pagination and token rotation live in `github/`)
 
 ### Fixed
 
@@ -40,7 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Parallel repository scanning for `search` (std threads, no async, spec §5): `min(tokens, repositories)` workers pull repositories from a shared queue, each worker owning one dedicated token with no contention; a worker whose dedicated token is rate-limited stops pulling work but does not fail the scan — the other workers' tokens keep draining the queue and the emails found so far are kept (the scan only fails when no worker can make progress)
+- Parallel repository scanning for `search` (std threads, no async): `min(tokens, repositories)` workers pull repositories from a shared queue, each worker owning one dedicated token with no contention; a worker whose dedicated token is rate-limited stops pulling work but does not fail the scan — the other workers' tokens keep draining the queue and the emails found so far are kept (the scan only fails when no worker can make progress)
 - Opt-in JSON report with `--json <path>`: `{ "target", "mode": "repository|profile|search", "emails", "scanned": { "repos", "pages" } }` — the text output format is unchanged
 
 ## [0.4.7] - 2026-08-04
