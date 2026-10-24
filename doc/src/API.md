@@ -16,8 +16,16 @@ search results) go through a single paginated loop:
 2. if the page is empty, the listing is complete;
 3. otherwise parse it and continue with page `n + 1`.
 
-One invariant bounds the loop:
+Two guards bound the loop:
 
+- **Short-page guard.** Listings fetched page by page (repository commits,
+  profile events, search results, the `user` investigation's identity
+  listings, and the `email` candidate search) stop when a page comes back underfilled,
+  instead of walking into the error page GitHub serves past the real end
+  of a listing. The simple listings (the profile fallback repository
+  enumeration, the public repositories and keys of a `user`, organization
+  members and repositories, and the commit verification of one `email`
+  candidate) end only when a page comes back empty.
 - **Token-pool bound.** Every page request participates in the rate-limit
   handling below; the loop can never spin: when every token is exhausted,
   the scan fails with an explicit error instead of retrying forever.
@@ -29,30 +37,52 @@ differently.
 
 ### Primary limit (quota)
 
-A `403` whose `x-ratelimit-remaining` header is `0` means the token's
-hourly quota is spent. The token is **retired**: it is removed from the
-allocation pool for the rest of the run, and the request is retried with
-the next available token. A retired token never comes back. A `429` is
-never treated as a spent quota, because "too many requests" is a transient condition, so a `429` parks the token instead, even when it carries
-`x-ratelimit-remaining: 0` (see below).
+A `403` whose `x-ratelimit-remaining` header is `0` means a quota is
+spent, and which quota decides the reaction:
+
+- on the core endpoints, the token's hourly quota is spent: the token is
+  **retired** (removed from the allocation pool for the rest of the run) and the request is retried with the next available token. A retired
+  token never comes back;
+- on the `/search/` endpoints (or any response carrying
+  `X-RateLimit-Resource: search`), the spent quota is the separate
+  per-minute search quota: the token's hourly core quota is untouched, so
+  the token is only **parked** for the short search window. Retiring a
+  healthy token over a hot search minute would drain multi-token pools
+  one token per minute.
 
 A `403` with `x-ratelimit-remaining` above `0` is a genuine refusal (for
-example a private or missing resource) and is **not** treated as rate
-limiting, unless it carries a `Retry-After` header or the secondary-limit
-body, which parks the token instead (see below).
+example a private or missing resource) and is **not** treated as rate limiting, unless it carries a `Retry-After` header, the secondary-limit body, or a primary-limit body whose quota header a middlebox stripped (the body text "API rate limit exceeded" is treated as transient too, since the missing header makes the two indistinguishable); those cases park the token
+instead (see below).
 
 ### Secondary limit (abuse detection)
 
-Short bursts of secondary rate limiting (`403`/`429` with a `Retry-After`
-header, or the documented secondary-limit body) **park** the token: the
-token is taken out of the allocation pool until the `Retry-After` delay
-elapses, then returns automatically. Parked tokens can still serve other
-workers through the shared pool. The honored delay is capped at one hour
-so that a hostile header cannot park a token indefinitely.
+A `429` is never treated as a spent quota, because "too many requests" is a transient condition, so the token is **parked**, never retired, even when
+the response carries `x-ratelimit-remaining: 0`. The same holds for a
+`403` carrying a `Retry-After` header or the documented secondary-limit
+body without an exhausted core quota: the token is taken out of the
+allocation pool until its window passes (`Retry-After` honored as-is,
+capped at one hour so a hostile header cannot park a token indefinitely),
+then returns automatically, and the request rotates immediately to another
+live token when one exists. Parked tokens can still serve other workers
+through the shared pool. A window that has already elapsed
+(`Retry-After: 0`) is retried immediately at no cost. An HTTP `401`
+(revoked or invalid token) retires the token like a spent quota.
 
 When a request fails on a token and another token is available, the
 request is transparently retried on the next token; the caller sees a
 failure only when no token can serve the request.
+
+## Caps and limits
+
+| Limit | Value | Effect |
+|-------|-------|--------|
+| Events timeline | 300 events | GitHub caps profile events; the listing stops there honestly |
+| Repository commits | 10 pages x 100 | a listing deeper than 1000 commits stops with an explicit truncation note |
+| Search results | 1000 | GitHub's documented search ceiling; reaching it ends the listing with a warning |
+| Reverse-email candidates | 50 repositories | budget cap of the `email`/`emails` reverse lookup |
+| Name pairs x domains | 64 x 64 | variant-generation inputs are truncated before generation |
+| Generated variants | 1000 | global cap on generated candidate addresses |
+| Custom patterns | 64 | `--variant-pattern` accepts at most 64 patterns |
 
 ## Search
 
@@ -65,6 +95,11 @@ compose with the query: `--stars`, `--forks` and `--size` take count ranges
 validated client-side before any request: a malformed range or an
 impossible date fails fast with an explicit error instead of surfacing as
 an empty result set from the API. `--limit` bounds how many repository
-results are scanned. A search request rejected by the API
-(itself a `422 Validation Failed`) propagates as an explicit failure
-instead of degrading into an empty report.
+results are scanned.
+
+A `422` on the first page means the API rejected the query itself (an
+over-long or invalid `q`, or an inaccessible `--user`/`--org` login): the
+run fails explicitly instead of degrading into an empty report. A `422`
+past the first page is GitHub's documented window boundary: the scan ends
+with an explicit warning that the collected repositories were discarded,
+rather than reporting a truncated set as complete.

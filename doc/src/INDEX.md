@@ -2,28 +2,43 @@
 
 git2mail extracts the email addresses a GitHub account exposes through its
 public activity: repository commits, profile events, and repository
-search. It is a command-line tool: you type commands in a terminal, the
-text window on your computer (Terminal on Mac and Linux, Command Prompt or
-PowerShell on Windows), instead of clicking buttons.
+search. It is
+a command-line tool: you type commands in a terminal, the text window on
+your computer (Terminal on Mac and Linux, PowerShell on Windows), instead
+of clicking buttons.
 
 ```
-git2mail scan --url <GITHUB_URL> [--token <TOKEN> | --token-file <TOKENS_JSON>] \
-    [--json <PATH>]
-git2mail search --query <QUERY> [--language <LANGUAGE>] [--limit <N>] \
-    [--token <TOKEN> | --token-file <TOKENS_JSON>] [--json <PATH>]
+git2mail scan   --url <github URL> [--token …|--token-file …] [--json <path>]
+git2mail search --query <q> [--language <l>] [--limit N]
+                [--token …|--token-file …] [--json <path>]
+git2mail email  <address> [--token …|--token-file …] [--json <path>]
+git2mail emails <file> [--token …|--token-file …] [--json <path>]
+git2mail user   <username> [--variant-pattern <p>]
+                [--token …|--token-file …] [--json <path>]
+git2mail org    <org> [--limit N] [--token …|--token-file …] [--json <path>]
 ```
 
-> How to read the commands: text in `[square brackets]` is optional, `|`
-> means "or", and `<UPPERCASE WORDS>` stand for values you fill in: never
-> type the brackets themselves.
+`search` also accepts filter flags: `--stars`, `--forks`, `--size`,
+`--created`, `--pushed`, `--license`, `--topic`, `--user` and `--org`, with
+concrete examples in [GitHub API usage](API.md) and `git2mail search --help`.
+
+> How to read the commands below: text in `[square brackets]` is optional,
+> `|` means "or", and `<lowercase words>` stand for values you fill in: never type the brackets themselves.
 
 `scan` accepts a repository URL or a profile URL; `search` runs a
-repository search query and scans every result.
+repository search query and scans every result. `email` and `emails`
+reverse one address (or a list) into GitHub accounts; `user` investigates
+a profile (identity history, external contributions, generated email
+variants, secondary accounts, SSH keys); `org` investigates an
+organization's members and repositories. The investigation commands (`user`, `email`, `emails`, `org`) report on
+screen like the scan commands, and through the opt-in JSON report
+(`--json <path>`) when you want to save them (see [Results](OUTPUT.md)).
 
 ## Installation
 
 The easiest way: download the ready-made program from the
-[releases page](https://github.com/extiop/git2mail/releases): no installation needed. If you already have the Rust toolkit, you can instead
+[releases page](https://github.com/extiop/git2mail/releases): no
+installation needed. If you already have the Rust toolchain, you can instead
 install from crates.io:
 
 ```
@@ -44,7 +59,7 @@ Prebuilt binaries are also attached to each
   path, and the test suite runs fully offline against a local HTTP mock.
 - **Blocking I/O with bounded parallelism.** Scans use `reqwest::blocking`
   over `std` threads; the multi-repository search fan-out spawns
-  `min(token_count, repository_count)` workers, one dedicated token per
+  `min(live_token_count, repository_count)` workers, one live token per
   worker, draining a shared queue of repositories. No async runtime.
 
 ## Tokens
@@ -72,5 +87,6 @@ behavior.
 
 ## Interrupting a run
 
-Ctrl-C aborts the run immediately: nothing is written, not even a partial report, so a truncated scan can never look complete. Re-run the same
+Ctrl-C aborts the run immediately: nothing is written, not even a partial
+report, so a truncated scan can never look complete. Re-run the same
 command to start over.
