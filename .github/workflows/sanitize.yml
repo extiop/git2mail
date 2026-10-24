@@ -32,10 +32,15 @@ jobs:
         validation_depth: 10
         path: CHANGELOG.md
     - name: Information
+      # the reader's outputs come from CHANGELOG.md, an editable file:
+      # route them through the environment instead of interpolating them
+      # into the script (a crafted changelog line could otherwise execute)
+      env:
+        CHANGELOG_VERSION: ${{ steps.changelog_reader.outputs.version }}
+        CHANGELOG_STATUS: ${{ steps.changelog_reader.outputs.status }}
+        CHANGELOG_CHANGES: ${{ steps.changelog_reader.outputs.changes }}
       run: |
-          echo -e "\e[1mVersion\e[0m ${{ steps.changelog_reader.outputs.version }}"
-          echo -e "\e[1mStatus\e[0m ${{ steps.changelog_reader.outputs.status }}"
-          echo -en "\e[1mBody\e[0m"
-          cat << 'EOF'
-          ${{ steps.changelog_reader.outputs.changes }}
-          EOF
+          printf '\033[1mVersion\033[0m %s\n' "$CHANGELOG_VERSION"
+          printf '\033[1mStatus\033[0m %s\n' "$CHANGELOG_STATUS"
+          printf '\033[1mBody\033[0m\n'
+          printf '%s\n' "$CHANGELOG_CHANGES"
