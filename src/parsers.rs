@@ -41,6 +41,14 @@ pub fn get_author(github_url: String) -> Result<String, Error> {
             .get(6)
             .map(|item| item.as_str().to_string())
             .ok_or_else(|| Error::InvalidUrl("author could not be found".to_string())),
+        // a profile URL pasted with a trailing `/` fails the regex while the
+        // identical paste artifact on a repository URL is trimmed elsewhere:
+        // name the actual fix instead of blaming an author that is right
+        // there in the URL
+        None if github_url.ends_with('/') => Err(Error::InvalidUrl(
+            "profile URL ends with '/': remove the trailing slash, e.g. https://github.com/some-user"
+                .to_string(),
+        )),
         None => Err(Error::InvalidUrl("repository author not found".to_string())),
     }
 }

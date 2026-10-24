@@ -1,5 +1,6 @@
 //! Profile scan: a profile's events, falling back to its repositories.
 
+use crate::correlate::{CorrelationBuilder, RepoContribution};
 use crate::errors::Error;
 use crate::github::fetch_paginated;
 use crate::parsers;
@@ -14,6 +15,7 @@ use serde_json::Value;
 /// retrieve multiple developers emails.
 pub(crate) fn scan_profile(scanner: &Scanner, author: &str) -> Result<super::ScanOutcome, Error> {
     let mut found_emails: Vec<String> = Vec::new();
+    let mut correlation = CorrelationBuilder::new();
 
     let page_emails: Vec<String> = fetch_paginated(
         scanner.client(),
@@ -39,15 +41,41 @@ pub(crate) fn scan_profile(scanner: &Scanner, author: &str) -> Result<super::Sca
             None,
         )?;
         for repository_url in &repositories {
-            match scan_repository_url(scanner.client(), repository_url) {
-                Ok(emails) => {
-                    merge_emails(&mut found_emails, emails);
-                    repos_scanned += 1;
+            match parse_repository_parts(repository_url) {
+                Ok((repository_author, repository)) => {
+                    match super::repository::scan_repository(
+                        scanner.client(),
+                        &repository_author,
+                        &repository,
+                    ) {
+                        Ok(scan) => {
+                            merge_emails(&mut found_emails, scan.emails);
+                            correlation.add_repo(RepoContribution {
+                                name: format!("{repository_author}/{repository}"),
+                                // the /repos listing metadata does not carry
+                                // the primary language: it would cost one
+                                // extra API call per repository (issue #5)
+                                language: None,
+                                authors: scan.authors,
+                            });
+                            repos_scanned += 1;
+                        }
+                        // one failing repository (deleted, private…)
+                        // must not abort the whole fallback scan and discard
+                        // the emails already collected from other repos
+                        Err(err) => log::warn!(
+                            "skipping repository {}: {}",
+                            crate::output::sanitize_log_text(repository_url),
+                            crate::output::sanitize_log_text(&err.to_string())
+                        ),
+                    }
                 }
-                // one failing repository (deleted, private, unparsable URL…)
-                // must not abort the whole fallback scan and discard the
-                // emails already collected from the events or other repos
-                Err(err) => log::warn!("skipping repository {repository_url}: {err}"),
+                // one unparsable URL must not abort the whole fallback scan
+                Err(err) => log::warn!(
+                    "skipping repository {}: {}",
+                    crate::output::sanitize_log_text(repository_url),
+                    crate::output::sanitize_log_text(&err.to_string())
+                ),
             }
         }
     }
@@ -56,18 +84,16 @@ pub(crate) fn scan_profile(scanner: &Scanner, author: &str) -> Result<super::Sca
     Ok(super::ScanOutcome {
         emails: found_emails,
         repos_scanned,
+        correlation: correlation.finish(),
     })
 }
 
-/// Scans one repository URL (parse its author/repository parts, then fetch
-/// its commits), as the building block of the profile repositories fallback.
-fn scan_repository_url(
-    client: &crate::github::Client,
-    repository_url: &str,
-) -> Result<Vec<String>, Error> {
+/// Parses the author/repository parts of a fallback repository URL, as the
+/// building block of the profile repositories fallback.
+fn parse_repository_parts(repository_url: &str) -> Result<(String, String), Error> {
     let repository_author = parsers::get_author(repository_url.to_string())?;
     let repository = parsers::get_repository(repository_url.to_string())?;
-    super::repository::scan_repository(client, &repository_author, &repository)
+    Ok((repository_author, repository))
 }
 
 /// Extracts the emails found in a `/users/{author}/events` page: at most one
