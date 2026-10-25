@@ -20,6 +20,38 @@ use std::path::{Path, PathBuf};
 /// Returns [`Error::NoResults`] when there is nothing to write, or
 /// [`Error::OutputWrite`] carrying the offending path when the results
 /// directory or the file itself cannot be created or written. Never panics.
+/// The shared log-safety rule for strings derived from untrusted metadata
+/// (commit author names/emails, API URLs): control characters (newlines
+/// would forge extra terminal lines, ESC opens ANSI escapes) and the main
+/// invisible/bidi format characters are replaced by `_`, so a hostile
+/// commit can never forge or recolor a terminal line.
+pub(crate) fn sanitize_log_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(
+                    c,
+                    '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}' | '\u{200B}'..='\u{200D}'
+                        | '\u{2060}'..='\u{2064}' | '\u{FEFF}'
+                )
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Writes the plain one-email-per-line result file under
+/// `results/<directory>/<file_name>` and returns its path.
+///
+/// # Errors
+///
+/// Returns [`Error::NoResults`] when there is nothing to write, or
+/// [`Error::OutputWrite`] carrying the offending path when the results
+/// directory or the file itself cannot be created or written. Never panics.
 pub fn write_text(directory: &str, file_name: &str, emails: &[String]) -> Result<PathBuf, Error> {
     if emails.is_empty() {
         return Err(Error::NoResults);
@@ -93,8 +125,11 @@ fn sanitize_file_name(name: &str) -> String {
 }
 
 /// Writes the opt-in JSON report to `path`:
-/// `{ "target", "mode": "repository|profile|search", "emails", "scanned": { "repos", "pages" } }`.
-/// The JSON report is an addition: the text output is always written too.
+/// `{ "target", "mode": "repository|profile|search", "emails", "scanned": { "repos", "pages" }, "correlation" }`.
+/// The `correlation` object (issue #5) carries the per-author aggregated
+/// attributes: emails, repositories with their primary language, dominant
+/// languages, first seen repository and total commit counts. The JSON report
+/// is an addition: the text output is skipped when the scan finds nothing.
 ///
 /// # Errors
 ///
@@ -108,12 +143,14 @@ pub fn write_json(
     emails: &[String],
     repos_scanned: usize,
     pages_fetched: usize,
+    correlation: &crate::correlate::Correlation,
 ) -> Result<(), Error> {
     let report = json!({
         "target": target,
         "mode": mode,
         "emails": emails,
         "scanned": { "repos": repos_scanned, "pages": pages_fetched },
+        "correlation": correlation,
     });
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -131,10 +168,26 @@ pub fn write_json(
 
 #[cfg(test)]
 mod tests {
+
     // Tests may unwrap, expect and panic freely: a failing assertion must
     // be loud, so the zero-panic lints do not apply to the test modules.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn sanitize_log_text_neuters_control_and_invisible_characters() {
+        assert_eq!(
+            sanitize_log_text("a\u{1b}[31mb\nc"),
+            "a_[31mb_c",
+            "ESC opens ANSI escapes and a newline forges lines: both become _"
+        );
+        assert_eq!(
+            sanitize_log_text("a\u{202E}b"),
+            "a_b",
+            "bidi override neutered"
+        );
+        assert_eq!(sanitize_log_text("clean text"), "clean text");
+    }
     use std::sync::Mutex;
 
     /// Serializes the tests that move the process working directory:
@@ -274,6 +327,7 @@ mod tests {
             &["a@b.c".to_string()],
             1,
             1,
+            &crate::correlate::Correlation::default(),
         )
         .expect_err("a directory path must fail");
         assert!(
@@ -296,6 +350,7 @@ mod tests {
             &["a@b.c".to_string()],
             1,
             3,
+            &crate::correlate::Correlation::default(),
         )
         .expect("json output must write");
 
@@ -307,6 +362,78 @@ mod tests {
         assert_eq!(parsed["emails"], serde_json::json!(["a@b.c"]));
         assert_eq!(parsed["scanned"]["repos"], 1);
         assert_eq!(parsed["scanned"]["pages"], 3);
+        // the correlation object is always part of the opt-in report
+        assert_eq!(parsed["correlation"]["authors"], serde_json::json!([]));
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn write_json_includes_the_correlation_report_on_top_of_the_legacy_fields() {
+        let path = std::env::temp_dir().join(format!(
+            "git2mail_output_test_{}_correlation.json",
+            std::process::id()
+        ));
+        let mut builder = crate::correlate::CorrelationBuilder::new();
+        builder.add_repo(crate::correlate::RepoContribution {
+            name: "extiop/ctf".to_string(),
+            language: Some("Rust".to_string()),
+            authors: vec![crate::correlate::CommitAuthor {
+                name: "Alice".to_string(),
+                email: "a@b.c".to_string(),
+                hits: 2,
+            }],
+        });
+        let correlation = builder.finish();
+
+        write_json(
+            &path,
+            "https://github.com/extiop/ctf",
+            "repository",
+            &["a@b.c".to_string()],
+            1,
+            1,
+            &correlation,
+        )
+        .expect("json output must write");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("report must be readable"))
+                .expect("report must be valid JSON");
+        // the legacy fields are unchanged, the correlation is an addition
+        assert_eq!(parsed["emails"], serde_json::json!(["a@b.c"]));
+        assert_eq!(parsed["scanned"]["repos"], 1);
+        let alice = &parsed["correlation"]["authors"][0];
+        assert_eq!(alice["author"], "Alice");
+        assert_eq!(alice["emails"], serde_json::json!(["a@b.c"]));
+        assert_eq!(alice["repos"][0]["name"], "extiop/ctf");
+        assert_eq!(alice["repos"][0]["language"], "Rust");
+        assert_eq!(alice["languages"], serde_json::json!(["Rust"]));
+        assert_eq!(alice["first_seen_repo"], "extiop/ctf");
+        assert_eq!(alice["total_hits"], 2);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn write_text_plain_output_stays_byte_identical_for_any_email_set() {
+        // property (issue #5 compatibility gate): whatever the scan found,
+        // the legacy text file is exactly one email per line — the
+        // correlation report changes nothing to the plain output
+        let mut state = 0x1234_5678_u32;
+        for _case in 0..8 {
+            let mut emails: Vec<String> = Vec::new();
+            for _i in 0..(state % 40 + 1) {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                emails.push(format!("dev{state}@example.com"));
+            }
+            in_temp_cwd(|| {
+                let directory = format!("git2mail_output_test_property_{}", std::process::id());
+                let path =
+                    write_text(&directory, "property", &emails).expect("text output must write");
+                let content = fs::read_to_string(&path).expect("result must be readable");
+                let expected: String = emails.iter().map(|email| format!("{email}\n")).collect();
+                assert_eq!(content, expected);
+            });
+            state = state.wrapping_add(7);
+        }
     }
 }

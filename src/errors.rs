@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::io;
+use std::path::Path;
 
 /// All the errors the crate can produce.
 #[non_exhaustive]
@@ -28,8 +29,19 @@ pub enum Error {
     /// The requested GitHub resource is private or unavailable
     /// (a 403 that is not a rate limit; a clean 404 maps to [`Error::NotFound`]).
     PrivateOrUnavailable,
+    /// The token file is not a usable JSON file (malformed JSON, wrong
+    /// shape, unusable keys). The payload names the file and the problem.
+    InvalidTokenFile(String),
+    /// The GitHub API rejected the token itself (HTTP 401): the token is
+    /// revoked, invalid, or expired. Distinct from a rate limit: the token
+    /// is the problem, not its quota.
+    TokenRejected,
     /// A search or scan returned no result.
     NoResults,
+    /// A `search` qualifier value is malformed (a bad count range, an
+    /// impossible date, a name with forbidden characters…). Rejected
+    /// client-side, before any network request.
+    InvalidSearchQualifier(String),
     /// Writing an output file failed.
     OutputWrite(String),
     /// A scan worker failed in an unexpected way (e.g. it never reported
@@ -42,27 +54,70 @@ impl fmt::Display for Error {
         match self {
             Error::Io(err) => write!(f, "I/O error: {err}"),
             Error::Json(err) => write!(f, "JSON error: {err}"),
-            Error::Http(err) => write!(f, "HTTP error: {err}"),
-            Error::InvalidUrl(details) => write!(f, "invalid GitHub URL: {details}"),
+            Error::Http(err) => {
+                write!(
+                    f,
+                    "could not reach GitHub: {err} — check your internet \
+                     connection and try again"
+                )
+            }
+            Error::InvalidUrl(details) => write!(f, "invalid GitHub URL: {details:?}"),
             Error::InvalidTokenFormat(masked) => {
                 write!(
                     f,
-                    "invalid token format (expected `ghp_…` or `github_pat_…`): {masked}"
+                    "invalid token format (expected `ghp_…` or `github_pat_…`): {masked:?}"
+                )
+            }
+            Error::InvalidTokenFile(details) => {
+                write!(f, "invalid token file: {details:?}")
+            }
+            Error::TokenRejected => {
+                write!(
+                    f,
+                    "GitHub rejected this token (HTTP 401 Unauthorized): it is revoked, \
+                     invalid or expired — check or rotate it"
                 )
             }
             Error::RateLimitExhausted => {
                 write!(
                     f,
-                    "rate limit exceeded and no more token available in the pool"
+                    "GitHub allowed no more requests this hour: every token's \
+                     allowance is used up — wait for the hour to reset, or add \
+                     more tokens with --token / --token-file"
                 )
             }
-            Error::NotFound => write!(f, "GitHub resource not found"),
-            Error::PrivateOrUnavailable => {
-                write!(f, "GitHub resource is private or unavailable")
+            Error::NotFound => {
+                write!(
+                    f,
+                    "GitHub resource not found — check the spelling of the \
+                 user, organization or repository name"
+                )
             }
-            Error::NoResults => write!(f, "no result found"),
+            Error::PrivateOrUnavailable => {
+                write!(
+                    f,
+                    "GitHub resource is private or unavailable — the repository may be \
+                     private, or the token lacks access to it"
+                )
+            }
+            Error::NoResults => {
+                write!(
+                    f,
+                    "no email found for this target: the repositories and the profile \
+                     are live but expose no public address"
+                )
+            }
+            Error::InvalidSearchQualifier(details) => {
+                write!(f, "invalid search qualifier: {details}")
+            }
             Error::OutputWrite(details) => write!(f, "failed to write output: {details}"),
-            Error::WorkerFailed(details) => write!(f, "scan worker failed: {details}"),
+            Error::WorkerFailed(details) => {
+                write!(
+                    f,
+                    "an unexpected internal error stopped the scan: {details} — \
+                     please run the command again"
+                )
+            }
         }
     }
 }
@@ -82,6 +137,21 @@ impl From<io::Error> for Error {
     fn from(err: io::Error) -> Self {
         Error::Io(err)
     }
+}
+
+/// Wraps a file-read failure so the message names the file: a bare
+/// "No such file or directory (os error 2)" would leave the user guessing
+/// which typed input failed. A UTF-16-saved file gets its own hint (a
+/// Windows editor cannot be read as UTF-8). The path is Debug-escaped
+/// like every user-typed payload echoed to the terminal (control
+/// characters must not pass raw).
+pub(crate) fn read_file_error(path: &Path, err: io::Error) -> Error {
+    let hint = if err.kind() == io::ErrorKind::InvalidData {
+        " (is the file UTF-8-encoded? a file saved as UTF-16 cannot be read)"
+    } else {
+        ""
+    };
+    Error::Io(io::Error::new(err.kind(), format!("{path:?}: {err}{hint}")))
 }
 
 impl From<serde_json::Error> for Error {
@@ -112,24 +182,102 @@ mod tests {
         assert!(
             Error::RateLimitExhausted
                 .to_string()
-                .contains("no more token")
+                .contains("every token's allowance is used up")
         );
-        assert_eq!(Error::NotFound.to_string(), "GitHub resource not found");
+        assert!(
+            Error::NotFound
+                .to_string()
+                .contains("check the spelling of the user")
+        );
         assert_eq!(
             Error::InvalidUrl("nope".to_string()).to_string(),
-            "invalid GitHub URL: nope"
+            "invalid GitHub URL: \"nope\""
         );
         assert_eq!(
             Error::InvalidTokenFormat("ghp_***".to_string()).to_string(),
-            "invalid token format (expected `ghp_…` or `github_pat_…`): ghp_***"
+            "invalid token format (expected `ghp_…` or `github_pat_…`): \"ghp_***\""
+        );
+        assert_eq!(
+            Error::InvalidSearchQualifier("stars: >abc".to_string()).to_string(),
+            "invalid search qualifier: stars: >abc"
         );
         assert_eq!(
             Error::OutputWrite("results/x".to_string()).to_string(),
             "failed to write output: results/x"
         );
+        assert!(
+            Error::Json(serde_json::from_str::<serde_json::Value>("bad").unwrap_err())
+                .to_string()
+                .starts_with("JSON error:"),
+            "the JSON arm wraps the serde message"
+        );
+        // a blocked connect (nothing listens on port 1) goes through the
+        // plain-language Http arm
+        let http_err = reqwest::blocking::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .expect_err("nothing listens on port 1");
+        assert!(
+            Error::Http(http_err)
+                .to_string()
+                .contains("could not reach GitHub"),
+            "the Http arm carries the plain-language network cause"
+        );
+        assert!(
+            Error::InvalidTokenFile("token file key \"foo\" is not a numeric index".to_string())
+                .to_string()
+                .starts_with("invalid token file:"),
+            "the invalid token file arm quotes its payload"
+        );
+        assert!(
+            Error::TokenRejected
+                .to_string()
+                .contains("GitHub rejected this token (HTTP 401 Unauthorized)")
+                && Error::TokenRejected
+                    .to_string()
+                    .contains("check or rotate it"),
+            "the rejected-token arm carries status and next step"
+        );
+        assert!(
+            Error::PrivateOrUnavailable
+                .to_string()
+                .contains("the token lacks access"),
+            "the private-resource arm names the token-scope possibility"
+        );
+        assert!(
+            Error::NoResults.to_string().contains("no email found"),
+            "the no-result arm explains that the target is live"
+        );
         assert_eq!(
             Error::WorkerFailed("did not report".to_string()).to_string(),
-            "scan worker failed: did not report"
+            "an unexpected internal error stopped the scan: did not report — please run the command again"
+        );
+    }
+
+    #[test]
+    fn read_file_error_names_the_file_and_hints_the_encoding() {
+        // the read failure names the typed input, so the user knows which
+        // file to fix; a UTF-16-saved file gets its own hint
+        let err = read_file_error(
+            Path::new("tokens.json"),
+            io::Error::new(io::ErrorKind::NotFound, "no such file"),
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("tokens.json") && message.contains("no such file"),
+            "unexpected message: {message}"
+        );
+        let err = read_file_error(
+            Path::new("tokens.json"),
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream does not represent valid UTF-8",
+            ),
+        );
+        assert!(
+            err.to_string().contains("UTF-16"),
+            "the invalid-data case must hint at the encoding: {}",
+            err
         );
     }
 

@@ -16,21 +16,30 @@ mod profile;
 mod repository;
 mod search;
 
+use crate::correlate::{Correlation, CorrelationBuilder, RepoContribution};
 use crate::errors::Error;
 use crate::github::{Client, TokenPool};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub use search::SearchQualifiers;
+
 /// Listings are fetched 100 items per page, the GitHub API maximum.
 pub(crate) const PER_PAGE: u16 = 100;
 
-/// Outcome of a scan: the emails found and how many repositories were scanned.
+/// Outcome of a scan: the emails found, how many repositories were scanned
+/// and the per-author correlation report built along the way (issue #5).
 #[derive(Debug, Default)]
 pub struct ScanOutcome {
     /// Emails found during the scan, deduplicated and sorted.
     pub emails: Vec<String>,
     /// Number of repositories whose commits were scanned.
     pub repos_scanned: usize,
+    /// Per-author correlation report: authors, emails, repositories with
+    /// their primary language and commit counts. Empty when no author could
+    /// be attributed (for instance a profile scan that found its emails in
+    /// the events alone).
+    pub correlation: Correlation,
 }
 
 /// A GitHub scanner built from the CLI parameters.
@@ -59,6 +68,10 @@ impl Scanner {
         } else if let Some(token_file) = token_file {
             TokenPool::from_token_file(token_file)?
         } else {
+            log::warn!(
+                "no token provided: running anonymously, limited to 60 requests/hour \
+                 (use --token or --token-file <tokens.json> for 5000 requests/hour each)"
+            );
             TokenPool::anonymous()
         };
         let client = Client::new(pool)?;
@@ -102,33 +115,67 @@ impl Scanner {
             return profile::scan_profile(self, author);
         }
 
-        let emails = repository::scan_repository(self.client(), author, repository)?;
+        let scan = repository::scan_repository(self.client(), author, repository)?;
+        // single-repository scan: the primary language would cost one extra
+        // API call on the repository metadata, so the correlation reports it
+        // as unknown (documented delta, issue #5)
+        let mut correlation = CorrelationBuilder::new();
+        correlation.add_repo(RepoContribution {
+            name: format!("{author}/{repository}"),
+            language: None,
+            authors: scan.authors,
+        });
         Ok(ScanOutcome {
-            emails,
+            emails: scan.emails,
             repos_scanned: 1,
+            correlation: correlation.finish(),
         })
     }
 
     /// Fetches the repositories matching a user request (a `query` with an
-    /// optional `language`, up to `limit` repositories) and scans them.
+    /// optional `language` and advanced [`SearchQualifiers`], up to `limit`
+    /// repositories) and scans them.
     ///
     /// # Errors
     ///
-    /// Returns the same failures as [`Scanner::scan_parts`]: a scan-wide
-    /// failure aborts the scan, while a dead dedicated token alone does not
-    /// (the parallel scan keeps the emails found so far). Never panics.
-    pub fn search(&self, query: &str, language: &str, limit: usize) -> Result<ScanOutcome, Error> {
-        search::aggregate_search(self, query, language, limit)
+    /// Returns [`Error::InvalidSearchQualifier`] when a provided qualifier
+    /// value is malformed (rejected client-side, before any network
+    /// request). Otherwise the same failures as [`Scanner::scan_parts`]: a
+    /// scan-wide failure aborts the scan, while a dead dedicated token
+    /// alone does not (the parallel scan keeps the emails found so far).
+    /// Never panics.
+    pub fn search(
+        &self,
+        query: &str,
+        language: &str,
+        qualifiers: &SearchQualifiers,
+        limit: usize,
+    ) -> Result<ScanOutcome, Error> {
+        search::aggregate_search(self, query, language, qualifiers, limit)
     }
+}
+
+/// Whether an email is usable: non-empty and not a GitHub `noreply` address.
+/// The shared acceptance rule of the plain output and of the correlation
+/// report, so both always stay consistent.
+pub(crate) fn is_usable_email(email: &str) -> bool {
+    let email = email.trim_matches('"');
+    // a crafted commit email with control characters or whitespace (a
+    // newline would forge extra lines in the one-email-per-line result
+    // file, an ESC would inject terminal sequences) is never usable: the
+    // plain output and the correlation report only carry real addresses
+    !email.is_empty()
+        && !email.contains("noreply")
+        && email.bytes().all(|byte| {
+            byte.is_ascii_graphic() || byte.is_ascii_alphanumeric() || byte == b'@' || byte == b'.'
+        })
 }
 
 /// Keeps a found email when it is usable: non-empty, not a GitHub `noreply`
 /// address and not already found.
 pub(crate) fn keep_email(emails: &mut Vec<String>, email: &str) {
-    let email = email.trim_matches('"');
-    if !email.is_empty() && !email.contains("noreply") && !emails.iter().any(|found| found == email)
-    {
-        emails.push(email.to_string());
+    if is_usable_email(email) && !emails.iter().any(|found| found == email.trim_matches('"')) {
+        emails.push(email.trim_matches('"').to_string());
     }
 }
 

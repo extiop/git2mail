@@ -11,6 +11,17 @@ use std::time::{Duration, Instant};
 /// Pool index used for the anonymous (token-less) quota.
 const ANONYMOUS_INDEX: usize = usize::MAX;
 
+/// 1-based display of a pool index, safe for the anonymous quota whose
+/// sentinel index is `usize::MAX` (an `index + 1` would overflow in debug
+/// builds).
+fn display_index(index: usize) -> usize {
+    if index == ANONYMOUS_INDEX {
+        0
+    } else {
+        index + 1
+    }
+}
+
 /// Accepted GitHub token prefixes.
 /// Personal access tokens (classic) start with `ghp_`, fine-grained ones with
 /// `github_pat_`.
@@ -77,8 +88,16 @@ impl TokenPool {
     /// strings. Validation happens at load time, so an invalid file fails
     /// before any scan. Never panics.
     pub fn from_token_file(path: &Path) -> Result<Self, Error> {
-        let raw = std::fs::read_to_string(path)?;
-        let parsed: Value = serde_json::from_str(&raw)?;
+        let raw = std::fs::read_to_string(path)
+            .map_err(|err| crate::errors::read_file_error(path, err))?;
+        let parsed: Value = serde_json::from_str(&raw).map_err(|err| {
+            // the malformed-JSON case is a broken file, not a broken value:
+            // it belongs to the crafted "invalid token file" family, and it
+            // must name the file (the bare serde message "expected value at
+            // line 1 column 1" alone leaves the user guessing which input
+            // failed). Debug-escaped like every InvalidTokenFile payload
+            Error::InvalidTokenFile(format!("{}: {err}", path.display()))
+        })?;
         let object = parsed.as_object().ok_or_else(|| {
             Error::InvalidTokenFormat(
                 "token file must be a JSON object of indexes to tokens".to_string(),
@@ -310,10 +329,10 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`Error::RateLimitExhausted`] when every token of the pool is
-    /// rate-limited, [`Error::NotFound`], [`Error::PrivateOrUnavailable`] and
-    /// [`Error::Http`] for the response and transport failures (any other
-    /// non-2xx status, including a rejected token answered with 401, surfaces
-    /// as [`Error::Http`]). Rate-limit responses rotate to the next token
+    /// rate-limited; any other non-success status surfaces as
+    /// [`Error::Http`], as do [`Error::NotFound`],
+    /// [`Error::PrivateOrUnavailable`] and [`Error::Http`] for the response
+    /// and transport failures. Rate-limit responses rotate to the next token
     /// of the pool and the request is retried with it. Two cases are
     /// distinguished:
     ///
@@ -334,7 +353,7 @@ impl Client {
     /// usable.
     ///
     /// Once no token can be acquired, [`Error::RateLimitExhausted`] is
-    /// returned (no infinite loop, no wasted sleep). Never panics.
+    /// returned (no infinite loop, no wasted sleep).
     ///
     /// Any other 403 is permanent (private resource, missing token scope,
     /// SSO not authorized…) and maps to [`Error::PrivateOrUnavailable`].
@@ -365,6 +384,15 @@ impl Client {
                 {
                     // Primary rate limit: the hourly quota is spent, retire
                     // the token and rotate to the next one.
+                    log::info!(
+                        "token #{} has used up its hourly allowance{}",
+                        display_index(index),
+                        if self.tokens.has_other_live(index) {
+                            ": switching to the next available token"
+                        } else {
+                            " and no other token is available"
+                        }
+                    );
                     self.tokens.mark_exhausted(index);
                     continue;
                 }
@@ -378,6 +406,12 @@ impl Client {
                     // not spent) and rotate to the next live token.
                     let deadline =
                         Instant::now() + retry_after.unwrap_or(Self::DEFAULT_SECONDARY_PARK);
+                    log::info!(
+                        "GitHub asked token #{} to slow down: pausing it for {} seconds, \
+                         then switching to another token if one is available",
+                        display_index(index),
+                        deadline.duration_since(Instant::now()).as_secs()
+                    );
                     self.tokens.mark_limited_until(index, deadline);
                     if self.tokens.has_other_live(index) {
                         continue; // rotate to the next live token and retry
@@ -390,6 +424,13 @@ impl Client {
             }
             if status == reqwest::StatusCode::NOT_FOUND {
                 return Err(Error::NotFound);
+            }
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                // The token itself was rejected (revoked, invalid, expired).
+                // The raw reqwest message — "HTTP status client error (401
+                // Unauthorized) for url (…)" — names no next step and reads
+                // like a tool failure rather than a credentials problem
+                return Err(Error::TokenRejected);
             }
             let response = response.error_for_status()?;
             self.successful_requests.fetch_add(1, Ordering::Relaxed);

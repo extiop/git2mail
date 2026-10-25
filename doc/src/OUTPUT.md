@@ -24,18 +24,40 @@ results.
 
 ## JSON report (`--json <path>`)
 
-`--json` additionally writes a JSON report next to the text output:
+`--json <path>` additionally writes a JSON report at the path you give (for example `--json report.json`).
 
 ```json
 {
   "target": "<scan target>",
   "mode": "repository|profile|search",
   "emails": ["…"],
-  "scanned": { "repos": 12, "pages": 30 }
+  "scanned": { "repos": 12, "pages": 30 },
+  "correlation": {
+    "authors": [
+      {
+        "author": "Alice",
+        "emails": ["alice@example.com"],
+        "repos": [
+          { "name": "a/one", "language": "Rust" },
+          { "name": "b/two", "language": "Go" }
+        ],
+        "languages": ["Rust", "Go"],
+        "first_seen_repo": "a/one",
+        "total_hits": 3
+      }
+    ]
+  }
 }
 ```
 
-The report is written after the text output, at the end of the scan.
+The report is written after the text output, at the end of the scan. The
+`correlation` block groups the emails by commit author: for each author it
+lists every address seen in their commits, the repositories they appear in
+(with the repository's primary language), the languages ordered dominant
+first (most commits, ties alphabetical), the repository where the author was first seen, and the total
+number of hits. A commit without a detected (non-noreply) email is not
+attributed; a commit with no author name is attributed under the email
+itself.
 
 ## File names
 

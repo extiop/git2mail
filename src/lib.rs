@@ -12,6 +12,11 @@
 //! [`std::sync::LazyLock`] initializers in [`parsers`], whose compilation
 //! cannot fail at runtime.
 
+/// Per-author attribute correlation (issue #5): aggregates the scan results
+/// per author with the repositories scanned, their primary language and the
+/// commit counts, for the opt-in JSON report and the terminal summary.
+pub mod correlate;
+
 /// MLA-style hand-made error type shared by the whole crate.
 pub mod errors;
 
