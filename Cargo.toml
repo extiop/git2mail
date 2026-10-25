@@ -3,11 +3,12 @@ name = "git2mail"
 version = "0.7.0"
 authors = ["extiop"]
 edition = "2024"
+rust-version = "1.88"
 license = "LGPL-3.0-only"
 description = "Pure Rust OSINT CLI: uncover the email addresses behind GitHub activity: repository, profile and keyword scans, reverse email lookup, and full user/organization investigations. 100% GitHub REST API, no scraping."
 repository = "https://github.com/extiop/git2mail"
 readme = "README.md"
-keywords = ["github", "osint", "rust", "leak"]
+keywords = ["github", "osint", "rust", "leak", "email"]
 categories = ["command-line-utilities"]
 
 # MLA-style strict lints (single-crate equivalent of the MLA workspace
@@ -30,7 +31,7 @@ missing_docs = "deny"
 # programming error), the two justified production-code expects
 # (`#[expect(clippy::large_enum_variant)]` on the CLI `Command` enum in
 # `src/main.rs` and `#[expect(clippy::too_many_arguments)]` on the
-# `output::write_json` report writer — `expect` instead of `allow`, so the
+# `output::write_scan_report_json` report writer — `expect` instead of `allow`, so the
 # build fails when they stop applying), and the test modules,
 # where failing loudly is the point.
 unwrap_used = "deny"

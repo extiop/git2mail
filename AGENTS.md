@@ -58,7 +58,7 @@ an async runtime "just this once".
    justified `#[expect]` allowances inventoried with their justification in
    `Cargo.toml`'s lint table (`clippy::large_enum_variant` on the CLI
    `Command` enum in `src/main.rs`, `clippy::too_many_arguments` on
-   `output::write_json` — `#[expect]`, so a stale allowance fails the
+   `output::write_scan_report_json` — `#[expect]`, so a stale allowance fails the
    build). Tests may panic freely.
 4. **No async/tokio**: threads from `std` (`std::thread::scope`) +
    `reqwest` blocking client. One dedicated token per parallel worker.

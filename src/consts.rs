@@ -3,7 +3,7 @@
 //! per module.
 
 /// The GitHub API base URL the production runs hit.
-pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
+pub const GITHUB_API_BASE: &str = "https://api.github.com";
 
 /// The GitHub noreply domain: addresses on it never carry a real mailbox
 /// (they feed the username/names histories of the `user` investigation and

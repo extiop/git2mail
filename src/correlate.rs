@@ -72,7 +72,7 @@ pub struct RepoLanguage {
 
 /// The per-author correlation report (issue #5): the `correlation` object of
 /// the opt-in `--json` output, on top of the unchanged legacy fields.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Correlation {
     /// One entry per author, sorted by descending commit count (then author
     /// name, case-insensitively, so the report is deterministic).
@@ -150,7 +150,7 @@ impl Correlation {
 
 /// One author's correlated attributes (one entry of
 /// [`Correlation::authors`]).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AuthorReport {
     /// The author name the commits expose (the report key). Same-name
     /// authors are merged: an OSINT heuristic, like GitHub's own

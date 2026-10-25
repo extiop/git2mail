@@ -121,7 +121,8 @@ impl fmt::Display for Error {
                     write!(
                         f,
                         "could not reach GitHub: {err} — check your internet \
-                         connection and try again"
+                         connection and try again (on a corporate network, a \
+                         proxy or firewall may have refused the request)"
                     )
                 }
             }
@@ -146,7 +147,9 @@ impl fmt::Display for Error {
                     // `--token`/token-file value and is printed to the
                     // terminal, so control characters (an ESC opener in the
                     // first four characters) must not pass raw
-                    "invalid token format (expected `ghp_…` or `github_pat_…`): {masked:?}"
+                    "invalid token format (expected `ghp_…` or \
+                     `github_pat_…`): {masked:?} — copy a fresh token from \
+                     github.com/settings/tokens"
                 )
             }
             Error::InvalidTokenFile(details) => {
@@ -162,8 +165,10 @@ impl fmt::Display for Error {
                     f,
                     "GitHub allowed no more requests: every token's allowance \
                      is used up (without --token: the shared anonymous \
-                     allowance is spent) — wait for the limit window to \
-                     reset, or add more tokens with --token / --token-file"
+                     allowance is spent) — wait up to one hour for the \
+                     limit to reset, or add more tokens with --token / \
+                     --token-file; emails found before the limit may \
+                     not be saved"
                 )
             }
             Error::TokenRejected => {
@@ -187,14 +192,16 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "GitHub resource not found — check the spelling of the \
-                     user, organization or repository name"
+                     user, organization or repository name (a URL ending in \
+                     .git also produces this: drop the suffix)"
                 )
             }
             Error::PrivateOrUnavailable => {
                 write!(
                     f,
                     "GitHub resource is private or unavailable — the repository may be \
-                     private, or the token lacks access to it"
+                     private, the token lacks access to it, or a network intermediary \
+                     refused the request"
                 )
             }
             Error::EmptyRepository => {
@@ -338,6 +345,15 @@ mod tests {
         let io_error = Error::Io(io::Error::other("disk on fire"));
         assert_eq!(io_error.to_string(), "disk on fire");
 
+        let search_qualifier =
+            Error::InvalidSearchQualifier("stars abc: expected a number or range".to_string())
+                .to_string();
+        assert!(
+            search_qualifier.starts_with("invalid search filter: ")
+                && search_qualifier.contains("stars abc"),
+            "unexpected InvalidSearchQualifier rendering: {search_qualifier}"
+        );
+
         let rate_limit = Error::RateLimitExhausted.to_string();
         assert!(
             rate_limit.contains("every token's allowance is used up")
@@ -402,7 +418,7 @@ mod tests {
         );
         assert_eq!(
             Error::InvalidTokenFormat("ghp_***".to_string()).to_string(),
-            "invalid token format (expected `ghp_…` or `github_pat_…`): \"ghp_***\""
+            "invalid token format (expected `ghp_…` or `github_pat_…`): \"ghp_***\" — copy a fresh token from github.com/settings/tokens"
         );
         // the --variant-pattern payload is user-typed and echoed raw inside
         // the details sentence: the whole payload must be Debug-escaped ONCE
@@ -431,7 +447,7 @@ mod tests {
         // the terminal: control characters are Debug-escaped, not printed raw
         assert_eq!(
             Error::InvalidTokenFormat("\x1b[31***".to_string()).to_string(),
-            "invalid token format (expected `ghp_…` or `github_pat_…`): \"\\u{1b}[31***\""
+            "invalid token format (expected `ghp_…` or `github_pat_…`): \"\\u{1b}[31***\" — copy a fresh token from github.com/settings/tokens"
         );
         assert_eq!(
             Error::OutputWrite("results/x".to_string()).to_string(),

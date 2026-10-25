@@ -20,12 +20,12 @@ Two guards bound the loop:
 
 - **Short-page guard.** Listings fetched page by page (repository commits,
   profile events, search results, the `user` investigation's identity
-  listings, and the `email` candidate search) stop when a page comes back underfilled,
+  listings, the `email` candidate search, and the commit verification of
+  one `email` candidate) stop when a page comes back underfilled,
   instead of walking into the error page GitHub serves past the real end
   of a listing. The simple listings (the profile fallback repository
   enumeration, the public repositories and keys of a `user`, organization
-  members and repositories, and the commit verification of one `email`
-  candidate) end only when a page comes back empty.
+  members and repositories) end only when a page comes back empty.
 - **Token-pool bound.** Every page request participates in the rate-limit
   handling below; the loop can never spin: when every token is exhausted,
   the scan fails with an explicit error instead of retrying forever.

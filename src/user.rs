@@ -1030,10 +1030,6 @@ fn parse_keys_page(json: &Value) -> Result<(Vec<SshKey>, usize), Error> {
     Ok((keys, items.len()))
 }
 
-// the noreply test is the shared exact-domain rule of the crate
-// (`crate::sources::is_noreply_email`, subsumed by the `is_usable_email`
-// gate of `absorb_identity`): the same test [`parse_noreply`] applies.
-
 /// Folds one commit name for the report, trimmed (a hostile whitespace-only
 /// name like `"   "` must not plant noise in the histories) and dropped when
 /// nothing remains.
@@ -1149,9 +1145,14 @@ impl UserReport {
         if self.secondary_accounts.is_empty() {
             info!("[-] no secondary account candidate");
         }
+        // these are heuristics, not confirmations: a junior analyst must
+        // never read a possible alias as an established fact
+        info!(
+            "[.] the accounts below are candidates suggested by name overlap, not confirmed links"
+        );
         for account in &self.secondary_accounts {
             info!(
-                "[!] {} ({}): names [{}], repos [{}]",
+                "[.] possible account: {} ({}): names [{}], repos [{}]",
                 log_safe(&account.identity),
                 account.kind,
                 log_safe(&account.names.join(", ")),
@@ -2724,7 +2725,7 @@ mod tests {
         // puts on UI commits: it recurs across two or more repositories on
         // any profile with web-flow commits and never carries a target
         // name, so the co-author heuristic flagged it as a secondary
-        // account of the target (live repro: user elibenporat reported
+        // account of the target (live repro: user octocat reported
         // secondary_accounts[0].identity == "noreply@github.com"). It
         // stays in the emails list — it IS an observed commit email — but
         // it is automation, not a person
@@ -3984,18 +3985,7 @@ mod tests {
                     r#"{"total_count": 0, "items": []}"#.to_string(),
                 );
             }
-            let page = || {
-                request
-                    .first()
-                    .map(|line| line.trim_end_matches(" HTTP/1.1"))
-                    .and_then(|line| line.split('?').nth(1))
-                    .and_then(|query| {
-                        query
-                            .split('&')
-                            .find_map(|param| param.strip_prefix("page=")?.parse::<u16>().ok())
-                    })
-                    .unwrap_or(0)
-            };
+            let page = || crate::github::mock::request_line_page(request);
             if path.contains("/users/oldname?") || path.contains("/users/oldname ") {
                 return (
                     200,

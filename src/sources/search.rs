@@ -297,7 +297,7 @@ fn validate_date_range(name: &str, value: &str) -> Result<(), Error> {
 fn validate_name_value(name: &str, value: &str) -> Result<(), Error> {
     if name == "user" || name == "org" {
         return crate::user::validate_username(value)
-            .map_err(|_| invalid_qualifier(name, value, "a GitHub login like extiop or acme"));
+            .map_err(|_| invalid_qualifier(name, value, "a GitHub login like octocat or acme"));
     }
     const EXPECTED: &str = "a name like mit, osint or acme";
     let allowed = value
@@ -1127,7 +1127,7 @@ fn reduce_worker_reports(reports: Vec<WorkerReport>) -> ReducedReports {
         // result instead of throwing the work away
         Some(err) if only_token_deaths && any_progress => {
             log::warn!(
-                "one token ran out or was refused mid-scan: results may be incomplete (the JSON report marks the run \"scanned.partial\" only when a listed repository was left unscanned)"
+                "one token ran out or was refused mid-scan: results may be incomplete. The JSON report marks the run \"scanned.partial\" only when a listed repository was left unscanned"
             );
             partial_token_death = true;
             death_error = Some(err);
@@ -1256,7 +1256,7 @@ mod tests {
             pushed: Some("2019-01-01..2020-01-01".to_string()),
             license: Some("apache-2.0".to_string()),
             topic: Some("osint".to_string()),
-            user: Some("extiop".to_string()),
+            user: Some("octocat".to_string()),
             org: Some("acme".to_string()),
         };
         qualifiers

@@ -1278,7 +1278,7 @@ mod tests {
         ));
         write_scan_report_json(
             &path,
-            "https://github.com/extiop/ctf",
+            "https://github.com/octocat/hello-world",
             "repository",
             &["a@b.c".to_string()],
             1,
@@ -1291,7 +1291,7 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).expect("report must be readable"))
                 .expect("report must be valid JSON");
-        assert_eq!(parsed["target"], "https://github.com/extiop/ctf");
+        assert_eq!(parsed["target"], "https://github.com/octocat/hello-world");
         assert_eq!(parsed["mode"], "repository");
         assert_eq!(parsed["emails"], serde_json::json!(["a@b.c"]));
         assert_eq!(parsed["scanned"]["repos"], 1);
@@ -1314,7 +1314,7 @@ mod tests {
         ));
         write_scan_report_json(
             &path,
-            "https://github.com/extiop/ctf",
+            "https://github.com/octocat/hello-world",
             "search",
             &["a@b.c".to_string()],
             3,
@@ -1355,7 +1355,7 @@ mod tests {
         ));
         let mut builder = crate::correlate::CorrelationBuilder::new();
         builder.add_repo(crate::correlate::RepoContribution {
-            name: "extiop/ctf".to_string(),
+            name: "octocat/hello-world".to_string(),
             language: Some("Rust".to_string()),
             authors: vec![crate::correlate::CommitAuthor {
                 name: "Alice".to_string(),
@@ -1367,7 +1367,7 @@ mod tests {
 
         write_scan_report_json(
             &path,
-            "https://github.com/extiop/ctf",
+            "https://github.com/octocat/hello-world",
             "repository",
             &["a@b.c".to_string()],
             1,
@@ -1386,10 +1386,10 @@ mod tests {
         let alice = &parsed["correlation"]["authors"][0];
         assert_eq!(alice["author"], "Alice");
         assert_eq!(alice["emails"], serde_json::json!(["a@b.c"]));
-        assert_eq!(alice["repos"][0]["name"], "extiop/ctf");
+        assert_eq!(alice["repos"][0]["name"], "octocat/hello-world");
         assert_eq!(alice["repos"][0]["language"], "Rust");
         assert_eq!(alice["languages"], serde_json::json!(["Rust"]));
-        assert_eq!(alice["first_seen_repo"], "extiop/ctf");
+        assert_eq!(alice["first_seen_repo"], "octocat/hello-world");
         assert_eq!(alice["total_hits"], 2);
         fs::remove_file(&path).ok();
     }

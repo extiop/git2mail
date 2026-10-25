@@ -97,6 +97,10 @@ pub struct OrgReport {
     pub emails: OrgEmails,
     /// The scan coverage (repositories actually scanned, pages fetched).
     pub scanned: OrgScanned,
+    /// The per-author correlation built from the scanned commits (author,
+    /// emails, repositories, commit counts): the remediation view an org
+    /// auditor needs to attribute an exposure to a person.
+    pub correlation: crate::correlate::Correlation,
 }
 
 /// Runs the full investigation of one GitHub organization: fetches the org
@@ -141,6 +145,7 @@ type OrgScanFeedback = (
     BTreeMap<String, Vec<String>>,
     usize,
     Option<Error>,
+    crate::correlate::Correlation,
 );
 
 /// Filters the raw listing (untrusted API data: an entry whose name is
@@ -177,9 +182,15 @@ fn scan_org_repositories(
             language: None,
         })
         .collect();
-    let (all, per_repository, repos_scanned, _, _, _, token_death_error) =
+    let (all, per_repository, repos_scanned, _, correlation, _, token_death_error) =
         scanner.scan_repositories_at(base, &hits, false)?;
-    Ok((all, per_repository, repos_scanned, token_death_error))
+    Ok((
+        all,
+        per_repository,
+        repos_scanned,
+        token_death_error,
+        correlation,
+    ))
 }
 
 fn investigate_at(
@@ -240,7 +251,7 @@ fn investigate_at(
             log_safe(&info.login)
         );
     }
-    let (all, per_repository, repos_scanned, token_death_error) =
+    let (all, per_repository, repos_scanned, token_death_error, correlation) =
         scan_org_repositories(scanner, base, &repositories, &info.login)?;
     // token death mid-scan: the skip-vs-abort contract is the module-level
     // one, but a partial kept after a dedicated token died may have left
@@ -265,6 +276,7 @@ fn investigate_at(
             repos: repos_scanned,
             pages: scanner.requests_made(),
         },
+        correlation,
     };
     report.log_summary();
     Ok(report)
@@ -326,7 +338,44 @@ fn parse_members_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
 /// Returns [`Error::InvalidProfile`] when the body is not a JSON array.
 /// Never panics.
 fn parse_repos_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
-    parse_string_field_page(json, "name", "repositories")
+    let Some(items) = json.as_array() else {
+        return Err(Error::InvalidProfile(
+            "repositories payload: not an array".to_string(),
+        ));
+    };
+    // the same hostile-listing discipline as the user investigation's
+    // repositories listing: entries without a usable name are malformed
+    // (warned, never silent), and forked repositories are skipped —
+    // `type=public` includes forks, whose default-branch commits mirror the
+    // upstream history, so upstream developers' emails would otherwise land
+    // in the org's report unmarked
+    let mut repositories = Vec::new();
+    let mut malformed = 0usize;
+    let mut forks = 0usize;
+    for item in items {
+        let name = item.get("name").and_then(Value::as_str);
+        if item.get("fork").and_then(Value::as_bool) == Some(true) {
+            forks += 1;
+            continue;
+        }
+        match name {
+            Some(name) if !name.is_empty() => repositories.push(name.to_string()),
+            _ => malformed += 1,
+        }
+    }
+    if malformed > 0 {
+        let plural = if malformed > 1 { "entries" } else { "entry" };
+        log::warn!("{malformed} malformed {plural} skipped in the repositories listing");
+    }
+    if forks > 0 {
+        let plural = if forks > 1 {
+            "repositories"
+        } else {
+            "repository"
+        };
+        log::warn!("{forks} forked {plural} skipped (their history is upstream's)");
+    }
+    Ok((repositories, items.len()))
 }
 
 /// Extracts one string field of every item of a listing page, together
@@ -492,6 +541,7 @@ mod tests {
                 all: Vec::new(),
             },
             scanned: OrgScanned { repos: 0, pages: 0 },
+            correlation: crate::correlate::Correlation::default(),
         };
         let (_, lines) = crate::test_logger::capture(|| report.log_summary());
         assert!(
@@ -1128,6 +1178,73 @@ mod tests {
     }
 
     #[test]
+    fn a_forked_listing_entry_is_skipped_with_a_warning() {
+        // `type=public` includes forks: a fork's default-branch commits
+        // mirror the upstream history, so upstream developers' emails would
+        // land in the org's report unmarked. The listing filter skips them
+        // with a warning (the same discipline as the user investigation)
+        let (address, server) = serve_requests(move |_index, request| {
+            let line = request.first().map(String::as_str).unwrap_or("");
+            if line.contains("/orgs/acme/repos") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        r#"[{"name": "upstream-fork", "fork": true}, {"name": "one"}]"#.to_string(),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            if line.contains("/orgs/acme/public_members") {
+                return (200, vec![], "[]".to_string());
+            }
+            if line.contains("/repos/acme/one/commits") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        format!("[{}]", commit_json("Alice", "alice@acme.com")),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            (
+                200,
+                vec![],
+                r#"{"login": "acme", "name": "Acme Corp"}"#.to_string(),
+            )
+        });
+
+        let scanner = token_scanner(false);
+        let (outcome, lines) =
+            crate::test_logger::capture(|| investigate_at(&scanner, &address, "acme", None));
+        let report = outcome.expect("the scan must succeed despite the fork");
+        server.join();
+
+        // the fork never reaches the scanned set: only the sane entry is
+        // scanned and reported
+        assert_eq!(report.scanned.repos, 1, "the fork must not be scanned");
+        assert_eq!(
+            report.emails.per_repository.get("acme/one"),
+            Some(&vec!["alice@acme.com".to_string()])
+        );
+        assert!(
+            !report
+                .emails
+                .per_repository
+                .keys()
+                .any(|key| key.contains("upstream-fork")),
+            "the fork must never be scanned"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("1 forked repository skipped")),
+            "the fork must be announced: {lines:?}"
+        );
+    }
+
+    #[test]
     fn the_report_serializes_the_documented_json_shape() {
         let report = OrgReport {
             org: OrgInfo {
@@ -1143,6 +1260,19 @@ mod tests {
                     vec!["alice@acme.com".to_string()],
                 )]),
                 all: vec!["alice@acme.com".to_string()],
+            },
+            correlation: crate::correlate::Correlation {
+                authors: vec![crate::correlate::AuthorReport {
+                    author: "Alice".to_string(),
+                    emails: vec!["alice@acme.com".to_string()],
+                    repos: vec![crate::correlate::RepoLanguage {
+                        name: "acme/one".to_string(),
+                        language: None,
+                    }],
+                    languages: Vec::new(),
+                    first_seen_repo: "acme/one".to_string(),
+                    total_hits: 1,
+                }],
             },
             scanned: OrgScanned { repos: 1, pages: 5 },
         };
@@ -1163,5 +1293,15 @@ mod tests {
         );
         assert_eq!(parsed["scanned"]["repos"], 1);
         assert_eq!(parsed["scanned"]["pages"], 5);
+        // the per-author correlation is additive (the remediation view an
+        // org auditor needs): person, emails, repositories, counts
+        assert_eq!(
+            parsed["correlation"]["authors"][0]["author"],
+            serde_json::json!("Alice")
+        );
+        assert_eq!(
+            parsed["correlation"]["authors"][0]["emails"],
+            serde_json::json!(["alice@acme.com"])
+        );
     }
 }

@@ -244,9 +244,53 @@ pub fn reverse_bulk(scanner: &Scanner, path: &Path) -> Result<BulkReport, Error>
         );
         return Ok(BulkReport::default());
     }
-    let report = reverse_bulk_at(scanner, GITHUB_API_BASE, &addresses)?;
+    let (report, failure) = reverse_bulk_at(scanner, GITHUB_API_BASE, &addresses);
+    if failure.is_some() && !report.results.is_empty() {
+        log::warn!(
+            "the bulk run aborted early: the results computed before the failure follow ({} of {} addresses checked)",
+            report.results.len(),
+            report.summary.total
+        );
+    }
     log_bulk_report(&report);
+    if let Some(err) = failure {
+        return Err(err);
+    }
     Ok(report)
+}
+
+/// The bulk reverse lookup exposing partial results: on an abort-class
+/// failure (a transport error, a malformed payload) the lookups already
+/// paid for travel back in the report alongside the error, so a CLI caller
+/// can still write the requested `--json` file. Token deaths never land
+/// here: they keep their own workers' findings and the scan drains on.
+/// Logs the terminal report either way.
+pub fn reverse_bulk_with_partial(
+    scanner: &Scanner,
+    base: &str,
+    path: &Path,
+) -> (BulkReport, Option<Error>) {
+    let addresses = match read_addresses(path) {
+        Ok(addresses) => addresses,
+        Err(err) => return (BulkReport::default(), Some(err)),
+    };
+    if addresses.is_empty() {
+        log::info!(
+            "[-] no usable email address in {}",
+            log_safe(&path.display().to_string())
+        );
+        return (BulkReport::default(), None);
+    }
+    let (report, failure) = reverse_bulk_at(scanner, base, &addresses);
+    if failure.is_some() && !report.results.is_empty() {
+        log::warn!(
+            "the bulk run aborted early: the results computed before the failure follow ({} of {} addresses checked)",
+            report.results.len(),
+            addresses.len()
+        );
+    }
+    log_bulk_report(&report);
+    (report, failure)
 }
 
 /// The reverse lookup itself, driven against one API base URL: [`reverse`]
@@ -741,7 +785,9 @@ fn log_report(report: &EmailReport, searched: usize) {
                 );
             }
         }
-        None => log::info!("[-] no GitHub account matched this email"),
+        None => log::info!(
+            "[-] no GitHub account matched this email (the lookup only sees candidate repositories whose name or description mention the address: no match is not proof of absence)"
+        ),
     }
     for candidate in &report.candidate_accounts {
         // the resolved account is kept in the JSON candidates list for the
@@ -777,7 +823,7 @@ fn log_bulk_report(report: &BulkReport) {
                 confidence_plain(&account.confidence)
             ),
             None => log::info!(
-                "[-] {}: no GitHub account found",
+                "[-] {}: no GitHub account found (the lookup only sees candidate repositories mentioning the address: no match is not proof of absence)",
                 log_safe(&email_report.email)
             ),
         }
@@ -902,13 +948,17 @@ struct BulkWorkerReport {
 /// `min(nb_tokens, nb_addresses)` workers, each owning exactly one dedicated
 /// token through its own client, pulling `(file index, address)` pairs from
 /// a shared `mpsc` work queue until it is drained.
+///
+/// Returns the report and the abort-class failure that ended it, if any:
+/// on an abort the report holds the lookups completed before the failure
+/// (token deaths do not end the run and never reach this return).
 fn reverse_bulk_at(
     scanner: &Scanner,
     base: &str,
     addresses: &[String],
-) -> Result<BulkReport, Error> {
+) -> (BulkReport, Option<Error>) {
     if addresses.is_empty() {
-        return Ok(BulkReport::default());
+        return (BulkReport::default(), None);
     }
     let tokens = scanner.client().tokens();
     // Each worker is dedicated the next *live* token when any token is live
@@ -1041,24 +1091,17 @@ fn reverse_bulk_at(
         unmatched: results.len() - matched,
         skipped,
     };
+    let report = BulkReport { results, summary };
     if let Some(err) = failure {
         // an abort-class failure must not erase the lookups already paid
-        // for: the partial report is logged (when it holds anything)
-        // before the failure propagates, so a transient timeout at address
-        // 300 of 500 does not erase addresses 1-299. The unchecked
-        // addresses are already named by the skip warnings above
-        let report = BulkReport { results, summary };
-        if !report.results.is_empty() {
-            log::warn!(
-                "[!] the bulk run aborted early: the results computed before the failure follow ({} of {} addresses checked)",
-                report.results.len(),
-                addresses.len()
-            );
-            log_bulk_report(&report);
-        }
-        return Err(err);
+        // for: the partial report travels back alongside the error (the
+        // caller writes it to the requested --json file and logs it), so a
+        // transient timeout at address 300 of 500 does not erase addresses
+        // 1-299. The unchecked addresses are already named by the skip
+        // warnings above
+        return (report, Some(err));
     }
-    Ok(BulkReport { results, summary })
+    (report, None)
 }
 
 /// Worker body: owns one dedicated token through its own client, pulls the
@@ -1771,8 +1814,11 @@ mod tests {
         std::fs::remove_file(&token_path).ok();
         scanner.client().tokens().mark_exhausted(0);
 
-        let report = reverse_bulk_at(&scanner, &address, &["jane@acme.com".to_string()])
-            .expect("the live token must process the single listed address");
+        let (report, failure) = reverse_bulk_at(&scanner, &address, &["jane@acme.com".to_string()]);
+        assert!(
+            failure.is_none(),
+            "the live token must process the single listed address"
+        );
         server.join();
 
         assert_eq!(report.summary.total, 1);
@@ -1798,8 +1844,9 @@ mod tests {
         std::fs::remove_file(&token_path).ok();
         scanner.client().tokens().mark_exhausted(0);
 
-        let error = reverse_bulk_at(&scanner, &address, &["jane@acme.com".to_string()])
-            .expect_err("a single dead token must fail the bulk run without any request");
+        let (_, failure) = reverse_bulk_at(&scanner, &address, &["jane@acme.com".to_string()]);
+        let error =
+            failure.expect("a single dead token must fail the bulk run without any request");
         assert!(matches!(error, Error::RateLimitExhausted));
         assert_eq!(server.join(), 0, "no doomed request may reach the wire");
     }
@@ -2862,12 +2909,12 @@ mod tests {
         let scanner = Scanner::new(None, Some(&token_path)).expect("scanner must build");
         std::fs::remove_file(&token_path).ok();
 
-        let report = reverse_bulk_at(
+        let (report, failure) = reverse_bulk_at(
             &scanner,
             &address,
             &["alice@acme.com".to_string(), "bob@acme.com".to_string()],
-        )
-        .expect("the bulk run must succeed");
+        );
+        assert!(failure.is_none(), "the bulk run must succeed");
         server.join();
 
         // the results are in file order, whatever worker picked what
@@ -2952,12 +2999,15 @@ mod tests {
         let scanner = Scanner::new(None, Some(&token_path)).expect("scanner must build");
         std::fs::remove_file(&token_path).ok();
 
-        let report = reverse_bulk_at(
+        let (report, failure) = reverse_bulk_at(
             &scanner,
             &address,
             &["dead@evil.com".to_string(), "jane@acme.com".to_string()],
-        )
-        .expect("one revoked token must not abort the bulk run");
+        );
+        assert!(
+            failure.is_none(),
+            "one revoked token must not abort the bulk run"
+        );
         server.join();
 
         // the healthy address was fully processed and matched
@@ -3033,12 +3083,15 @@ mod tests {
         let scanner = Scanner::new(None, Some(&token_path)).expect("scanner must build");
         std::fs::remove_file(&token_path).ok();
 
-        let report = reverse_bulk_at(
+        let (report, failure) = reverse_bulk_at(
             &scanner,
             &address,
             &["alice@x.com".to_string(), "bob@x.com".to_string()],
-        )
-        .expect("a dead dedicated token with progress must not fail the bulk run");
+        );
+        assert!(
+            failure.is_none(),
+            "a dead dedicated token with progress must not fail the bulk run"
+        );
         server.join();
 
         // the processed address is reported normally; the address the worker
@@ -3101,14 +3154,44 @@ mod tests {
         // one token: one worker processes the addresses in file order, so
         // the first lookup is complete when the second one aborts the run
         let scanner = Scanner::new(None, None).expect("scanner must build");
-        let (result, lines) = crate::test_logger::capture(|| {
-            reverse_bulk_at(
-                &scanner,
-                &address,
-                &["alice@acme.com".to_string(), "doomed@acme.com".to_string()],
-            )
+        let addresses_path = std::env::temp_dir().join(format!(
+            "git2mail_bulk_abort_test_{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&addresses_path, "alice@acme.com\ndoomed@acme.com\n")
+            .expect("test setup: write addresses file");
+        let ((report, failure), lines) = crate::test_logger::capture(|| {
+            reverse_bulk_with_partial(&scanner, &address, &addresses_path)
         });
-        assert!(result.is_err(), "a 5xx mid-run must abort the bulk run");
+        assert!(
+            matches!(failure, Some(_)),
+            "a 5xx mid-run must abort the bulk run"
+        );
+        assert_eq!(
+            report.results.len(),
+            1,
+            "the lookup completed before the failure must travel back with the error"
+        );
+
+        // the CLI wiring (main.rs) writes the partial report best-effort to
+        // the requested --json file before propagating the abort: pin that
+        // the tuple's report serializes to a usable file (the parity the
+        // threat-intelligence persona asked for: 299 paid-for attributions
+        // must not live only in a scrolled terminal)
+        let json_path = std::env::temp_dir().join(format!(
+            "git2mail_bulk_abort_json_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&json_path);
+        crate::output::write_report_json(&json_path, &report)
+            .expect("the partial report must serialize");
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&json_path).expect("the partial JSON must exist"),
+        )
+        .expect("the partial report must be valid JSON");
+        assert_eq!(parsed["results"].as_array().map(Vec::len), Some(1));
+        std::fs::remove_file(&json_path).ok();
+        std::fs::remove_file(&addresses_path).ok();
         server.join();
 
         // the address computed before the failure was logged, not erased:

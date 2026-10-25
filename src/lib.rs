@@ -1,7 +1,7 @@
 //! OSINT tool to find a GitHub user's email.
 //!
-//! It uses GitHub repositories metadata regarding commits to get developers' email.
-//! It browses a repository and scrapes developers' email through its commits.
+//! It reads repositories' commit metadata through the GitHub REST API to
+//! collect developers' email addresses.
 //!
 //! # Panics
 //!
@@ -11,6 +11,29 @@
 //! are the two documented `expect` allowances on the static-regex
 //! [`std::sync::LazyLock`] initializers in [`parsers`], whose compilation
 //! cannot fail at runtime.
+
+//! # Library usage
+//!
+//! The public doors are [`sources::Scanner`] (build it from tokens, then
+//! call `scan_parts` for one repository/profile or `search` for a keyword
+//! query) and the investigation entry points of the [`email`] and [`org`]
+//! modules. Every fallible call returns [`errors::Error`]; the reports
+//! serialize to the documented JSON shapes. The `Error` display strings
+//! are written for a terminal user (they carry next steps), not for
+//! programmatic matching — match on the variant, not the text.
+//!
+//! ```no_run
+//! use git2mail::sources::Scanner;
+//!
+//! let scanner = Scanner::new(Some("ghp_your_token"), None)?;
+//! let outcome = scanner.scan_parts("denoland", "deno")?;
+//! for email in &outcome.emails {
+//!     println!("{email}");
+//! }
+//! # Ok::<(), git2mail::errors::Error>(())
+//! ```
+//!
+//!
 
 /// Per-author attribute correlation (issue #5): aggregates the scan results
 /// per author with the repositories scanned, their primary language and the
@@ -22,7 +45,7 @@ pub mod errors;
 
 /// Shared constants of the crate (the GitHub API base URL and the noreply
 /// domain), defined once instead of duplicated per module.
-mod consts;
+pub mod consts;
 
 /// Reverse email lookup: reconstructs
 /// candidate repositories from the address (documented heuristic — GitHub

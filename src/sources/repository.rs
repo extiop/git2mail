@@ -225,25 +225,26 @@ mod tests {
 
     #[test]
     fn a_trailing_slash_url_scans_the_existing_repository_end_to_end() {
-        // the pasted URL `https://github.com/extiop/ctf/` must reach the
-        // API as `/repos/extiop/ctf/commits`, not the unresolvable
-        // `/repos/extiop/ctf%2F/commits` (a guaranteed 404 on an existing
+        // the pasted URL `https://github.com/octocat/hello-world/` must reach the
+        // API as `/repos/octocat/hello-world/commits`, not the unresolvable
+        // `/repos/octocat/hello-world%2F/commits` (a guaranteed 404 on an existing
         // repository): the parser trims the paste artifact, the scan runs
         // on the real name
         let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
             let request_line = &request[0];
             assert!(
-                request_line.starts_with("GET /repos/extiop/ctf/commits?"),
+                request_line.starts_with("GET /repos/octocat/hello-world/commits?"),
                 "unexpected request line: {request_line}"
             );
             (200, vec![], "[]".to_string())
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let author = crate::parsers::get_author("https://github.com/extiop/ctf/".to_string())
-            .expect("the pasted URL must parse");
+        let author =
+            crate::parsers::get_author("https://github.com/octocat/hello-world/".to_string())
+                .expect("the pasted URL must parse");
         let repository =
-            crate::parsers::get_repository("https://github.com/extiop/ctf/".to_string())
+            crate::parsers::get_repository("https://github.com/octocat/hello-world/".to_string())
                 .expect("the pasted URL must parse");
         scan_repository(&client, &address, &author, &repository)
             .expect("the trimmed name must still scan");
@@ -385,7 +386,7 @@ mod tests {
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let scan = scan_repository(&client, &address, "extiop", "huge")
+        let scan = scan_repository(&client, &address, "octocat", "huge")
             .expect("the capped listing must succeed");
         let handled = server.join();
 

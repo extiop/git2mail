@@ -8,7 +8,7 @@ tokens.json
 # results directory
 /results
 
-# pi-subagents
+# local agent-scratch directories (never committed)
 .pi-subagents/
 
 # internal release kit (handoff notes, PR drafts, tokens)

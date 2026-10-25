@@ -20,9 +20,9 @@ struct SharedArgs {
     /// Authenticate with your GitHub token (raises the limit from 60 to
     /// 5000 requests/hour). Create one at github.com/settings/tokens.
     /// Typing it here leaves it visible in your shell history and to other
-    /// programs — prefer `--token-file`; when both are given, a non-blank
-    /// --token wins (a whitespace-only --token falls through to
-    /// --token-file). `--token ""` on its own runs anonymously
+    /// programs — prefer `--token-file`; when both are given, the --token
+    /// value is used unless it is empty or only spaces (then --token-file
+    /// is read). `--token ""` on its own runs anonymously
     #[arg(short, long)]
     token: Option<String>,
     /// File holding one or more GitHub tokens, e.g. {"0": "ghp_…"} — each
@@ -78,8 +78,10 @@ enum Command {
     },
     /// Trace one email address back to its GitHub account (best effort:
     /// GitHub has no email search, so matching repositories are guessed
-    /// from the address, then their commits are checked). The result
-    /// prints on screen; add `--json <path>` (or `--json -`) to save it
+    /// from the address, then their commits are checked). One lookup can
+    /// spend up to 500 requests: a token is strongly recommended. The
+    /// result prints on screen; add `--json <path>` (or `--json -`) to
+    /// save it
     Email {
         /// Email address you want to trace back to its GitHub account
         address: String,
@@ -100,6 +102,8 @@ enum Command {
     },
     /// Investigate a GitHub profile: past identities, real and guessed
     /// email addresses, other accounts, SSH keys, outside repositories.
+    /// A token is strongly recommended: the walk spends dozens of
+    /// requests and aborts on a spent anonymous allowance.
     ///
     /// The full report prints on screen (add `--json <path>` or `--json -`
     /// to save it): past usernames and names found in the account's commit
@@ -122,7 +126,9 @@ enum Command {
     /// Investigate a GitHub organization: its public members, its public
     /// repositories and the developers' emails found scanning them (the
     /// emails are also saved to the file results/org/<org>; add `--json`
-    /// for the full report)
+    /// for the full report). A token is strongly recommended: the walk
+    /// covers every listed repository and aborts on a spent anonymous
+    /// allowance.
     Org {
         /// GitHub organization name — the word in its page address, e.g.
         /// `acme` in github.com/acme
@@ -180,7 +186,7 @@ enum Command {
         /// Filter repositories by topic (e.g. `osint`, `recon`)
         #[arg(long, value_name = "NAME")]
         topic: Option<String>,
-        /// Restrict the search to one user's repositories (e.g. `--user extiop`;
+        /// Restrict the search to one user's repositories (e.g. `--user octocat`;
         /// mutually exclusive with `--org`)
         #[arg(long, value_name = "LOGIN", conflicts_with = "org")]
         user: Option<String>,
@@ -293,7 +299,27 @@ fn run() -> Result<(), Error> {
             run_report_command(&shared, |scanner| email::reverse(scanner, &address))
         }
         Command::Emails { file, shared } => {
-            run_report_command(&shared, |scanner| email::reverse_bulk(scanner, &file))
+            // the bulk run writes its own partial report on an abort: the
+            // lookups already paid for must reach the requested --json file
+            // even when the run fails (mirroring the scan path's guard),
+            // then the abort error still propagates
+            let scanner = Scanner::new(shared.token.as_deref(), shared.token_file.as_deref())?;
+            let (report, failure) = email::reverse_bulk_with_partial(
+                &scanner,
+                git2mail::consts::GITHUB_API_BASE,
+                &file,
+            );
+            if let Some(path) = shared.json.as_ref() {
+                if failure.is_some() {
+                    write_json_best_effort(Some(path), &report);
+                } else {
+                    output::write_report_json(path, &report)?;
+                }
+            }
+            match failure {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
         }
         Command::User {
             username,
@@ -699,7 +725,7 @@ mod tests {
             "--topic",
             "osint",
             "--user",
-            "extiop",
+            "octocat",
         ])
         .expect("search must accept the advanced qualifier flags");
         let Command::Search {
@@ -724,7 +750,7 @@ mod tests {
         assert_eq!(pushed.as_deref(), Some(">=2023"));
         assert_eq!(license.as_deref(), Some("mit"));
         assert_eq!(topic.as_deref(), Some("osint"));
-        assert_eq!(user.as_deref(), Some("extiop"));
+        assert_eq!(user.as_deref(), Some("octocat"));
         assert_eq!(org, None);
     }
 
@@ -761,7 +787,7 @@ mod tests {
     #[test]
     fn search_rejects_user_and_org_together() {
         let cli = Cli::try_parse_from([
-            "git2mail", "search", "--query", "nmap", "--user", "extiop", "--org", "acme",
+            "git2mail", "search", "--query", "nmap", "--user", "octocat", "--org", "acme",
         ]);
         assert!(
             cli.is_err(),

@@ -286,13 +286,13 @@ mod tests {
     #[test]
     fn parse_repository_page_extracts_html_urls() {
         let json: Value = serde_json::json!([
-            { "html_url": "https://github.com/extiop/ctf" },
+            { "html_url": "https://github.com/octocat/hello-world" },
             { "name": "no url here" }
         ]);
         let repositories = parse_repository_page(&json).expect("parsing must succeed");
         assert_eq!(
             repositories.0,
-            vec!["https://github.com/extiop/ctf".to_string()]
+            vec!["https://github.com/octocat/hello-world".to_string()]
         );
         assert_eq!(repositories.1, 2, "raw item count, with or without url");
     }

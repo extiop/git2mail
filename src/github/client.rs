@@ -137,7 +137,6 @@ fn read_token_json(path: &Path) -> Result<Value, Error> {
         err,
         "for tokens: copy tokens.example.json to tokens.json and paste your tokens from github.com/settings/tokens",
     ))?;
-    // bounded per the MAX_TOKEN_FILE_BYTES rationale
     let path_label = format!("{path:?}").trim_matches('"').to_string();
     if !metadata.is_file() {
         return Err(Error::InvalidTokenFile(format!(
@@ -629,9 +628,9 @@ impl Client {
                         // is not spent) and rotate to the next live token.
                         let deadline = Instant::now() + window;
                         log::info!(
-                            "GitHub asked {} to slow down: pausing it for {} seconds, \
-                             then switching to another token if one is available",
-                            pool_member(index),
+                            "one of your tokens hit GitHub's secondary rate limit: pausing it \
+                             for {} seconds, then switching to another token if \
+                             one is available",
                             window.as_secs()
                         );
                         self.tokens.mark_limited_until(index, deadline);
@@ -1173,7 +1172,7 @@ mod tests {
         // listing: the classification must key on the request path's last
         // segment, not on `/commits` occurring anywhere in the URL
         assert!(Client::is_commits_endpoint(
-            "https://api.github.com/repos/extiop/ctf/commits?per_page=100&page=1"
+            "https://api.github.com/repos/octocat/hello-world/commits?per_page=100&page=1"
         ));
         assert!(Client::is_commits_endpoint(
             "http://127.0.0.1:8080/repos/a/b/commits"
@@ -1182,13 +1181,13 @@ mod tests {
             "https://api.github.com/orgs/acme/members?per_page=100&page=1"
         ));
         assert!(!Client::is_commits_endpoint(
-            "https://api.github.com/users/extiop/repos"
+            "https://api.github.com/users/octocat/repos"
         ));
         // a repository named `commits` is metadata, not a commit listing
         // (a listing always carries the `repos/{owner}/{repo}/commits`
         // shape): the segment count tells them apart
         assert!(!Client::is_commits_endpoint(
-            "https://api.github.com/repos/extiop/commits"
+            "https://api.github.com/repos/octocat/commits"
         ));
         // a commit listing of a repository named `search` (the inverse of
         // the search-endpoint scoping case) is a commits endpoint

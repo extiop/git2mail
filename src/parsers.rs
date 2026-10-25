@@ -59,7 +59,7 @@ const WEB_URL_HOSTS: [&str; 2] = ["github.com", "www.github.com"];
 /// (`git@github.com:…`) and other-scheme URLs keep the current behavior.
 fn check_url_host(github_url: &str) -> Result<(), Error> {
     let Some((scheme, rest)) = github_url.split_once("://") else {
-        // no scheme (`git@github.com:extiop/ctf`): nothing to judge here
+        // no scheme (`git@github.com:octocat/hello-world`): nothing to judge here
         return Ok(());
     };
     if !matches!(
@@ -105,7 +105,7 @@ fn is_dot_segment(part: &str) -> bool {
 
 /// Rejects a shape-valid URL whose target is not GitHub. Two gaps the
 /// host check cannot see, because they hide one regex group deeper:
-/// a scheme-less paste naming another forge (`gitlab.com/extiop/ctf`) is
+/// a scheme-less paste naming another forge (`gitlab.com/octocat/hello-world`) is
 /// scanned against the github.com namesake of its path — the same
 /// wrong-target class [`check_url_host`] closes for scheme'd URLs (its own
 /// guard only runs on a `://`); and a dot segment (`.`/`..`) in the author
@@ -255,9 +255,9 @@ pub fn get_repository(github_url: String) -> Result<String, Error> {
             .get(7)
             .map(|item| {
                 // a trailing `/` is a trivially common paste artifact
-                // (`https://github.com/extiop/ctf/`), never part of a
+                // (`https://github.com/octocat/hello-world/`), never part of a
                 // repository name: left in, it would be percent-encoded
-                // into an unresolvable `/repos/extiop/ctf%2F/commits`
+                // into an unresolvable `/repos/octocat/hello-world%2F/commits`
                 // request (a guaranteed 404 on an existing repository).
                 // Unlike the `.git` suffix, which is kept verbatim
                 // (documented behavior), it can never be part of a name.
@@ -284,7 +284,6 @@ mod tests {
     // Tests may unwrap, expect and panic freely: a failing assertion must
     // be loud, so the zero-panic lints do not apply to the test modules.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-    // Note this useful idiom: importing names from outer (for mod tests) scope.
     use super::*;
     use crate::errors::Error;
 
@@ -297,17 +296,17 @@ mod tests {
         // paste (or hostile API-supplied html_url) must hit the length bound
         // and fail immediately, not burn seconds of CPU per parse before
         // failing as unparseable anyway
-        let padded = format!("https://github.com/extiop/{}", "r".repeat(10_000));
+        let padded = format!("https://github.com/octocat/{}", "r".repeat(10_000));
         let error = get_author(padded.clone()).expect_err("an over-long URL must be rejected");
         assert!(matches!(error, Error::InvalidUrl(details) if details.contains("too long")));
         let error = get_repository(padded).expect_err("an over-long URL must be rejected");
         assert!(matches!(error, Error::InvalidUrl(details) if details.contains("too long")));
         // a long-but-bounded URL still parses: the bound only stops the
         // pathological tail
-        let long_but_valid = format!("https://github.com/extiop/{}", "r".repeat(2000));
+        let long_but_valid = format!("https://github.com/octocat/{}", "r".repeat(2000));
         assert_eq!(
             get_author(long_but_valid.clone()).expect("a bounded URL must still parse"),
-            "extiop"
+            "octocat"
         );
         assert_eq!(
             get_repository(long_but_valid).expect("a bounded URL must still parse"),
@@ -315,10 +314,13 @@ mod tests {
         );
         // the bound applies to the normalized URL: paste artifacts cut
         // before the check do not count against it
-        let artifact_padded = format!("https://github.com/extiop/ctf?{}", "x".repeat(10_000));
+        let artifact_padded = format!(
+            "https://github.com/octocat/hello-world?{}",
+            "x".repeat(10_000)
+        );
         assert_eq!(
             get_repository(artifact_padded).expect("the trimmed URL must still parse"),
-            "ctf"
+            "hello-world"
         );
     }
 
@@ -328,11 +330,11 @@ mod tests {
         // authority (the old split-on-':' took `user` for the host): the
         // real host is judged, and a foreign host under userinfo is refused
         assert_eq!(
-            get_author("https://user:pass@github.com/extiop/ctf".to_string())
+            get_author("https://user:pass@github.com/octocat/hello-world".to_string())
                 .expect("the userinfo prefix must not hide github.com"),
-            "extiop"
+            "octocat"
         );
-        let error = get_author("https://github.com@evil.com/extiop/ctf".to_string())
+        let error = get_author("https://github.com@evil.com/octocat/hello-world".to_string())
             .expect_err("the rightmost @ wins: evil.com is not github.com");
         assert!(
             matches!(&error, Error::InvalidUrl(details) if details.contains("evil.com")),
@@ -345,7 +347,7 @@ mod tests {
         // the guard used to reject a port-bearing URL with the generic
         // "unsupported host github.com:443" wording, which read like a
         // wrong-target complaint; the port now has its own message
-        let error = get_author("https://github.com:443/extiop/ctf".to_string())
+        let error = get_author("https://github.com:443/octocat/hello-world".to_string())
             .expect_err("a port-bearing URL must be rejected");
         assert!(
             matches!(&error, Error::InvalidUrl(details) if details.contains("port")),
@@ -356,32 +358,32 @@ mod tests {
     #[test]
     fn get_author_git() {
         assert_eq!(
-            get_author("git://github.com/extiop/ctf".to_string()).expect("must parse"),
-            "extiop"
+            get_author("git://github.com/octocat/hello-world".to_string()).expect("must parse"),
+            "octocat"
         );
     }
 
     #[test]
     fn get_author_git_at() {
         assert_eq!(
-            get_author("git@github.com/extiop/ctf".to_string()).expect("must parse"),
-            "extiop"
+            get_author("git@github.com/octocat/hello-world".to_string()).expect("must parse"),
+            "octocat"
         );
     }
 
     #[test]
     fn get_author_https() {
         assert_eq!(
-            get_author("https://github.com/extiop/ctf".to_string()).expect("must parse"),
-            "extiop"
+            get_author("https://github.com/octocat/hello-world".to_string()).expect("must parse"),
+            "octocat"
         );
     }
 
     #[test]
     fn get_author_ssh() {
         assert_eq!(
-            get_author("ssh://github.com/extiop/ctf".to_string()).expect("must parse"),
-            "extiop"
+            get_author("ssh://github.com/octocat/hello-world".to_string()).expect("must parse"),
+            "octocat"
         );
     }
 
@@ -397,7 +399,8 @@ mod tests {
     fn get_author_too_long() {
         // author is not retrieved as expected
         assert_eq!(
-            get_author("https://github.com/github/extiop/ctf".to_string()).expect("must parse"),
+            get_author("https://github.com/github/octocat/hello-world".to_string())
+                .expect("must parse"),
             "github"
         );
     }
@@ -406,8 +409,8 @@ mod tests {
     fn get_author_swapped() {
         // author is not retrieved as expected as author and repository are swapped
         assert_eq!(
-            get_author("https://github.com/ctf/extiop".to_string()).expect("must parse"),
-            "ctf"
+            get_author("https://github.com/hello-world/octocat".to_string()).expect("must parse"),
+            "hello-world"
         );
     }
 
@@ -415,40 +418,41 @@ mod tests {
     fn get_author_scp_like_ssh_url() {
         // common SSH shorthand with a colon separator
         assert_eq!(
-            get_author("git@github.com:extiop/ctf".to_string()).expect("must parse"),
-            "extiop"
+            get_author("git@github.com:octocat/hello-world".to_string()).expect("must parse"),
+            "octocat"
         );
     }
 
     #[test]
     fn get_author_without_scheme() {
         assert_eq!(
-            get_author("github.com/extiop/ctf".to_string()).expect("must parse"),
-            "extiop"
+            get_author("github.com/octocat/hello-world".to_string()).expect("must parse"),
+            "octocat"
         );
     }
 
     #[test]
     fn get_author_with_user_info() {
         assert_eq!(
-            get_author("https://user@github.com/extiop/ctf".to_string()).expect("must parse"),
-            "extiop"
+            get_author("https://user@github.com/octocat/hello-world".to_string())
+                .expect("must parse"),
+            "octocat"
         );
     }
 
     #[test]
     fn get_author_trailing_slash() {
         assert_eq!(
-            get_author("https://github.com/extiop/ctf/".to_string()).expect("must parse"),
-            "extiop"
+            get_author("https://github.com/octocat/hello-world/".to_string()).expect("must parse"),
+            "octocat"
         );
     }
 
     #[test]
     fn get_author_profile_url() {
         assert_eq!(
-            get_author("https://github.com/extiop".to_string()).expect("must parse"),
-            "extiop"
+            get_author("https://github.com/octocat".to_string()).expect("must parse"),
+            "octocat"
         );
     }
 
@@ -459,7 +463,7 @@ mod tests {
         // artifact is rejected outright instead of resolving into a
         // guaranteed-404 request against an empty name
         assert!(matches!(
-            get_author("https://github.com/extiop/".to_string()),
+            get_author("https://github.com/octocat/".to_string()),
             Err(Error::InvalidUrl(_))
         ));
     }
@@ -477,15 +481,15 @@ mod tests {
     #[test]
     fn get_author_and_get_repository_reject_a_non_github_host_in_a_scheme_less_url() {
         // the scheme'd host guard cannot see a scheme-less paste: its
-        // judgment only runs on a `://`, so `gitlab.com/extiop/ctf` used to
+        // judgment only runs on a `://`, so `gitlab.com/octocat/hello-world` used to
         // be scanned against the github.com namesake of its path — the same
         // wrong-target class, hidden one regex group deeper (the guard's
         // own test only covered scheme'd URLs)
         for url in [
-            "gitlab.com/extiop/ctf",
-            "GitLab.com/extiop/ctf",
-            "git@gitlab.com:extiop/ctf",
-            "github.com.evil.com/extiop/ctf",
+            "gitlab.com/octocat/hello-world",
+            "GitLab.com/octocat/hello-world",
+            "git@gitlab.com:octocat/hello-world",
+            "github.com.evil.com/octocat/hello-world",
         ] {
             let error =
                 get_author(url.to_string()).expect_err("a non-github host must be rejected");
@@ -496,10 +500,10 @@ mod tests {
         }
         // a bare `owner/repository` (no dot in the host slot) and the
         // documented `git@github.com:owner/repo` SCP form still parse
-        assert!(get_author("extiop/ctf".to_string()).is_ok());
+        assert!(get_author("octocat/hello-world".to_string()).is_ok());
         assert_eq!(
-            get_author("git@github.com:extiop/ctf".to_string()).expect("must parse"),
-            "extiop"
+            get_author("git@github.com:octocat/hello-world".to_string()).expect("must parse"),
+            "octocat"
         );
     }
 
@@ -514,7 +518,7 @@ mod tests {
             "https://github.com/../repo",
             "https://github.com/./repo",
             "https://github.com/owner/..",
-            "git@github.com:../extiop/ctf",
+            "git@github.com:../octocat/hello-world",
         ] {
             let error =
                 get_author(url.to_string()).expect_err("a dot-segment part must be rejected");
@@ -536,7 +540,7 @@ mod tests {
         for name in ["", ".", "..", "a/b", "x?y", "x#y"] {
             assert!(!is_safe_repository_name(name), "{name:?} must be rejected");
         }
-        for name in ["ctf", "my.repo", "git2mail"] {
+        for name in ["hello-world", "my.repo", "git2mail"] {
             assert!(is_safe_repository_name(name), "{name:?} must be accepted");
         }
     }
@@ -551,11 +555,11 @@ mod tests {
         // (live repro). A http(s)/git:// URL on another host is now rejected
         // with the offending host named, before any scan runs
         for url in [
-            "https://gitlab.com/extiop/ctf",
-            "http://gitlab.com/extiop/ctf",
-            "git://gitlab.com/extiop/ctf",
-            "https://github.com.evil.com/extiop/ctf",
-            "HTTPS://GitLab.COM/extiop",
+            "https://gitlab.com/octocat/hello-world",
+            "http://gitlab.com/octocat/hello-world",
+            "git://gitlab.com/octocat/hello-world",
+            "https://github.com.evil.com/octocat/hello-world",
+            "HTTPS://GitLab.COM/octocat",
         ] {
             let error =
                 get_author(url.to_string()).expect_err("a non-github web host must be rejected");
@@ -571,7 +575,8 @@ mod tests {
             );
         }
         // the error names the offending host
-        let error = get_author("https://gitlab.com/extiop/ctf".to_string()).expect_err("must fail");
+        let error = get_author("https://gitlab.com/octocat/hello-world".to_string())
+            .expect_err("must fail");
         assert!(
             error.to_string().contains("gitlab.com"),
             "the error must name the offending host: {error}"
@@ -579,12 +584,13 @@ mod tests {
         // the github.com hosts are accepted, case-insensitively, `www.`
         // alias included
         assert_eq!(
-            get_author("https://GitHub.com/extiop/ctf".to_string()).expect("must parse"),
-            "extiop"
+            get_author("https://GitHub.com/octocat/hello-world".to_string()).expect("must parse"),
+            "octocat"
         );
         assert_eq!(
-            get_author("https://www.github.com/extiop/ctf".to_string()).expect("must parse"),
-            "extiop"
+            get_author("https://www.github.com/octocat/hello-world".to_string())
+                .expect("must parse"),
+            "octocat"
         );
         // the documented ssh:// passthrough is untouched: self-hosted Git
         // SSH remotes are a legitimate input
@@ -594,8 +600,8 @@ mod tests {
         );
         // and so is the scheme-less documented form
         assert_eq!(
-            get_author("git@github.com:extiop/ctf".to_string()).expect("must parse"),
-            "extiop"
+            get_author("git@github.com:octocat/hello-world".to_string()).expect("must parse"),
+            "octocat"
         );
     }
 
@@ -619,31 +625,32 @@ mod tests {
     #[test]
     fn get_repository_git_protocol() {
         assert_eq!(
-            get_repository("git://github.com/extiop/ctf".to_string()).expect("must parse"),
-            "ctf"
+            get_repository("git://github.com/octocat/hello-world".to_string()).expect("must parse"),
+            "hello-world"
         );
     }
 
     #[test]
     fn get_repository_git_at_syntax() {
         assert_eq!(
-            get_repository("git@github.com/extiop/ctf".to_string()).expect("must parse"),
-            "ctf"
+            get_repository("git@github.com/octocat/hello-world".to_string()).expect("must parse"),
+            "hello-world"
         );
     }
 
     #[test]
     fn get_repository_https_url() {
         assert_eq!(
-            get_repository("https://github.com/extiop/ctf".to_string()).expect("must parse"),
-            "ctf"
+            get_repository("https://github.com/octocat/hello-world".to_string())
+                .expect("must parse"),
+            "hello-world"
         );
     }
 
     #[test]
     fn get_repository_no_project() {
         assert_eq!(
-            get_repository("https://github.com/extiop".to_string()).expect("must parse"),
+            get_repository("https://github.com/octocat".to_string()).expect("must parse"),
             ""
         );
     }
@@ -653,7 +660,7 @@ mod tests {
         // the same profile-shape rejection seen from the repository parser:
         // a lone trailing `/` after the author is not a repository name
         assert!(matches!(
-            get_repository("https://github.com/extiop/".to_string()),
+            get_repository("https://github.com/octocat/".to_string()),
             Err(Error::InvalidUrl(_))
         ));
     }
@@ -662,8 +669,9 @@ mod tests {
     fn get_repository_too_long() {
         // repository is not retrieved as expected
         assert_eq!(
-            get_repository("https://github.com/github/extiop/ctf".to_string()).expect("must parse"),
-            "extiop/ctf"
+            get_repository("https://github.com/github/octocat/hello-world".to_string())
+                .expect("must parse"),
+            "octocat/hello-world"
         );
     }
 
@@ -671,8 +679,9 @@ mod tests {
     fn get_repository_swapped() {
         // repository is not retrieved as expected as author and repository are swapped
         assert_eq!(
-            get_repository("https://github.com/ctf/extiop".to_string()).expect("must parse"),
-            "extiop"
+            get_repository("https://github.com/hello-world/octocat".to_string())
+                .expect("must parse"),
+            "octocat"
         );
     }
 
@@ -680,46 +689,38 @@ mod tests {
     fn get_repository_scp_like_ssh_url() {
         // common SSH shorthand with a colon separator
         assert_eq!(
-            get_repository("git@github.com:extiop/ctf".to_string()).expect("must parse"),
-            "ctf"
+            get_repository("git@github.com:octocat/hello-world".to_string()).expect("must parse"),
+            "hello-world"
         );
     }
 
     #[test]
     fn get_repository_without_scheme() {
         assert_eq!(
-            get_repository("github.com/extiop/ctf".to_string()).expect("must parse"),
-            "ctf"
-        );
-    }
-
-    #[test]
-    fn get_repository_git_suffix_is_kept() {
-        // the `(git)?` optional suffix is absorbed by the greedy `(.+)` group:
-        // current behavior keeps it in the repository name
-        assert_eq!(
-            get_repository("https://github.com/extiop/ctf.git".to_string()).expect("must parse"),
-            "ctf.git"
+            get_repository("github.com/octocat/hello-world".to_string()).expect("must parse"),
+            "hello-world"
         );
     }
 
     #[test]
     fn get_repository_trailing_slash_is_trimmed() {
         // a trailing `/` is a paste artifact, never part of a repository
-        // name: percent-encoding it (`ctf%2F`) would make the scan a
+        // name: percent-encoding it (`hello-world%2F`) would make the scan a
         // guaranteed 404 on an existing repository
         assert_eq!(
-            get_repository("https://github.com/extiop/ctf/".to_string()).expect("must parse"),
-            "ctf"
+            get_repository("https://github.com/octocat/hello-world/".to_string())
+                .expect("must parse"),
+            "hello-world"
         );
         // several trailing slashes are paste noise too, and a name made only
         // of slashes is not a repository
         assert_eq!(
-            get_repository("https://github.com/extiop/ctf//".to_string()).expect("must parse"),
-            "ctf"
+            get_repository("https://github.com/octocat/hello-world//".to_string())
+                .expect("must parse"),
+            "hello-world"
         );
         assert!(matches!(
-            get_repository("https://github.com/extiop//".to_string()),
+            get_repository("https://github.com/octocat//".to_string()),
             Err(Error::InvalidUrl(_))
         ));
     }
@@ -756,29 +757,32 @@ mod tests {
         // the documented `.git` passthrough is unaffected by the trailing-
         // slash trim: only slashes are trimmed, never a `.git` suffix
         assert_eq!(
-            get_repository("https://github.com/extiop/ctf.git".to_string()).expect("must parse"),
-            "ctf.git"
+            get_repository("https://github.com/octocat/hello-world.git".to_string())
+                .expect("must parse"),
+            "hello-world.git"
         );
         assert_eq!(
-            get_repository("https://github.com/extiop/ctf.git/".to_string()).expect("must parse"),
-            "ctf.git"
+            get_repository("https://github.com/octocat/hello-world.git/".to_string())
+                .expect("must parse"),
+            "hello-world.git"
         );
     }
 
     #[test]
     fn get_repository_nested_path_is_kept() {
         assert_eq!(
-            get_repository("https://github.com/extiop/ctf/internal/tool".to_string())
+            get_repository("https://github.com/octocat/hello-world/internal/tool".to_string())
                 .expect("must parse"),
-            "ctf/internal/tool"
+            "hello-world/internal/tool"
         );
     }
 
     #[test]
     fn get_repository_with_user_info() {
         assert_eq!(
-            get_repository("https://user@github.com/extiop/ctf".to_string()).expect("must parse"),
-            "ctf"
+            get_repository("https://user@github.com/octocat/hello-world".to_string())
+                .expect("must parse"),
+            "hello-world"
         );
     }
 
@@ -793,19 +797,19 @@ mod tests {
     #[test]
     fn get_author_and_repository_accept_an_uppercase_scheme() {
         for url in [
-            "HTTPS://GITHUB.COM/ELIBENPORAT/HIKARU",
-            "Http://GitHub.com/ELIBENPORAT/HIKARU",
-            "SSH://github.com/ELIBENPORAT/HIKARU",
-            "GIT@GitHub.com:ELIBENPORAT/HIKARU",
+            "HTTPS://GITHUB.COM/Octocat/Hello-World",
+            "Http://GitHub.com/Octocat/Hello-World",
+            "SSH://github.com/Octocat/Hello-World",
+            "GIT@GitHub.com:Octocat/Hello-World",
         ] {
             assert_eq!(
                 get_author(url.to_string()).expect("must parse"),
-                "ELIBENPORAT",
+                "Octocat",
                 "wrong author for {url}"
             );
             assert_eq!(
                 get_repository(url.to_string()).expect("must parse"),
-                "HIKARU",
+                "Hello-World",
                 "wrong repository for {url}"
             );
         }
@@ -820,9 +824,9 @@ mod tests {
     #[test]
     fn get_repository_profile_paste_artifacts_resolve_to_profile_mode() {
         for url in [
-            "https://github.com/elibenporat?tab=repositories",
-            "https://github.com/elibenporat#repositories",
-            "https://github.com/elibenporat?tab=repositories&foo=1#bar",
+            "https://github.com/octocat?tab=repositories",
+            "https://github.com/octocat#repositories",
+            "https://github.com/octocat?tab=repositories&foo=1#bar",
         ] {
             assert_eq!(
                 get_repository(url.to_string()).expect("must parse"),
@@ -831,7 +835,7 @@ mod tests {
             );
             assert_eq!(
                 get_author(url.to_string()).expect("must parse"),
-                "elibenporat",
+                "octocat",
                 "wrong author for {url}"
             );
         }

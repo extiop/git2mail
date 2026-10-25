@@ -484,7 +484,7 @@ mod tests {
         let client = Client::anonymous().expect("client must build");
         let error = fetch_paginated(
             &client,
-            |page| format!("{address}/repos/extiop/ctf/commits?page={page}"),
+            |page| format!("{address}/repos/octocat/hello-world/commits?page={page}"),
             |json: &Value| {
                 Ok((
                     vec![json.as_array().map(|a| a.len()).unwrap_or(0)],
@@ -512,8 +512,8 @@ mod tests {
         let client = Client::anonymous().expect("client must build");
         for path in [
             "/orgs/acme/members?page=1",
-            "/users/extiop/repos?page=1",
-            "/repos/extiop/ctf?page=1",
+            "/users/octocat/repos?page=1",
+            "/repos/octocat/hello-world?page=1",
             "/search/repositories?q=x&per_page=100&page=1",
         ] {
             let error = fetch_paginated(

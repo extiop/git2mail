@@ -45,6 +45,11 @@ install from crates.io:
 cargo install git2mail --locked
 ```
 
+Building from source needs the Rust toolchain plus `cmake`, a C compiler
+and `pkg-config` (the bundled TLS library compiles C code; on macOS,
+start with `xcode-select --install` then `brew install cmake
+pkg-config`).
+
 ## Design principles
 
 - **GitHub REST API only.** No HTML scraping, no binary git dependency:
