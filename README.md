@@ -10,17 +10,17 @@ https://docs.rs/git2mail)
 [![User guide](https://img.shields.io/badge/mdbook-user%20guide-informational)](
 https://extiop.github.io/git2mail/)
 
-Find developers' public email addresses from GitHub — for recruitment, sales, journalism and open-source research.
+Find developers' public email addresses from GitHub, for recruitment, sales, journalism and open-source research.
 
 # Introduction
 
-git2mail is an OSINT tool — OSINT, open-source intelligence, means investigating using only information the public can already see — that finds developers' email addresses from GitHub repositories and profiles. It reads commit metadata through the GitHub API to retrieve author emails, supporting both single and multi-token authentication for large-scale investigations.
+git2mail is an OSINT tool (OSINT, open-source intelligence, means investigating using only information the public can already see) that finds developers' email addresses from GitHub repositories and profiles. It reads commit metadata through the GitHub API to retrieve author emails, supporting both single and multi-token authentication for large-scale investigations.
 
 > ⚠️ **Responsible use.** git2mail collects only publicly available data
 through the GitHub REST API. Use it only for purposes that are lawful and
-respectful of the people whose data it shows — for example identifying and
+respectful of the people whose data it shows, for example identifying and
 contacting open-source contributors, with a clear introduction and an easy
-way to say no — in accordance with the
+way to say no, in accordance with the
 [GitHub Terms of Service](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)
 and applicable privacy and anti-spam laws. You are solely responsible for
 your use.
@@ -37,7 +37,7 @@ This repository contains:
 
 ## 👁️ Philosophy
 
-git2mail is built for anyone who needs to reach developers — recruiters, sales teams, sourcing specialists, journalists — as well as for fast large-scale open-source research. It can be used with multiple personal access tokens — private access keys you create from your own GitHub account settings (<https://github.com/settings/tokens>) — so you are no longer tied to a single account and can fetch a large number of emails.
+git2mail is built for anyone who needs to reach developers (recruiters, sales teams, sourcing specialists, journalists) as well as for fast large-scale open-source research. It can be used with multiple personal access tokens (tokens you create from your own GitHub account settings, <https://github.com/settings/tokens>), so you are no longer tied to a single account and can fetch a large number of emails.
 
 ### ⚡ Performances
 
@@ -48,7 +48,7 @@ The `search` subcommand scans the found repositories in parallel with one worker
 
 ## 🚀 Quickstart
 
-1. Download the ready-made program for your computer (Windows, macOS or Linux) from [git2mail releases](https://github.com/extiop/git2mail/releases): unzip it and put the file in a folder you can find. No installation needed — the commands below are run in a terminal (see the [user guide](https://extiop.github.io/git2mail/) for what a terminal is and how to open one)
+1. Download the ready-made program for your computer (Windows, macOS or Linux) from [git2mail releases](https://github.com/extiop/git2mail/releases): unzip it and put the file in a folder you can find. No installation needed: the commands below are run in a terminal (see the [user guide](https://extiop.github.io/git2mail/) for what a terminal is and how to open one)
 
 OR
 
@@ -136,13 +136,13 @@ With dummy values:
 git2mail scan --url https://github.com/denoland/deno --token-file tokens.json
 ```
 
-To also get a JSON report — a structured text file you can open in any text editor, and other software can read — in addition to the on-screen results:
+To also get a JSON report (a structured text file you can open in any text editor, and other software can read) in addition to the on-screen results:
 
 ```bash
 git2mail scan --url "$TARGET_URL" --json "$YOUR_REPORT_PATH"
 ```
 
-`tokens.example.json` content (obviously fake placeholders — copy the file to `tokens.json` and replace them with your own tokens), which is available at the root of the project:
+`tokens.example.json` content (obviously fake placeholders: copy the file to `tokens.json` and replace them with your own tokens), which is available at the root of the project:
 
 ```json
 {
@@ -211,7 +211,7 @@ git2mail search --query nmap --topic osint --user extiop --token-file tokens.jso
 
 ### 🔗 Developer correlation
 
-Every scan also aggregates its results per author (issue #5): for each author found in the scanned commits, it correlates the attributes git2mail already collects — the emails they used, the repositories they were seen in with their primary language, the first repository where they appeared and their total commit count. Authors are sorted by commit count and each author's languages are ordered dominant first, so the report answers "who are the main developers behind this topic, and what do they write in?".
+Every scan also aggregates its results per author (issue #5): for each author found in the scanned commits, it correlates the attributes git2mail already collects: the emails they used, the repositories they were seen in with their primary language, the first repository where they appeared and their total commit count. Authors are sorted by commit count and each author's languages are ordered dominant first, so the report answers "who are the main developers behind this topic, and what do they write in?".
 
 The report lives in the opt-in `--json` output, as a `correlation` object added on top of the unchanged legacy fields:
 
@@ -253,7 +253,7 @@ This process can be extended to multiple repositories, notably with custom queri
 
 The GitHub API rate limit for non authenticated users is 60 requests per hour. Thus, if you search classic repositories such as [ripgrep](https://github.com/BurntSushi/ripgrep), which has thousands of commits currently, you better use a GitHub or GitHub App account, and generate one token **per account** following this [GitHub API documentation](https://docs.github.com/en/rest/overview/resources-in-the-rest-api#rate-limiting). Be aware that your token does not need any access to any of your repositories. Anonymous access is supported (`--token ""`), but non authenticated requests are very limited, so tokens remain the practical way to run a real scan. Bear in mind that the rate limit is defined as the number of requests per hour **per account**.
 
-Note that with one token, you can request 5000 times the GitHub API per hour, this is the number of commits you can fetch with it. If you need to crawl more commits, you better get multiple tokens. To do so, add tokens from additional accounts you own — within what GitHub's Terms of Service allow. For instance, to analyze the [Go programming language repository](https://github.com/golang/go), you need at least 11 tokens as there is roughly 53 000 commits available at the time I write this documentation.
+Note that with one token, you can make 5000 requests to the GitHub API per hour; that is the number of commits you can fetch with it. If you need to crawl more commits, you better get multiple tokens. To do so, add tokens from additional accounts you own, within what GitHub's Terms of Service allow. For instance, to analyze the [Go programming language repository](https://github.com/golang/go), you need at least 11 tokens as there is roughly 53 000 commits available at the time I write this documentation.
 
 This project can be combined with other OSINT tools. For instance, you can use git2mail to retrieve some Gmail addresses and then, do further investigation for some of them with [GHunt](https://github.com/mxrch/ghunt).
 
@@ -284,13 +284,13 @@ This project is limited to GitHub repositories.
 - [x] From a GitHub repository, search for commits and email of authors with GitHub metadata and parsing
 - [x] From a GitHub keyword search, retrieve GitHub repositories URLs
 - [x] Handle properly errors and limit, or even remove, panics
-- [x] Correlate emails, language and project preferences: per-author correlation report (emails, repositories with their primary language, first seen repository, commit counts) in the `--json` output, plus a top-authors terminal summary — see the [correlation section](#-developer-correlation) (issue #5)
+- [x] Correlate emails, language and project preferences: per-author correlation report (emails, repositories with their primary language, first seen repository, commit counts) in the `--json` output, plus a top-authors terminal summary (see the [correlation section](#-developer-correlation) (issue #5)
 - [x] Support more advanced parameters (_cf._ <https://github.com/search/advanced>): `--stars`, `--forks`, `--size`, `--created`, `--pushed`, `--license`, `--topic`, `--user`/`--org` on the `search` subcommand (issue #6)
 
 ## 💭 Thoughts
 
 - Fuzzing to find my code vulnerabilities
-- ~~Async queries~~ **resolved by design** (issue #4): parallel requests run on std threads with one dedicated token per worker (the v0.5.0 refactor) — async was considered and rejected, as per-token parallelism is enough for network I/O at this scale and adds no dependency
+- ~~Async queries~~ **resolved by design** (issue #4): parallel requests run on std threads with one dedicated token per worker (the v0.5.0 refactor); async was considered and rejected, as per-token parallelism is enough for network I/O at this scale and adds no dependency
 
 ## 💻 Contributing
 
