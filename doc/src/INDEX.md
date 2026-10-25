@@ -2,9 +2,9 @@
 
 git2mail extracts the email addresses a GitHub account exposes through its
 public activity: repository commits, profile events, and repository
-search. It is a command-line tool — you type commands in a terminal: the
+search. It is a command-line tool: you type commands in a terminal, the
 text window on your computer (Terminal on Mac and Linux, Command Prompt or
-PowerShell on Windows) — instead of clicking buttons.
+PowerShell on Windows), instead of clicking buttons.
 
 ```
 git2mail scan --url <GITHUB_URL> [--token <TOKEN> | --token-file <TOKENS_JSON>] \
@@ -14,7 +14,7 @@ git2mail search --query <QUERY> [--language <LANGUAGE>] [--limit <N>] \
 ```
 
 > How to read the commands: text in `[square brackets]` is optional, `|`
-> means "or", and `<UPPERCASE WORDS>` stand for values you fill in — never
+> means "or", and `<UPPERCASE WORDS>` stand for values you fill in: never
 > type the brackets themselves.
 
 `scan` accepts a repository URL or a profile URL; `search` runs a
@@ -23,8 +23,7 @@ repository search query and scans every result.
 ## Installation
 
 The easiest way: download the ready-made program from the
-[releases page](https://github.com/extiop/git2mail/releases) — no
-installation needed. If you already have the Rust toolkit, you can instead
+[releases page](https://github.com/extiop/git2mail/releases): no installation needed. If you already have the Rust toolkit, you can instead
 install from crates.io:
 
 ```
@@ -53,7 +52,7 @@ Prebuilt binaries are also attached to each
 ### Getting a token
 
 Create a classic token at <https://github.com/settings/tokens> with no
-scopes at all — reading public data needs none — or a fine-grained token
+scopes at all (reading public data needs none) or a fine-grained token
 with "Public repositories (read-only)".
 
 `tokens.example.json` shows the file format `--token-file` expects: one
@@ -73,6 +72,5 @@ behavior.
 
 ## Interrupting a run
 
-Ctrl-C aborts the run immediately: nothing is written — not even a partial
-report — so a truncated scan can never look complete. Re-run the same
+Ctrl-C aborts the run immediately: nothing is written, not even a partial report, so a truncated scan can never look complete. Re-run the same
 command to start over.

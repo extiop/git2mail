@@ -33,13 +33,12 @@ A `403` whose `x-ratelimit-remaining` header is `0` means the token's
 hourly quota is spent. The token is **retired**: it is removed from the
 allocation pool for the rest of the run, and the request is retried with
 the next available token. A retired token never comes back. A `429` is
-never treated as a spent quota — "too many requests" is a transient
-condition — so a `429` parks the token instead, even when it carries
+never treated as a spent quota, because "too many requests" is a transient condition, so a `429` parks the token instead, even when it carries
 `x-ratelimit-remaining: 0` (see below).
 
 A `403` with `x-ratelimit-remaining` above `0` is a genuine refusal (for
 example a private or missing resource) and is **not** treated as rate
-limiting — unless it carries a `Retry-After` header or the secondary-limit
+limiting, unless it carries a `Retry-After` header or the secondary-limit
 body, which parks the token instead (see below).
 
 ### Secondary limit (abuse detection)
