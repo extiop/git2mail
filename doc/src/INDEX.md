@@ -45,9 +45,6 @@ install from crates.io:
 cargo install git2mail --locked
 ```
 
-Prebuilt binaries are also attached to each
-[release](https://github.com/extiop/git2mail/releases).
-
 ## Design principles
 
 - **GitHub REST API only.** No HTML scraping, no binary git dependency:

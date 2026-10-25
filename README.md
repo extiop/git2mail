@@ -93,9 +93,7 @@ first try. You should see something like:
 
 ```text
 Starting git2mail!
-[!] no token provided: running anonymously, limited to 60 requests/hour
-— create one at github.com/settings/tokens and use --token or
---token-file <tokens.json> for 5000 requests/hour each
+[!] no token provided: running anonymously, limited to 60 requests/hour — create one at github.com/settings/tokens and use --token or --token-file <tokens.json> for 5000 requests/hour each
 --------------------------------
 [+] Found 12 emails
 [+] Result is available at results/repository/denoland_deno
@@ -110,7 +108,8 @@ commit metadata: they can be old or spoofed, so see
 the screen also names the top developers behind the repository (the names
 they type in their commits, which is self-declared information exactly
 like the addresses); add `--json report.json` to your command to save the
-full per-author report.
+full per-author report (or `--json -` to print it to stdout instead, for
+pipes).
 
 ### 3. Create a token for real scans
 
@@ -177,7 +176,8 @@ git2mail scan --url "$TARGET_URL" --token "$YOUR_TOKEN"
 
 A token passed with `--token` stays saved on your computer in the record of commands you have typed, and other programs running at the same time can see it: prefer `--token-file`, which reads the token(s) from a file
 instead. When both are provided, `--token` wins for that run and a warning
-is logged.
+is logged (a whitespace-only `--token` counts as absent and falls back to
+`--token-file`).
 
 If you don't have a token yet, you can still try the tool: simply leave
 `--token` out. GitHub then allows only about 60 lookups per hour, so a token
@@ -249,7 +249,7 @@ Result files and JSON reports are written to a temporary file first, then rename
 }
 ```
 
-In this mode, your results will be stored per profile with the following relative path, from your current working directory: `results/profile/$author`. If a repository is defined, it will be at `results/repository/$author_$repository`.
+In this mode, your results will be stored per profile with the following relative path, from your current working directory: `results/profile/$author`. If a repository is defined, it will be at `results/repository/$author_$repository`. A name the tool had to change (sanitized, or containing an uppercase letter) carries a 16-character suffix made of the original name; the run always prints the real path of every file it writes.
 
 ### Full profile investigation (API-only)
 
@@ -263,11 +263,11 @@ It accepts the shared `--token`/`--token-file`/`--json` flags and reports, both 
 
 - **Profile**: the account fields that carry OSINT value (name, company, blog, location, public email, bio, creation date, account type, Twitter/X handle and public repository count). An organization target is rejected with a clear error pointing at the `org` subcommand.
 - **Usernames/names history**: the *noreply technique*: GitHub hides users' real email in commits behind an alias like `12345+jane@users.noreply.github.com`, and the number in that alias is the account's ID, so matching it reveals usernames the account used in the past. The target's own repositories' commits are scanned, and every author/committer email shaped `<id>+<username>@users.noreply.github.com` whose numeric `id` equals the target's reveals a username the account used in the past (with the commit names seen with it and the repositories where it appeared). The older pre-2017 form `<id>@users.noreply.github.com` attributes the current username only.
-- **Emails**: every email used on the target's repositories (the 0.5.0 technique), with the names and repositories where each was seen. Noreply addresses are excluded: they feed the histories instead, and a malformed noreply payload (a non-numeric id…) is dropped entirely.
+- **Emails**: every email used on the target's repositories (the 0.5.0 technique), with the names and repositories where each was seen. Noreply addresses are excluded: they feed the histories instead, and a malformed noreply payload (a non-numeric id…) is dropped entirely. Forked repositories are skipped with a warning: their commit history mirrors the upstream project's, so scanning them would report other projects' developers.
 - **Variants**: the likely email spellings `{first}.{last}`, `{first}{last}`, `{initial}{last}`, `{first}_{last}`, `{initial}_{last}`, `{first}`, `{last}`, `{initial}.{last}` applied to the first/last names extracted from the profile name and the commit names seen with the target's noreply id (a name that appears only with a real, non-noreply email does not feed the guessing), combined with the domains deduced from the emails already found (noreply excluded). Variants actually observed in the commits are reported as `matched` (deduplicated by email); the others as `generated` (candidates to check elsewhere, not findings). Names are lowercased and accents removed (`é`→`e`, plus `ß`→`ss`, `æ`→`ae`, `œ`→`oe`, `ø`→`o`); names in other alphabets are kept as written. The candidate names and domains are ranked by raw sighting weight and capped (at most 64 name pairs and 64 domains are expanded, the generated list at 1000 candidates, with warnings), so commit-forged metadata cannot drown the real ones. Beyond the eight built-in patterns, `--variant-pattern <PATTERN>` (repeatable, at most 64 patterns) probes your own conventions, e.g. `git2mail user janedoe --variant-pattern '{last}{first}'`; the placeholders are `{first}`, `{last}` and `{initial}` (the domain is not part of the pattern), only printable ASCII is allowed (whitespace, `@`, control and zero-width characters are rejected client-side), the expansion is lowercased so the literal part matches observed emails case-insensitively like the built-ins, the custom patterns are applied after the built-ins (deduplicated against them) and are verified against the API like every other candidate. On a broad target the built-ins alone can fill the 1000-candidate generated list; a warning then names the custom patterns as possibly under-listed (matched custom candidates are always reported).
 - **Local identities (machine-local addresses)**: emails like `jeanpierre@My-Computer.local`, `jeanpierre@box.lan` or a single-label domain like `jeanpierre@mycomputer`. This is a **heuristic**: it flags the documented mDNS/workgroup conventions and dot-less domains only, and a false positive merely adds one candidate to the `local_identities` list.
 - **Potential secondary accounts** (heuristics, reported with their evidence): an email recurring across two or more of the target's repositories whose names never overlap the target's own names (`co-author`), and noreply pairs (`id+username` or legacy `<id>` form) whose id differs from the target's but whose username matches a known target username (`noreply-username`) or whose commit names match a known target name (`noreply-name`). The web-flow identity GitHub stamps on commits made through its UI (name `github`, address `noreply@github.com`) is never reported as a secondary account: it is automation, not a person (the email itself stays in the emails list).
-- **SSH keys**: the account's public keys (`GET /users/{u}/keys`, paginated), with title and creation date.
+- **SSH keys**: the account's public keys (`GET /users/{u}/keys`, paginated). The public endpoint exposes the key id and material only: the user-set title and creation date exist on the authenticated self listing, not here.
 - **External contributions**: commits authored by the target outside their own repositories (`search/commits q=author:<user> -user:<user>`, paginated, capped at GitHub's documented 1000-result search ceiling), attributed to the repositories found.
 
 Like every repository scan, each target repository's commit walk is capped at 10 pages of 100 commits (the shared per-repository budget): when the budget cuts a history, a warning says it may be incomplete instead of the report silently pretending it saw all of it.
@@ -285,7 +285,7 @@ With `--json`, the enriched report carries the documented shape:
     "generated": ["janedupont@acme.com", "jdupont@acme.com"]
   },
   "secondary_accounts": [{ "kind": "co-author", "identity": "co@acme.com", "names": ["co worker"], "repos": ["jane/one", "jane/two"] }],
-  "ssh_keys": [{ "id": 1, "key": "ssh-ed25519 AAAA…", "title": "laptop", "created_at": "2020-01-01T00:00:00Z" }],
+  "ssh_keys": [{ "id": 1, "key": "ssh-ed25519 AAAA…" }],
   "external_contributions": [{ "repository": "acme/lib", "url": "https://github.com/acme/lib", "commits": 3 }],
   "local_identities": [{ "email": "jeanpierre@My-Computer.local", "names": [], "repos": ["jane/one"] }]
 }
@@ -399,7 +399,7 @@ git2mail search --query nmap --language Rust --token-file tokens.json --limit 5
 
 Without `--limit`, the search defaults to scanning 5 repositories.
 
-In this mode, your results will be stored per query with the following relative path, from your current working directory: `results/keyword/$query`. If a language is defined, it will be at `results/keyword/$query_$language`.
+In this mode, your results will be stored per query with the following relative path, from your current working directory: `results/keyword/$query`. If a language is defined, it will be at `results/keyword/$query_$language`. As everywhere else, a name the tool had to change (sanitized, or containing an uppercase letter) carries a 16-character suffix made of the original name; the run always prints the real path of every file it writes.
 
 ### Advanced search qualifiers
 
@@ -467,7 +467,7 @@ git2mail search --query nmap --language Rust --token-file tokens.json --json rep
 
 `scanned.partial` is `true` when the parallel scan kept its findings although a dedicated token died mid-scan (whole listed repositories may then have been left unscanned): the JSON report keeps `partial: true` even when the run itself exits 0.
 
-The primary language comes free with the repository-search metadata, so `search` runs attribute a language to every repository that has a detected primary language (GitHub reports `language: null` when it has none, and the report passes it through, like `scan` (repository/profile) runs which do not spend an extra API call on it). The same author seen in several repositories (across pages, workers or scan stages) is merged: emails deduplicated, hit counts summed. The terminal log also prints a short summary of the top authors with their dominant language; the plain-text result files keep the legacy one-email-per-line format, byte-identical.
+The primary language comes free with the repository-search metadata, so `search` runs attribute a language to every repository that has a detected primary language (GitHub reports `language: null` when it has none, and the report passes it through, like `scan` (repository/profile) runs which do not spend an extra API call on it). The same author seen in several repositories (across pages, workers or scan stages) is merged: emails deduplicated, hit counts summed. The terminal log also prints a short summary of the top 5 authors (by commit count) with their dominant language; the full author list lives in the JSON report's `correlation.authors`, and the plain-text result files keep the legacy one-email-per-line format, byte-identical.
 
 ## How it works
 

@@ -13,6 +13,8 @@ use std::sync::LazyLock;
 /// `?`, `#` or surrounding whitespace, so the cut can never mangle a real
 /// target (unlike the `.git` suffix, which is kept verbatim, documented).
 fn normalize_pasted_url(github_url: &str) -> &str {
+    // `split` always yields at least one item: the fallback is the
+    // never-panic degradation the crate's zero-panic lints require
     github_url
         .trim()
         .split(['?', '#'])
@@ -46,8 +48,8 @@ fn check_url_len(github_url: &str) -> Result<(), Error> {
 /// alias included): the documented web URL formats are all github.com.
 const WEB_URL_HOSTS: [&str; 2] = ["github.com", "www.github.com"];
 
-/// Rejects a http(s) or `git://` URL whose host is not github.com, before
-/// any regex or API work. The parsers used to accept any host: a pasted
+/// Rejects a http(s), `git://`, `ftp` or `ftps` URL whose host is not
+/// github.com, before any regex or API work. The parsers used to accept any host: a pasted
 /// `https://gitlab.com/a/b` was silently re-targeted onto api.github.com
 /// and the scan reported "GitHub resource not found" after a guaranteed-404
 /// run — telling the user a *GitHub* resource was missing when the actual
@@ -92,6 +94,64 @@ fn check_url_host(github_url: &str) -> Result<(), Error> {
     )))
 }
 
+/// Whether a URL part is a dot segment: never a valid GitHub login or
+/// repository name, and normalized away by the url crate when the API path
+/// is built, which would silently re-target the authenticated request to
+/// another api.github.com path (a hostile or malformed listing-derived
+/// `html_url` can carry one).
+fn is_dot_segment(part: &str) -> bool {
+    part == "." || part == ".."
+}
+
+/// Rejects a shape-valid URL whose target is not GitHub. Two gaps the
+/// host check cannot see, because they hide one regex group deeper:
+/// a scheme-less paste naming another forge (`gitlab.com/extiop/ctf`) is
+/// scanned against the github.com namesake of its path — the same
+/// wrong-target class [`check_url_host`] closes for scheme'd URLs (its own
+/// guard only runs on a `://`); and a dot segment (`.`/`..`) in the author
+/// or repository slot survives every check, then the url crate collapses
+/// `{base}/repos/../X/commits` into `{base}/X/commits` when the API path
+/// is built, silently re-targeting the authenticated request. The
+/// documented `git@github.com:owner/repo` SCP form (github.com host, no
+/// dot segment) and a bare `owner/repository` (no dot in the host slot)
+/// still parse. The `ssh://git@domain.com/…` self-hosted passthrough is
+/// untouched: this helper only fires on scheme-less URLs, and `ssh://` is
+/// a scheme [`check_url_host`] deliberately lets through.
+fn check_url_target(github_url: &str, captures: &regex::Captures<'_>) -> Result<(), Error> {
+    let host = captures.get(5).map_or("", |item| item.as_str());
+    if !github_url.contains("://")
+        && host.contains('.')
+        && !WEB_URL_HOSTS.contains(&host.to_ascii_lowercase().as_str())
+    {
+        return Err(Error::InvalidUrl(format!(
+            "unsupported host {host}: git2mail only investigates github.com URLs"
+        )));
+    }
+    let dot_segment = captures
+        .get(6)
+        .is_some_and(|item| is_dot_segment(item.as_str()))
+        || captures
+            .get(7)
+            .is_some_and(|item| is_dot_segment(item.as_str()));
+    if dot_segment {
+        return Err(Error::InvalidUrl(
+            "a dot segment is not a valid GitHub owner or repository name".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a listing-derived repository name can be composed into a scan
+/// URL: non-empty, no dot segment (the url crate normalizes `..` into a
+/// re-targeted request) and no path separator or query/fragment
+/// introducer (a `?`/`#` would silently truncate the scanned repository
+/// and desynchronize the per-repository report keys). GitHub listing
+/// names never carry any of these: an entry that does is a broken or
+/// hostile payload, skipped with a warning by the composing caller.
+pub(crate) fn is_safe_repository_name(name: &str) -> bool {
+    !name.is_empty() && !is_dot_segment(name) && !name.contains(['/', '?', '#'])
+}
+
 /// GitHub project URL (with a repository part).
 // The one allowed `expect` of the crate: a static regex failing to compile
 // is a programming error that no runtime error handling can recover from.
@@ -134,6 +194,7 @@ pub fn get_author(github_url: String) -> Result<String, Error> {
     check_url_len(github_url)?;
     check_url_host(github_url)?;
     if let Some(captures) = GITHUB_URL.captures(github_url) {
+        check_url_target(github_url, &captures)?;
         // we know that it is in group 6 that the author is
         return captures
             .get(6)
@@ -147,10 +208,13 @@ pub fn get_author(github_url: String) -> Result<String, Error> {
             });
     }
     match GITHUB_URL_PROFILE.captures(github_url) {
-        Some(captures) => captures
-            .get(6)
-            .map(|item| item.as_str().to_string())
-            .ok_or_else(|| Error::InvalidUrl("author could not be found".to_string())),
+        Some(captures) => {
+            check_url_target(github_url, &captures)?;
+            captures
+                .get(6)
+                .map(|item| item.as_str().to_string())
+                .ok_or_else(|| Error::InvalidUrl("author could not be found".to_string()))
+        }
         // a profile URL pasted with a trailing `/` fails the regex while the
         // identical paste artifact on a repository URL is trimmed elsewhere:
         // name the actual fix instead of blaming an author that is right
@@ -185,6 +249,7 @@ pub fn get_repository(github_url: String) -> Result<String, Error> {
     check_url_len(github_url)?;
     check_url_host(github_url)?;
     if let Some(captures) = GITHUB_URL.captures(github_url) {
+        check_url_target(github_url, &captures)?;
         // we know that it is in group 7 that the repository is
         let repository = captures
             .get(7)
@@ -200,7 +265,11 @@ pub fn get_repository(github_url: String) -> Result<String, Error> {
             })
             .filter(|name| !name.is_empty())
             .map(String::from)
-            .ok_or_else(|| Error::InvalidUrl("repository name not found".to_string()))?;
+            .ok_or_else(|| {
+                Error::InvalidUrl(
+                    "this URL does not point to a GitHub repository or profile — use a URL like https://github.com/owner/repository".to_string(),
+                )
+            })?;
         return Ok(repository);
     }
     // only author case, URL targets an user profile: there is no repository
@@ -403,6 +472,73 @@ mod tests {
     #[test]
     fn get_author_no_path_at_all() {
         assert!(get_author("https://github.com/".to_string()).is_err());
+    }
+
+    #[test]
+    fn get_author_and_get_repository_reject_a_non_github_host_in_a_scheme_less_url() {
+        // the scheme'd host guard cannot see a scheme-less paste: its
+        // judgment only runs on a `://`, so `gitlab.com/extiop/ctf` used to
+        // be scanned against the github.com namesake of its path — the same
+        // wrong-target class, hidden one regex group deeper (the guard's
+        // own test only covered scheme'd URLs)
+        for url in [
+            "gitlab.com/extiop/ctf",
+            "GitLab.com/extiop/ctf",
+            "git@gitlab.com:extiop/ctf",
+            "github.com.evil.com/extiop/ctf",
+        ] {
+            let error =
+                get_author(url.to_string()).expect_err("a non-github host must be rejected");
+            assert!(
+                matches!(&error, Error::InvalidUrl(details) if details.contains("unsupported host")),
+                "unexpected error for {url}: {error:?}"
+            );
+        }
+        // a bare `owner/repository` (no dot in the host slot) and the
+        // documented `git@github.com:owner/repo` SCP form still parse
+        assert!(get_author("extiop/ctf".to_string()).is_ok());
+        assert_eq!(
+            get_author("git@github.com:extiop/ctf".to_string()).expect("must parse"),
+            "extiop"
+        );
+    }
+
+    #[test]
+    fn get_author_and_get_repository_reject_dot_segments() {
+        // a dot segment is never a valid login or repository name: the url
+        // crate normalizes `{base}/repos/../X/commits` into
+        // `{base}/X/commits`, so a hostile or malformed listing `html_url`
+        // carrying one would silently re-target the authenticated request
+        // to another api.github.com path
+        for url in [
+            "https://github.com/../repo",
+            "https://github.com/./repo",
+            "https://github.com/owner/..",
+            "git@github.com:../extiop/ctf",
+        ] {
+            let error =
+                get_author(url.to_string()).expect_err("a dot-segment part must be rejected");
+            assert!(
+                matches!(&error, Error::InvalidUrl(details) if details.contains("dot segment")),
+                "unexpected error for {url}: {error:?}"
+            );
+            let error =
+                get_repository(url.to_string()).expect_err("a dot-segment part must be rejected");
+            assert!(
+                matches!(&error, Error::InvalidUrl(details) if details.contains("dot segment")),
+                "unexpected error for {url}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_safe_repository_name_rejects_url_corrupting_names() {
+        for name in ["", ".", "..", "a/b", "x?y", "x#y"] {
+            assert!(!is_safe_repository_name(name), "{name:?} must be rejected");
+        }
+        for name in ["ctf", "my.repo", "git2mail"] {
+            assert!(is_safe_repository_name(name), "{name:?} must be accepted");
+        }
     }
 
     #[test]

@@ -32,10 +32,10 @@ use serde_json::Value;
 ///
 /// # Errors
 ///
-/// The client's failures (`Error::Http`, `Error::NotFound`,
-/// `Error::PrivateOrUnavailable`, `Error::EmptyRepository`,
-/// `Error::RateLimitExhausted`, `Error::TokenRejected`) plus any
-/// `parse_page` error. Never panics.
+/// The client's failures (`Error::Http`, `Error::Io` (an oversized
+/// announced body), `Error::NotFound`, `Error::PrivateOrUnavailable`,
+/// `Error::EmptyRepository`, `Error::RateLimitExhausted`,
+/// `Error::TokenRejected`) plus any `parse_page` error. Never panics.
 pub fn fetch_paginated<T, F>(
     client: &Client,
     build_url: impl Fn(u16) -> String,
@@ -45,7 +45,7 @@ pub fn fetch_paginated<T, F>(
 where
     F: Fn(&Value) -> Result<(Vec<T>, usize), Error>,
 {
-    fetch_paginated_impl(client, build_url, parse_page, limit, 0, false)
+    fetch_paginated_impl(client, build_url, parse_page, limit, 0)
 }
 
 /// The same paginated fetch, with page-size awareness for the search
@@ -65,16 +65,17 @@ where
 ///   parser that drops listed items must not keep the walk alive past the
 ///   window either (the kept items are still truncated to `limit`).
 ///
-/// The plain listings (commits, repos, members, events, keys) are answered
-/// with an empty page past their end, so [`fetch_paginated`] needs neither
-/// condition.
+/// The plain listings (commits, repos, members, keys) are answered with an
+/// empty page past their end, so [`fetch_paginated`] needs neither condition
+/// (the events walk is different: it uses the page-size-aware seam and its
+/// raw-422 cap, documented in `sources/profile.rs`).
 ///
 /// # Errors
 ///
-/// The client's failures (`Error::Http`, `Error::NotFound`,
-/// `Error::PrivateOrUnavailable`, `Error::EmptyRepository`,
-/// `Error::RateLimitExhausted`, `Error::TokenRejected`) plus any
-/// `parse_page` error. Never panics.
+/// The client's failures (`Error::Http`, `Error::Io` (an oversized
+/// announced body), `Error::NotFound`, `Error::PrivateOrUnavailable`,
+/// `Error::EmptyRepository`, `Error::RateLimitExhausted`,
+/// `Error::TokenRejected`) plus any `parse_page` error. Never panics.
 pub fn fetch_paginated_with_page_size<T, F>(
     client: &Client,
     build_url: impl Fn(u16) -> String,
@@ -85,20 +86,19 @@ pub fn fetch_paginated_with_page_size<T, F>(
 where
     F: Fn(&Value) -> Result<(Vec<T>, usize), Error>,
 {
-    fetch_paginated_impl(client, build_url, parse_page, limit, per_page, true)
+    fetch_paginated_impl(client, build_url, parse_page, limit, per_page)
 }
 
-/// The shared loop behind both entry points. `count_raw` selects which
-/// counter the user `limit` is checked against (raw listed items for the
-/// page-size-aware search seams, kept items for the plain listings, whose
-/// pinned budget semantics stay unchanged).
+/// The shared loop behind both entry points. The user `limit` is checked
+/// against the raw listed items for the page-size-aware search seams
+/// (`per_page > 0`) and against the kept items for the plain listings
+/// (`per_page == 0`), whose pinned budget semantics stay unchanged.
 fn fetch_paginated_impl<T, F>(
     client: &Client,
     build_url: impl Fn(u16) -> String,
     parse_page: F,
     limit: Option<usize>,
     per_page: u16,
-    count_raw: bool,
 ) -> Result<Vec<T>, Error>
 where
     F: Fn(&Value) -> Result<(Vec<T>, usize), Error>,
@@ -123,7 +123,7 @@ where
         // seams count raw items (see [`fetch_paginated_with_page_size`]);
         // the plain listings keep counting the items kept so far.
         if let Some(limit) = limit
-            && (if count_raw {
+            && (if per_page > 0 {
                 raw_seen >= limit
             } else {
                 all_items.len() >= limit
@@ -161,7 +161,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use crate::github::TokenPool;
-    use crate::github::mock::{request_header, request_line_page, serve_requests};
+    use crate::github::mock::{request_header, request_line_page, serve_requests, temp_token_file};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -211,12 +211,7 @@ mod tests {
     fn fetch_paginated_rotates_token_on_rate_limit() {
         let (address, server) = serve_requests(move |_index, request| {
             let authorization = request_header(request, "Authorization").unwrap_or("");
-            let request_line = request.first().map(String::as_str).unwrap_or("");
-            let page = request_line
-                .split("page=")
-                .nth(1)
-                .and_then(|rest| rest.split(' ').next())
-                .unwrap_or("");
+            let page = request_line_page(request);
             match (authorization, page) {
                 // first token is rate-limited (exhausted quota)…
                 ("token ghp_a", _) => (
@@ -225,18 +220,13 @@ mod tests {
                     String::new(),
                 ),
                 // …so the request is retried with the next token
-                (_, "1") => (200, vec![], r#"["after-rotation"]"#.to_string()),
+                (_, 1) => (200, vec![], r#"["after-rotation"]"#.to_string()),
                 _ => (200, vec![], "[]".to_string()),
             }
         });
 
         // two tokens so the 403 can rotate to the second one
-        let path = std::env::temp_dir().join(format!(
-            "git2mail_paginated_test_{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&path, r#"{"0": "ghp_a", "1": "ghp_b"}"#)
-            .expect("test setup: write temp file");
+        let path = temp_token_file(r#"{"0": "ghp_a", "1": "ghp_b"}"#, 1);
         let pool = TokenPool::from_token_file(&path).expect("token file must load");
         std::fs::remove_file(&path).ok();
         let client = Client::new(pool).expect("client must build");
@@ -256,12 +246,7 @@ mod tests {
     fn exhausted_tokens_are_skipped_on_later_pages() {
         let (address, server) = serve_requests(move |_index, request| {
             let authorization = request_header(request, "Authorization").unwrap_or("");
-            let request_line = request.first().map(String::as_str).unwrap_or("");
-            let page = request_line
-                .split("page=")
-                .nth(1)
-                .and_then(|rest| rest.split(' ').next())
-                .unwrap_or("");
+            let page = request_line_page(request);
             if authorization == "token ghp_a" {
                 // always rate-limited: marked exhausted after the first hit
                 return (
@@ -271,19 +256,14 @@ mod tests {
                 );
             }
             let body = match page {
-                "1" => r#"["one"]"#.to_string(),
-                "2" => r#"["two"]"#.to_string(),
+                1 => r#"["one"]"#.to_string(),
+                2 => r#"["two"]"#.to_string(),
                 _ => "[]".to_string(),
             };
             (200, vec![], body)
         });
 
-        let path = std::env::temp_dir().join(format!(
-            "git2mail_paginated_skip_test_{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&path, r#"{"0": "ghp_a", "1": "ghp_b"}"#)
-            .expect("test setup: write temp file");
+        let path = temp_token_file(r#"{"0": "ghp_a", "1": "ghp_b"}"#, 2);
         let pool = TokenPool::from_token_file(&path).expect("token file must load");
         std::fs::remove_file(&path).ok();
         let client = Client::new(pool).expect("client must build");
@@ -307,12 +287,7 @@ mod tests {
     fn fetch_paginated_rotates_on_429_and_honors_retry_after() {
         let (address, server) = serve_requests(move |_index, request| {
             let authorization = request_header(request, "Authorization").unwrap_or("");
-            let request_line = request.first().map(String::as_str).unwrap_or("");
-            let page = request_line
-                .split("page=")
-                .nth(1)
-                .and_then(|rest| rest.split(' ').next())
-                .unwrap_or("");
+            let page = request_line_page(request);
             if authorization == "token ghp_a" {
                 // secondary rate limit: 429 with a `Retry-After` window longer
                 // than the test, so the token stays parked for the whole scan
@@ -323,18 +298,13 @@ mod tests {
                 );
             }
             match page {
-                "1" => (200, vec![], r#"["after-429"]"#.to_string()),
+                1 => (200, vec![], r#"["after-429"]"#.to_string()),
                 _ => (200, vec![], "[]".to_string()),
             }
         });
 
         // two tokens so the 429 can rotate to the second one
-        let path = std::env::temp_dir().join(format!(
-            "git2mail_paginated_429_test_{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&path, r#"{"0": "ghp_a", "1": "ghp_b"}"#)
-            .expect("test setup: write temp file");
+        let path = temp_token_file(r#"{"0": "ghp_a", "1": "ghp_b"}"#, 3);
         let pool = TokenPool::from_token_file(&path).expect("token file must load");
         std::fs::remove_file(&path).ok();
         let client = Client::new(pool).expect("client must build");
@@ -361,12 +331,7 @@ mod tests {
         // again instead of being retired for the rest of the process
         let (address, server) = serve_requests(move |_index, request| {
             let authorization = request_header(request, "Authorization").unwrap_or("");
-            let request_line = request.first().map(String::as_str).unwrap_or("");
-            let page = request_line
-                .split("page=")
-                .nth(1)
-                .and_then(|rest| rest.split(' ').next())
-                .unwrap_or("");
+            let page = request_line_page(request);
             if authorization == "token ghp_a" {
                 return (
                     429,
@@ -375,17 +340,12 @@ mod tests {
                 );
             }
             match page {
-                "1" => (200, vec![], r#"["after-429"]"#.to_string()),
+                1 => (200, vec![], r#"["after-429"]"#.to_string()),
                 _ => (200, vec![], "[]".to_string()),
             }
         });
 
-        let path = std::env::temp_dir().join(format!(
-            "git2mail_paginated_429_recover_test_{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&path, r#"{"0": "ghp_a", "1": "ghp_b"}"#)
-            .expect("test setup: write temp file");
+        let path = temp_token_file(r#"{"0": "ghp_a", "1": "ghp_b"}"#, 4);
         let pool = TokenPool::from_token_file(&path).expect("token file must load");
         std::fs::remove_file(&path).ok();
         let client = Client::new(pool).expect("client must build");
@@ -611,12 +571,7 @@ mod tests {
         // instead of crashing the scan
         let (address, server) = serve_requests(move |_index, request| {
             let authorization = request_header(request, "Authorization").unwrap_or("");
-            let request_line = request.first().map(String::as_str).unwrap_or("");
-            let page = request_line
-                .split("page=")
-                .nth(1)
-                .and_then(|rest| rest.split(' ').next())
-                .unwrap_or("");
+            let page = request_line_page(request);
             if authorization == "token ghp_a" {
                 return (
                     429,
@@ -628,17 +583,12 @@ mod tests {
                 );
             }
             match page {
-                "1" => (200, vec![], r#"["after-hostile-429"]"#.to_string()),
+                1 => (200, vec![], r#"["after-hostile-429"]"#.to_string()),
                 _ => (200, vec![], "[]".to_string()),
             }
         });
 
-        let path = std::env::temp_dir().join(format!(
-            "git2mail_paginated_429_overflow_test_{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&path, r#"{"0": "ghp_a", "1": "ghp_b"}"#)
-            .expect("test setup: write temp file");
+        let path = temp_token_file(r#"{"0": "ghp_a", "1": "ghp_b"}"#, 5);
         let pool = TokenPool::from_token_file(&path).expect("token file must load");
         std::fs::remove_file(&path).ok();
         let client = Client::new(pool).expect("client must build");
@@ -665,28 +615,18 @@ mod tests {
         // abort a run while healthy tokens sit in the pool
         let (address, server) = serve_requests(move |_index, request| {
             let authorization = request_header(request, "Authorization").unwrap_or("");
-            let request_line = request.first().map(String::as_str).unwrap_or("");
-            let page = request_line
-                .split("page=")
-                .nth(1)
-                .and_then(|rest| rest.split(' ').next())
-                .unwrap_or("");
+            let page = request_line_page(request);
             if authorization == "token ghp_a" {
                 // the revoked token: the API rejects it every time
                 return (401, vec![], String::new());
             }
             match page {
-                "1" => (200, vec![], r#"["after-401"]"#.to_string()),
+                1 => (200, vec![], r#"["after-401"]"#.to_string()),
                 _ => (200, vec![], "[]".to_string()),
             }
         });
 
-        let path = std::env::temp_dir().join(format!(
-            "git2mail_paginated_401_rotate_test_{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&path, r#"{"0": "ghp_a", "1": "ghp_b"}"#)
-            .expect("test setup: write temp file");
+        let path = temp_token_file(r#"{"0": "ghp_a", "1": "ghp_b"}"#, 6);
         let pool = TokenPool::from_token_file(&path).expect("token file must load");
         std::fs::remove_file(&path).ok();
         let client = Client::new(pool).expect("client must build");
@@ -714,12 +654,7 @@ mod tests {
         // private-resource refusal
         let (address, server) = serve_requests(move |_index, request| {
             let authorization = request_header(request, "Authorization").unwrap_or("");
-            let request_line = request.first().map(String::as_str).unwrap_or("");
-            let page = request_line
-                .split("page=")
-                .nth(1)
-                .and_then(|rest| rest.split(' ').next())
-                .unwrap_or("");
+            let page = request_line_page(request);
             if authorization == "token ghp_a" {
                 return (
                     403,
@@ -731,17 +666,12 @@ mod tests {
                 );
             }
             match page {
-                "1" => (200, vec![], r#"["after-date-403"]"#.to_string()),
+                1 => (200, vec![], r#"["after-date-403"]"#.to_string()),
                 _ => (200, vec![], "[]".to_string()),
             }
         });
 
-        let path = std::env::temp_dir().join(format!(
-            "git2mail_paginated_403_date_test_{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&path, r#"{"0": "ghp_a", "1": "ghp_b"}"#)
-            .expect("test setup: write temp file");
+        let path = temp_token_file(r#"{"0": "ghp_a", "1": "ghp_b"}"#, 7);
         let pool = TokenPool::from_token_file(&path).expect("token file must load");
         std::fs::remove_file(&path).ok();
         let client = Client::new(pool).expect("client must build");
@@ -952,12 +882,7 @@ mod tests {
         // unavailable"
         let (address, server) = serve_requests(move |_index, request| {
             let authorization = request_header(request, "Authorization").unwrap_or("");
-            let request_line = request.first().map(String::as_str).unwrap_or("");
-            let page = request_line
-                .split("page=")
-                .nth(1)
-                .and_then(|rest| rest.split(' ').next())
-                .unwrap_or("");
+            let page = request_line_page(request);
             if authorization == "token ghp_a" {
                 return (
                     403,
@@ -966,17 +891,12 @@ mod tests {
                 );
             }
             match page {
-                "1" => (200, vec![], r#"["after-403-secondary"]"#.to_string()),
+                1 => (200, vec![], r#"["after-403-secondary"]"#.to_string()),
                 _ => (200, vec![], "[]".to_string()),
             }
         });
 
-        let path = std::env::temp_dir().join(format!(
-            "git2mail_paginated_403_secondary_test_{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&path, r#"{"0": "ghp_a", "1": "ghp_b"}"#)
-            .expect("test setup: write temp file");
+        let path = temp_token_file(r#"{"0": "ghp_a", "1": "ghp_b"}"#, 8);
         let pool = TokenPool::from_token_file(&path).expect("token file must load");
         std::fs::remove_file(&path).ok();
         let client = Client::new(pool).expect("client must build");
@@ -1006,12 +926,7 @@ mod tests {
         // a resource-scoped failure and exit 0 with an empty report
         let (address, server) = serve_requests(move |_index, request| {
             let authorization = request_header(request, "Authorization").unwrap_or("");
-            let request_line = request.first().map(String::as_str).unwrap_or("");
-            let page = request_line
-                .split("page=")
-                .nth(1)
-                .and_then(|rest| rest.split(' ').next())
-                .unwrap_or("");
+            let page = request_line_page(request);
             if authorization == "token ghp_a" {
                 return (
                     403,
@@ -1020,17 +935,12 @@ mod tests {
                 );
             }
             match page {
-                "1" => (200, vec![], r#"["after-headerless-403"]"#.to_string()),
+                1 => (200, vec![], r#"["after-headerless-403"]"#.to_string()),
                 _ => (200, vec![], "[]".to_string()),
             }
         });
 
-        let path = std::env::temp_dir().join(format!(
-            "git2mail_paginated_403_headerless_test_{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&path, r#"{"0": "ghp_a", "1": "ghp_b"}"#)
-            .expect("test setup: write temp file");
+        let path = temp_token_file(r#"{"0": "ghp_a", "1": "ghp_b"}"#, 9);
         let pool = TokenPool::from_token_file(&path).expect("token file must load");
         std::fs::remove_file(&path).ok();
         let client = Client::new(pool).expect("client must build");
@@ -1168,12 +1078,7 @@ mod tests {
             })
         };
 
-        let path = std::env::temp_dir().join(format!(
-            "git2mail_paginated_403_precedence_test_{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&path, r#"{"0": "ghp_a", "1": "ghp_b"}"#)
-            .expect("test setup: write temp file");
+        let path = temp_token_file(r#"{"0": "ghp_a", "1": "ghp_b"}"#, 10);
         let pool = TokenPool::from_token_file(&path).expect("token file must load");
         std::fs::remove_file(&path).ok();
         let client = Client::new(pool).expect("client must build");

@@ -1,7 +1,7 @@
 //! Search scan: the repositories matching a query, scanned in parallel.
 
 use crate::consts::GITHUB_API_BASE;
-use crate::correlate::{Correlation, CorrelationBuilder, RepoContribution};
+use crate::correlate::{Correlation, CorrelationBuilder, RepoContribution, RepoScan};
 use crate::errors::Error;
 use crate::github::fetch_paginated_with_page_size;
 use crate::output::sanitize_log_text as log_safe;
@@ -36,6 +36,10 @@ pub(crate) type ParallelScan = Result<
         usize,
         Correlation,
         bool,
+        // the real death error behind the partial flag (a token death, not
+        // necessarily a spent allowance): callers re-raising the flag abort
+        // with this cause instead of a misattributed rate-limit error
+        Option<Error>,
     ),
     Error,
 >;
@@ -52,6 +56,8 @@ type ReducedReports = (
     usize,
     Correlation,
     bool,
+    // the real death error behind the partial flag
+    Option<Error>,
 );
 
 /// Optional GitHub repository-search qualifiers, following the
@@ -103,7 +109,7 @@ impl SearchQualifiers {
             match name {
                 "stars" | "forks" | "size" => validate_count_range(name, value)?,
                 "created" | "pushed" => validate_date_range(name, value)?,
-                _ => validate_name(name, value)?,
+                _ => validate_name_value(name, value)?,
             }
         }
         Ok(())
@@ -172,7 +178,15 @@ fn validate_count_range(name: &str, value: &str) -> Result<(), Error> {
             // because `None > Some(_)` is always false
             if is_digits(low)
                 && is_digits(high)
-                && (low.len() > high.len() || (low.len() == high.len() && low > high))
+                // leading zeros are notation, not magnitude (`0500` is
+                // `500`): strip them before the string comparison, an
+                // empty side is zero
+                && {
+                    let low = low.trim_start_matches('0');
+                    let high = high.trim_start_matches('0');
+                    low.len() > high.len()
+                        || (low.len() == high.len() && low > high)
+                }
             {
                 return Err(invalid_qualifier(name, value, EXPECTED));
             }
@@ -280,7 +294,7 @@ fn validate_date_range(name: &str, value: &str) -> Result<(), Error> {
 /// (`apache-2.0`, `osint_2024`) but must hold at least one alphanumeric
 /// character: a separator-only value (`...`, `--`) would silently match
 /// nothing.
-fn validate_name(name: &str, value: &str) -> Result<(), Error> {
+fn validate_name_value(name: &str, value: &str) -> Result<(), Error> {
     if name == "user" || name == "org" {
         return crate::user::validate_username(value)
             .map_err(|_| invalid_qualifier(name, value, "a GitHub login like extiop or acme"));
@@ -319,6 +333,69 @@ pub(crate) fn aggregate_search(
     aggregate_search_at(scanner, GITHUB_API_BASE, query, language, qualifiers, limit)
 }
 
+/// Fetches the search listing for the query: capped at `ceiling` (GitHub
+/// never serves more than 1000 search results, so the over-ceiling page is
+/// never requested — the API answers it with a raw 422, and the extra
+/// pages would only be thrown away anyway). The page-size-aware loop also
+/// ends the listing on a short final page and counts raw items toward the
+/// cap, so a total that is not a multiple of the page size can no longer
+/// walk into the out-of-window request and cost the hits already collected
+/// (they are preserved instead). The hits are counted as they stream in so
+/// the defensive 422 fallback can report how many it had to discard.
+///
+/// # Errors
+///
+/// A page-1 422 (nothing collected) is the API rejecting the query itself
+/// — in practice a nonexistent or inaccessible `--user`/`--org` login (the
+/// API's own body says "The listed users cannot be searched…", but the raw
+/// reqwest error discards it, leaving a typo'd target indistinguishable
+/// from a tool failure): surfaced as [`Error::SearchRejected`] instead of
+/// the raw HTTP error. A window 422 past the ceiling ends the listing with
+/// a warning instead of aborting the whole search with a raw HTTP error
+/// (same parity as the user investigation's external-contributions
+/// search); the hits collected so far are deliberately kept by this
+/// function's own caller instead of thrown away with the page (the
+/// defensive fallback inside the paginated loop cannot recover them — a
+/// chosen design, not a limitation). Every other failure propagates.
+/// Never panics.
+fn fetch_search_hits(
+    client: &crate::github::Client,
+    base: &str,
+    query: &str,
+    language: &str,
+    qualifiers: &SearchQualifiers,
+    ceiling: usize,
+) -> Result<Vec<SearchHit>, Error> {
+    let collected = std::cell::Cell::new(0usize);
+    let hits = match fetch_paginated_with_page_size(
+        client,
+        |page| search_url(base, query, language, qualifiers, page),
+        |json| {
+            let (page_hits, raw_count) = parse_search_page(json)?;
+            collected.set(collected.get() + page_hits.len());
+            Ok((page_hits, raw_count))
+        },
+        Some(ceiling),
+        PER_PAGE,
+    ) {
+        Ok(hits) => hits,
+        Err(Error::Http(err))
+            if err.status() == Some(reqwest::StatusCode::UNPROCESSABLE_ENTITY) =>
+        {
+            if collected.get() == 0 {
+                return Err(Error::SearchRejected);
+            }
+            log::warn!(
+                "search stopped at GitHub's 1000-result limit: {} already-found repositories were dropped",
+                collected.get()
+            );
+            Vec::new()
+        }
+        Err(err) => return Err(err),
+    };
+    Ok(hits)
+}
+
 /// The same search, driven against one API base URL: [`aggregate_search`]
 /// is the production entry point (`https://api.github.com`) and the offline
 /// tests run this same code against a loopback mock (the same split as
@@ -326,15 +403,9 @@ pub(crate) fn aggregate_search(
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidSearchQualifier`] when a qualifier value is
-/// malformed (rejected client-side, before any network request). Otherwise
-/// the same failures as the parallel scan: a scan-wide failure aborts the
-/// scan, while a dead dedicated token alone does not. A request past
-/// GitHub's 1000-result search ceiling ends the listing with a warning
-/// instead of aborting with a raw HTTP error; a 422 on the first page,
-/// however, can never be a ceiling 422 (nothing was collected yet) — it is
-/// the API rejecting the query itself, and it fails explicitly instead of
-/// yielding a complete-looking empty report. Never panics.
+/// The same failures as the parallel scan: a scan-wide failure aborts the
+/// scan, while a dead dedicated token alone does not; the ceiling and 422
+/// semantics are [`fetch_search_hits`]'s. Never panics.
 pub(crate) fn aggregate_search_at(
     scanner: &Scanner,
     base: &str,
@@ -358,58 +429,18 @@ pub(crate) fn aggregate_search_at(
     // the over-ceiling page is never requested (the API answers it with a
     // raw 422, and the extra pages would only be thrown away anyway). The
     // page-size-aware loop also ends the listing on a short final page and
-    // counts raw items toward the cap, so a total that is not a multiple of
-    // the page size can no longer walk into the out-of-window request and
-    // cost the hits already collected (they are preserved instead). The
-    // hits are counted as they stream in so the defensive 422 fallback
-    // below can report how many it had to discard
-    let collected = std::cell::Cell::new(0usize);
-    let hits: Vec<SearchHit> = match fetch_paginated_with_page_size(
+    // counts raw items toward the cap; the ceiling and 422 semantics are
+    // [`fetch_search_hits`]'s
+    let hits = fetch_search_hits(
         scanner.client(),
-        |page| search_url(base, query, language, qualifiers, page),
-        |json| {
-            let (page_hits, raw_count) = parse_search_page(json)?;
-            collected.set(collected.get() + page_hits.len());
-            Ok((page_hits, raw_count))
-        },
-        Some(limit.min(SEARCH_RESULT_CEILING)),
-        PER_PAGE,
-    ) {
-        Ok(hits) => hits,
-        // defensive fallback (the cap, the short-page end and the raw-count
-        // limit above make the out-of-window page unreachable for GitHub's
-        // documented behavior): a 422 past the window ends the listing with
-        // a warning instead of aborting the whole search with a raw HTTP
-        // error (same parity as the user investigation's
-        // external-contributions search). The hits collected so far cannot
-        // be recovered from the paginated loop, so they are discarded — but
-        // the user must know how many were thrown away. A page-1 422 is
-        // different: with nothing collected, it can never be a window 422 —
-        // the API rejected the query itself (an over-long or otherwise
-        // invalid `q`), and a rejected query must fail explicitly instead
-        // of degrading into a complete-looking empty report
-        Err(Error::Http(err))
-            if err.status() == Some(reqwest::StatusCode::UNPROCESSABLE_ENTITY) =>
-        {
-            if collected.get() == 0 {
-                // the API rejected the query itself — in practice a
-                // nonexistent or inaccessible `--user`/`--org` login (the
-                // API's own body says "The listed users cannot be searched…",
-                // but the raw reqwest error discards it, leaving a typo'd
-                // target indistinguishable from a tool failure): surface the
-                // crafted rejection instead of the raw HTTP error
-                return Err(Error::SearchRejected);
-            }
-            log::warn!(
-                "search stopped at GitHub's 1000-result limit: {} already-found repositories were dropped",
-                collected.get()
-            );
-            Vec::new()
-        }
-        Err(err) => return Err(err),
-    };
+        base,
+        query,
+        language,
+        qualifiers,
+        limit.min(SEARCH_RESULT_CEILING),
+    )?;
 
-    let (mut found_emails, _, repos_scanned, _, correlation, partial) =
+    let (mut found_emails, _, repos_scanned, _, correlation, partial, _) =
         scanner.scan_repositories_at(base, &hits, true)?;
     sort_emails(&mut found_emails);
 
@@ -498,20 +529,30 @@ pub(crate) fn parse_search_page(json: &Value) -> Result<(Vec<SearchHit>, usize),
             "search payload: `items` is not an array".to_string(),
         ));
     };
-    let repositories = items
-        .iter()
-        .filter_map(|item| {
-            let url = item.get("html_url").and_then(Value::as_str)?;
-            let language = item
-                .get("language")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            Some(SearchHit {
-                url: url.to_string(),
-                language,
-            })
-        })
-        .collect();
+    // a listing-derived html_url is untrusted API data: an entry without
+    // a usable URL is skipped with a warning, never silently — the same
+    // warn-and-count rule the org and user listings apply to malformed
+    // entries (the raw count still includes it so pagination keeps its
+    // end-of-listing signal)
+    let mut repositories = Vec::new();
+    let mut malformed = 0usize;
+    for item in items {
+        let Some(url) = item.get("html_url").and_then(Value::as_str) else {
+            malformed += 1;
+            continue;
+        };
+        let language = item
+            .get("language")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        repositories.push(SearchHit {
+            url: url.to_string(),
+            language,
+        });
+    }
+    if malformed > 0 {
+        log::warn!("malformed search-listing entries skipped: {malformed}");
+    }
     Ok((repositories, items.len()))
 }
 
@@ -584,6 +625,7 @@ impl Scanner {
                 0,
                 Correlation::default(),
                 false,
+                None,
             ));
         }
         let tokens = self.client.tokens();
@@ -701,17 +743,25 @@ impl Scanner {
                 })
             })
             .collect();
-        let (result, per_repository, worker_requests, repos_scanned, skipped, correlation, partial) =
-            reduce_worker_reports(reports);
+        let (
+            result,
+            per_repository,
+            worker_requests,
+            repos_scanned,
+            skipped,
+            correlation,
+            partial,
+            death_error,
+        ) = reduce_worker_reports(reports);
         self.add_worker_requests(worker_requests);
         // the partial flag's documented meaning is "whole listed repositories
         // may have been left unscanned" (`scanned.partial` in the JSON
         // report): when the surviving workers fully drained the queue —
         // every listed repository was scanned or warn-skipped — the token
         // death lost no repository, and a complete report must not carry a
-        // false truncation alarm. The same coverage judgment the `org`
-        // caller applies to the flag, made here where the listing size is
-        // known (the reducers do not see it)
+        // false truncation alarm. The judgment is made here where the
+        // listing size is known (the reducers do not see it); the `org`
+        // caller aborts on any token death instead of judging coverage
         let partial = partial && repos_scanned + skipped < repositories.len();
         result.map(|emails| {
             (
@@ -721,6 +771,7 @@ impl Scanner {
                 skipped,
                 correlation,
                 partial,
+                death_error,
             )
         })
     }
@@ -758,20 +809,9 @@ impl Scanner {
             // spawned: report the death without pulling a repository, so the
             // other workers cover the whole queue instead of one repository
             // being lost to a doomed request
-            return Self::worker_report(
-                &client,
-                Vec::new(),
-                Vec::new(),
-                0,
-                0,
-                Some(Error::RateLimitExhausted),
-                true,
-            );
+            return WorkerAccum::default().finish(&client, Some(Error::RateLimitExhausted), true);
         }
-        let mut found_emails: Vec<String> = Vec::new();
-        let mut repos_scanned = 0usize;
-        let mut skipped = 0usize;
-        let mut contributions: Vec<RepoContribution> = Vec::new();
+        let mut accum = WorkerAccum::default();
 
         loop {
             // stop pulling work as soon as any worker failed fatally: the
@@ -793,34 +833,34 @@ impl Scanner {
             // keep the URL around for the skip warning: the parser helpers
             // take it by value
             let repository_url = hit.url.clone();
+            // a listing-derived URL the parsers reject (a hostile or
+            // truncated entry) is scoped to this entry: skip it with a
+            // warning like any resource-scoped failure, never abort the
+            // whole scan for one malformed listing line (the same
+            // warn-and-count rule the org listing applies to its entries;
+            // transport and scan failures below still abort)
             let author = match parsers::get_author(repository_url.clone()) {
                 Ok(author) => author,
                 Err(err) => {
-                    aborted.store(true, Ordering::Relaxed);
-                    return Self::worker_report(
-                        &client,
-                        found_emails,
-                        contributions,
-                        repos_scanned,
-                        skipped,
-                        Some(err),
-                        false,
+                    log::warn!(
+                        "skipping repository {}: {}",
+                        log_safe(&repository_url),
+                        log_safe(&err.to_string())
                     );
+                    accum.skipped += 1;
+                    continue;
                 }
             };
             let repository = match parsers::get_repository(repository_url.clone()) {
                 Ok(repository) => repository,
                 Err(err) => {
-                    aborted.store(true, Ordering::Relaxed);
-                    return Self::worker_report(
-                        &client,
-                        found_emails,
-                        contributions,
-                        repos_scanned,
-                        skipped,
-                        Some(err),
-                        false,
+                    log::warn!(
+                        "skipping repository {}: {}",
+                        log_safe(&repository_url),
+                        log_safe(&err.to_string())
                     );
+                    accum.skipped += 1;
+                    continue;
                 }
             };
             let scan = match super::repository::scan_repository(&client, base, &author, &repository)
@@ -832,15 +872,7 @@ impl Scanner {
                     // workers' tokens keep draining the queue, so the failure
                     // is not fatal and the emails found so far are kept
                     FailureAction::TokenDied => {
-                        return Self::worker_report(
-                            &client,
-                            found_emails,
-                            contributions,
-                            repos_scanned,
-                            skipped,
-                            Some(err),
-                            true,
-                        );
+                        return accum.finish(&client, Some(err), true);
                     }
                     // the failure is scoped to this repository (deleted,
                     // private, token without the right scope): skip it like
@@ -858,65 +890,18 @@ impl Scanner {
                             log_safe(&repository_url),
                             log_safe(&err.to_string())
                         );
-                        skipped += 1;
+                        accum.skipped += 1;
                         continue;
                     }
                     FailureAction::AbortScan => {
                         aborted.store(true, Ordering::Relaxed);
-                        return Self::worker_report(
-                            &client,
-                            found_emails,
-                            contributions,
-                            repos_scanned,
-                            skipped,
-                            Some(err),
-                            false,
-                        );
+                        return accum.finish(&client, Some(err), false);
                     }
                 },
             };
-            merge_emails(&mut found_emails, scan.emails);
-            contributions.push(RepoContribution {
-                name: format!("{author}/{repository}"),
-                language: hit.language,
-                authors: scan.authors,
-            });
-            repos_scanned += 1;
+            accum.absorb(scan, &author, &repository, hit.language);
         }
-        Self::worker_report(
-            &client,
-            found_emails,
-            contributions,
-            repos_scanned,
-            skipped,
-            None,
-            false,
-        )
-    }
-
-    /// Bundles what a worker found, the per-author contributions of its
-    /// scanned repositories (issue #5), how many requests its client made,
-    /// how many repositories it fully scanned, how many it warn-skipped as
-    /// resource-scoped and the failure that ended it (if any) into its final
-    /// report.
-    fn worker_report(
-        client: &crate::github::Client,
-        emails: Vec<String>,
-        contributions: Vec<RepoContribution>,
-        repos_scanned: usize,
-        skipped: usize,
-        failure: Option<Error>,
-        token_died: bool,
-    ) -> WorkerReport {
-        WorkerReport {
-            emails,
-            requests: client.requests_made(),
-            repos_scanned,
-            skipped,
-            contributions,
-            failure,
-            token_died,
-        }
+        accum.finish(&client, None, false)
     }
 
     /// Builds the client a worker exclusively owns for its dedicated token
@@ -979,6 +964,52 @@ fn classify_failure(err: &Error, skip_transient: bool) -> FailureAction {
     }
 }
 
+/// What one worker accumulated across the repositories it pulled off the
+/// shared queue: the merged email list, the per-author contributions, the
+/// scan/skip counters.
+#[derive(Default)]
+struct WorkerAccum {
+    emails: Vec<String>,
+    contributions: Vec<RepoContribution>,
+    repos_scanned: usize,
+    skipped: usize,
+}
+
+impl WorkerAccum {
+    /// Merges one scanned repository into the accumulation.
+    fn absorb(&mut self, scan: RepoScan, author: &str, repository: &str, language: Option<String>) {
+        merge_emails(&mut self.emails, scan.emails);
+        self.contributions.push(RepoContribution {
+            name: format!("{author}/{repository}"),
+            language,
+            authors: scan.authors,
+        });
+        self.repos_scanned += 1;
+    }
+
+    /// Bundles what a worker found, the per-author contributions of its
+    /// scanned repositories (issue #5), how many requests its client made,
+    /// how many repositories it fully scanned, how many it warn-skipped as
+    /// resource-scoped and the failure that ended it (if any) into its
+    /// final report.
+    fn finish(
+        self,
+        client: &crate::github::Client,
+        failure: Option<Error>,
+        token_died: bool,
+    ) -> WorkerReport {
+        WorkerReport::new(
+            client,
+            self.emails,
+            self.contributions,
+            self.repos_scanned,
+            self.skipped,
+            failure,
+            token_died,
+        )
+    }
+}
+
 /// What one scan worker reports back: the emails it found, the per-author
 /// contributions of the repositories it scanned (issue #5), how many
 /// successful requests its client made, how many repositories it fully
@@ -1003,6 +1034,27 @@ struct WorkerReport {
     /// died (spent quota or rejected token) rather than a scan-wide error:
     /// the other workers' tokens can keep draining the queue.
     token_died: bool,
+}
+impl WorkerReport {
+    fn new(
+        client: &crate::github::Client,
+        emails: Vec<String>,
+        contributions: Vec<RepoContribution>,
+        repos_scanned: usize,
+        skipped: usize,
+        failure: Option<Error>,
+        token_died: bool,
+    ) -> Self {
+        Self {
+            emails,
+            requests: client.requests_made(),
+            repos_scanned,
+            skipped,
+            contributions,
+            failure,
+            token_died,
+        }
+    }
 }
 
 /// Reduces the workers' reports into the scan result, the emails found per
@@ -1068,15 +1120,17 @@ fn reduce_worker_reports(reports: Vec<WorkerReport>) -> ReducedReports {
             }
         }
     }
+    let mut death_error = None;
     let result = match failure {
         // every failure is a dead dedicated token and at least one worker
         // made progress on its own token: return the (possibly partial)
         // result instead of throwing the work away
-        Some(_) if only_token_deaths && any_progress => {
+        Some(err) if only_token_deaths && any_progress => {
             log::warn!(
-                "one token ran out or was refused mid-scan: results may be incomplete (the JSON report marks this as \"scanned.partial\")"
+                "one token ran out or was refused mid-scan: results may be incomplete (the JSON report marks the run \"scanned.partial\" only when a listed repository was left unscanned)"
             );
             partial_token_death = true;
+            death_error = Some(err);
             Ok(found_emails)
         }
         Some(err) => Err(err),
@@ -1096,6 +1150,7 @@ fn reduce_worker_reports(reports: Vec<WorkerReport>) -> ReducedReports {
         skipped,
         correlation.finish(),
         partial_token_death,
+        death_error,
     )
 }
 
@@ -1115,21 +1170,6 @@ mod tests {
     use crate::github::fetch_paginated;
     use crate::github::mock;
     use std::sync::Arc;
-
-    /// The `page` query parameter of a mock request line, robust to
-    /// `per_page` sharing the `page=` substring.
-    fn page_of(line: &str) -> u16 {
-        line.trim_end_matches(" HTTP/1.1")
-            .split('?')
-            .nth(1)
-            .and_then(|query| {
-                query
-                    .split('&')
-                    .find_map(|param| param.strip_prefix("page="))
-            })
-            .and_then(|page| page.parse().ok())
-            .unwrap_or(0)
-    }
 
     /// A full page of 100 commits all attributing the same `(name, email)`
     /// pair: the page-size-aware commit listing only ends on a short page,
@@ -1378,6 +1418,32 @@ mod tests {
     }
 
     #[test]
+    fn leading_zeros_are_notation_not_magnitude_in_count_ranges() {
+        // `0500` is `500`: the inversion comparison strips leading zeros
+        // before comparing, so a zero-padded valid range is accepted and a
+        // zero-padded inverted one is still rejected
+        for value in ["0500..999", "005..010", "000..*"] {
+            let qualifiers = SearchQualifiers {
+                stars: Some(value.to_string()),
+                ..SearchQualifiers::default()
+            };
+            qualifiers
+                .validate()
+                .expect("a zero-padded valid range must be accepted");
+        }
+        let qualifiers = SearchQualifiers {
+            stars: Some("0500..9".to_string()),
+            ..SearchQualifiers::default()
+        };
+        let error = qualifiers
+            .validate()
+            .expect_err("a zero-padded inverted range must still be rejected");
+        assert!(
+            matches!(&error, Error::InvalidSearchQualifier(details) if details.contains("stars"))
+        );
+    }
+
+    #[test]
     fn validate_rejects_impossible_dates() {
         for value in [
             "2020-13-01",
@@ -1514,6 +1580,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_search_page_warns_on_malformed_entries_and_keeps_the_rest() {
+        // an item without a usable html_url is skipped with a warning,
+        // never silently: the raw count still includes it so pagination
+        // keeps its end-of-listing signal (same warn-and-count rule as the
+        // org and user listings)
+        let json: Value = serde_json::json!({
+            "total_count": 3,
+            "items": [
+                { "html_url": "https://github.com/a/one", "language": "Rust" },
+                { "language": "Go" },
+                { "other": true }
+            ]
+        });
+        let (outcome, lines) = crate::test_logger::capture(|| parse_search_page(&json));
+        let (hits, raw_count) = outcome.expect("parsing must succeed");
+        assert_eq!(
+            hits,
+            vec![SearchHit {
+                url: "https://github.com/a/one".to_string(),
+                language: Some("Rust".to_string()),
+            }]
+        );
+        assert_eq!(raw_count, 3);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("malformed search-listing entries skipped: 2")),
+            "the malformed entries must be reported: {lines:?}"
+        );
+    }
+
+    #[test]
     fn parse_search_page_rejected_search_ends_the_listing() {
         // GitHub returns {"items": null} for a rejected search: parsed as an
         // empty page, it ends the listing instead of erroring
@@ -1580,7 +1678,7 @@ mod tests {
                 return (200, vec![], "[]".to_string());
             }
             if line.contains("/search/repositories") {
-                return match page_of(line) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -1620,6 +1718,56 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_listing_url_is_skipped_with_a_warning_not_an_abort() {
+        // one listing entry with a present-but-unparseable html_url is
+        // scoped to that entry: it is skipped with a warning (the same
+        // warn-and-count rule as any resource-scoped failure) and the other
+        // hits are scanned, instead of one malformed line aborting the
+        // whole scan and discarding every finding
+        let (address, server) = mock::serve_requests(move |_index, request| {
+            let line = request.first().map(String::as_str).unwrap_or("");
+            if line.contains("/repos/a/one/commits") || line.contains("/repos/a/two/commits") {
+                return (200, vec![], "[]".to_string());
+            }
+            if line.contains("/search/repositories") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        r#"{"total_count": 2, "items": [{"html_url": "https://github.com/a/one"}, {"html_url": "https://github.com/"}]}"#.to_string(),
+                    ),
+                    _ => (200, vec![], r#"{"items": null}"#.to_string()),
+                };
+            }
+            (404, vec![], String::new())
+        });
+
+        let scanner =
+            crate::sources::Scanner::new(None, None).expect("anonymous scanner must build");
+        let (outcome, lines) = crate::test_logger::capture(|| {
+            aggregate_search_at(
+                &scanner,
+                &address,
+                "nmap",
+                "",
+                &SearchQualifiers::default(),
+                5,
+            )
+        });
+        let outcome = outcome.expect("one malformed entry must not abort the scan");
+        server.join();
+
+        // the sane entry was scanned; the malformed one was skipped
+        assert_eq!(outcome.repos_scanned, 1);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("skipping repository https://github.com/")),
+            "the malformed entry must be reported with its sanitized URL: {lines:?}"
+        );
+    }
+
+    #[test]
     fn the_search_ceiling_caps_the_listing_and_keeps_the_collected_hits() {
         // the 1000-result ceiling is the cap even when --limit is far above
         // it: the mock answers the full 100 items of pages 1..10 and the
@@ -1634,7 +1782,7 @@ mod tests {
                 return (200, vec![], "[]".to_string());
             }
             if line.contains("/search/repositories") {
-                let page = page_of(line);
+                let page = crate::github::mock::request_line_page(request);
                 if page > 10 {
                     // the documented over-ceiling answer: must never be
                     // requested, the cap stops the listing first
@@ -1792,7 +1940,7 @@ mod tests {
         let (address, server) = mock::serve_requests(move |_index, request| {
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/search/repositories") {
-                if page_of(line) > 1 {
+                if crate::github::mock::request_line_page(request) > 1 {
                     return (
                         422,
                         vec![],
@@ -1846,13 +1994,13 @@ mod tests {
                 return (401, vec![], String::new());
             }
             if line.contains("/repos/a/two/commits") {
-                return match page_of(line) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => full_commit_page("Bob", "bob@x.com"),
                     _ => (200, vec![], "[]".to_string()),
                 };
             }
             if line.contains("/repos/a/three/commits") {
-                return match page_of(line) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => full_commit_page("Carol", "carol@x.com"),
                     _ => (200, vec![], "[]".to_string()),
                 };
@@ -1878,7 +2026,7 @@ mod tests {
                 language: None,
             })
             .collect();
-        let (emails, _, repos_scanned, _, _, _) = scanner
+        let (emails, _, repos_scanned, _, _, _, _) = scanner
             .scan_repositories_at(&address, &hits, true)
             .expect("one revoked token must not abort the scan");
 
@@ -1906,7 +2054,7 @@ mod tests {
             }
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/repos/a/one/commits") {
-                return match page_of(line) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -1917,7 +2065,7 @@ mod tests {
                 };
             }
             if line.contains("/repos/a/two/commits") {
-                return match page_of(line) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -1961,7 +2109,7 @@ mod tests {
         assert_eq!(repos_scanned, 2);
         assert_eq!(emails.len(), 2);
         assert!(
-            !partial,
+            partial.is_none(),
             "a token death that left no listed repository uncovered is not a partial scan"
         );
     }
@@ -1980,7 +2128,7 @@ mod tests {
             }
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/repos/a/one/commits") {
-                return match page_of(line) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -2018,7 +2166,7 @@ mod tests {
 
         assert_eq!(repos_scanned, 1);
         assert_eq!(emails, vec!["alice@x.com".to_string()]);
-        assert!(!partial);
+        assert!(partial.is_none());
     }
 
     #[test]
@@ -2030,7 +2178,7 @@ mod tests {
         let (address, server) = mock::serve_requests(move |_index, request| {
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/repos/a/one/commits") {
-                return match page_of(line) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -2070,7 +2218,7 @@ mod tests {
                 language: None,
             })
             .collect();
-        let (emails, _, repos_scanned, _, _, partial) = scanner
+        let (emails, _, repos_scanned, _, _, partial, _) = scanner
             .scan_repositories_at(&address, &hits, true)
             .expect("the kept partial result is returned");
         server.join();
@@ -2098,7 +2246,7 @@ mod tests {
                 return (404, vec![], String::new());
             }
             if line.contains("/repos/a/full/commits") {
-                return match page_of(line) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -2125,7 +2273,7 @@ mod tests {
         ];
         let (outcome, lines) =
             crate::test_logger::capture(|| scanner.scan_repositories_at(&address, &hits, true));
-        let (emails, _, repos_scanned, _, _, _) =
+        let (emails, _, repos_scanned, _, _, _, _) =
             outcome.expect("a resource-scoped failure must not abort the scan");
         server.join();
 
@@ -2160,7 +2308,7 @@ mod tests {
                 );
             }
             if line.contains("/repos/a/full/commits") {
-                return match page_of(line) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -2171,7 +2319,7 @@ mod tests {
                 };
             }
             if line.contains("/search/repositories") {
-                return match page_of(line) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -2358,7 +2506,7 @@ mod tests {
             failure: None,
             token_died: false,
         };
-        let (result, _, _, repos_scanned, skipped, _, partial) = reduce_worker_reports(vec![
+        let (result, _, _, repos_scanned, skipped, _, partial, _) = reduce_worker_reports(vec![
             progressed_report(&["a@a.a"], 1, Some(Error::RateLimitExhausted)),
             covered,
         ]);
@@ -2373,7 +2521,7 @@ mod tests {
         // a dead worker's own gap (its in-flight repository) is neither
         // scanned nor skipped: scanned + skipped stays below the listing and
         // the caller must abort instead of writing a complete-looking report
-        let (result, _, _, repos_scanned, skipped, _, partial) = reduce_worker_reports(vec![
+        let (result, _, _, repos_scanned, skipped, _, partial, _) = reduce_worker_reports(vec![
             progressed_report(&["a@a.a"], 1, Some(Error::RateLimitExhausted)),
             report(&["b@b.b"], None),
         ]);
@@ -2408,15 +2556,19 @@ mod tests {
             progressed_report(&["a@a.a"], 1, Some(Error::RateLimitExhausted)),
             report(&["b@b.b"], None),
         ];
-        let (result, .., partial_token_death) = reduce_worker_reports(partial);
+        let (result, .., partial_token_death, death_error) = reduce_worker_reports(partial);
         result.expect("the healthy workers' emails must be kept");
         assert!(partial_token_death, "a kept partial result must be flagged");
+        assert!(
+            death_error.is_some(),
+            "the caller must receive the real death cause"
+        );
 
         let complete = vec![report(&["a@a.a"], None), report(&["b@b.b"], None)];
-        let (result, .., partial_token_death) = reduce_worker_reports(complete);
+        let (result, .., partial_token_death, death_error) = reduce_worker_reports(complete);
         result.expect("the scan must not fail");
         assert!(
-            !partial_token_death,
+            !partial_token_death && death_error.is_none(),
             "a result kept without any token death is not partial"
         );
     }
@@ -2460,10 +2612,6 @@ mod tests {
         // a spent quota stops the worker, dedicated token or not; so does a
         // token the API rejected outright (HTTP 401 surfaced as
         // [`Error::TokenRejected`])
-        assert!(matches!(
-            classify_failure(&Error::RateLimitExhausted, true),
-            FailureAction::TokenDied
-        ));
         assert!(matches!(
             classify_failure(&Error::RateLimitExhausted, true),
             FailureAction::TokenDied
@@ -2607,7 +2755,7 @@ mod correlation_tests {
             ),
         ];
 
-        let (result, _, requests, repos_scanned, _, correlation, _) =
+        let (result, _, requests, repos_scanned, _, correlation, ..) =
             reduce_worker_reports(reports);
         let emails = result.expect("the scan must not fail");
         assert_eq!(
@@ -2641,7 +2789,7 @@ mod correlation_tests {
         report.failure = Some(Error::RateLimitExhausted);
         report.token_died = true;
 
-        let (result, _, _, _, _, correlation, _) = reduce_worker_reports(vec![report, {
+        let (result, _, _, _, _, correlation, ..) = reduce_worker_reports(vec![report, {
             contribution_report(&["bob@y.y"], "b/two", Some("Go"), &[("Bob", "bob@y.y", 1)])
         }]);
 

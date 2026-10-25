@@ -217,8 +217,8 @@ is a release blocker.
   at every resource boundary, never an abort.
 - A `429` is always transient (park), even with `X-RateLimit-Remaining: 0`:
   the quota check is gated on the status before the header is consulted
-  (`src/github/client.rs`), pinned by
-  `a_429_with_a_spent_quota_header_is_transient_not_a_retirement` — the
+  (pinned by `src/github/paginated.rs`:
+  `a_429_with_a_spent_quota_header_is_transient_not_a_retirement`) — the
   pre-0.7.0 branches once retired such tokens while the doc claimed
   otherwise. Doc claims and code must never diverge: if the doc says it,
   a test pins it.

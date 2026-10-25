@@ -6,10 +6,115 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// Serves one keep-alive connection: every request of the connection is
+/// answered before accepting a new one (one connection per scan instead of
+/// one per request avoids the Windows loopback connection aborts (10053)
+/// that rapid connect/close cycles trigger under parallel test load). The
+/// read timeout keeps the shutdown flags responsive while the connection
+/// idles between requests.
+fn serve_connection(
+    mut stream: TcpStream,
+    stop: &AtomicBool,
+    handled: &AtomicUsize,
+    last_activity: &std::sync::Mutex<Instant>,
+    respond: &std::sync::Arc<
+        impl Fn(usize, &[String]) -> (u16, Vec<(String, String)>, String) + Send + Sync,
+    >,
+) {
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(reader) => reader,
+        Err(_) => return,
+    });
+    loop {
+        let mut request_lines: Vec<String> = Vec::new();
+        let mut closed = false;
+        // one accumulating buffer per request: a read
+        // timeout keeps whatever partial bytes were already
+        // read, so a request line split across the timeout
+        // is never lost
+        let mut line = String::new();
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Err(ref err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    // idle keep-alive connection: check the
+                    // shutdown flag, then keep reading
+                    // (`line` preserves any partial request
+                    // line)
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    closed = true;
+                    break;
+                }
+                Ok(_) => {
+                    if !line.ends_with('\n') {
+                        continue;
+                    }
+                    if line.trim().is_empty() {
+                        break; // end of the request headers
+                    }
+                    request_lines.push(line.trim_end().to_string());
+                    line.clear();
+                }
+            }
+        }
+        // HTTP clients may open extra idle connections that
+        // carry no request: do not count them as handled
+        // requests.
+        if !request_lines.is_empty() {
+            let index = handled.fetch_add(1, Ordering::Relaxed);
+            *last_activity.lock().expect("test bookkeeping") = Instant::now();
+            let (status, headers, body) = respond(index, &request_lines);
+            let reason = match status {
+                200 => "OK",
+                403 => "Forbidden",
+                404 => "Not Found",
+                429 => "Too Many Requests",
+                _ => "Error",
+            };
+            // the auto Content-Length reflects the body
+            // actually written, except when a test explicitly
+            // overrides it (e.g. a huge announced length to
+            // exercise the client's body-size cap — the
+            // mismatching body is never read then)
+            let declares_length = headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-length"));
+            let mut response = if declares_length {
+                format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n")
+            } else {
+                format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+                    body.len()
+                )
+            };
+            for (name, value) in &headers {
+                response.push_str(&format!("{name}: {value}\r\n"));
+            }
+            response.push_str("\r\n");
+            response.push_str(&body);
+            let _ = stream.write_all(response.as_bytes());
+        }
+        if closed || stop.load(Ordering::Relaxed) {
+            return;
+        }
+    }
+}
 
 pub(crate) fn serve_requests(
     respond: impl Fn(usize, &[String]) -> (u16, Vec<(String, String)>, String) + Send + Sync + 'static,
@@ -49,7 +154,7 @@ pub(crate) fn serve_requests(
                 {
                     break;
                 }
-                let mut stream = match listener.accept() {
+                let stream = match listener.accept() {
                     Ok((stream, _)) => {
                         *last_activity.lock().expect("test bookkeeping") = Instant::now();
                         stream
@@ -76,82 +181,7 @@ pub(crate) fn serve_requests(
                 let respond = Arc::clone(&respond);
                 let stop = Arc::clone(&stop);
                 let connection = std::thread::spawn(move || {
-                    let mut reader = BufReader::new(match stream.try_clone() {
-                        Ok(reader) => reader,
-                        Err(_) => return,
-                    });
-                    loop {
-                        let mut request_lines: Vec<String> = Vec::new();
-                        let mut closed = false;
-                        // one accumulating buffer per request: a read
-                        // timeout keeps whatever partial bytes were already
-                        // read, so a request line split across the timeout
-                        // is never lost
-                        let mut line = String::new();
-                        loop {
-                            match reader.read_line(&mut line) {
-                                Ok(0) => {
-                                    closed = true;
-                                    break;
-                                }
-                                Err(ref err)
-                                    if err.kind() == std::io::ErrorKind::WouldBlock
-                                        || err.kind() == std::io::ErrorKind::TimedOut =>
-                                {
-                                    // idle keep-alive connection: check the
-                                    // shutdown flag, then keep reading
-                                    // (`line` preserves any partial request
-                                    // line)
-                                    if stop.load(Ordering::Relaxed) {
-                                        return;
-                                    }
-                                    continue;
-                                }
-                                Err(_) => {
-                                    closed = true;
-                                    break;
-                                }
-                                Ok(_) => {
-                                    if !line.ends_with('\n') {
-                                        continue;
-                                    }
-                                    if line.trim().is_empty() {
-                                        break; // end of the request headers
-                                    }
-                                    request_lines.push(line.trim_end().to_string());
-                                    line.clear();
-                                }
-                            }
-                        }
-                        // HTTP clients may open extra idle connections that
-                        // carry no request: do not count them as handled
-                        // requests.
-                        if !request_lines.is_empty() {
-                            let index = handled.fetch_add(1, Ordering::Relaxed);
-                            *last_activity.lock().expect("test bookkeeping") = Instant::now();
-                            let (status, headers, body) = respond(index, &request_lines);
-                            let reason = match status {
-                                200 => "OK",
-                                403 => "Forbidden",
-                                404 => "Not Found",
-                                429 => "Too Many Requests",
-                                _ => "Error",
-                            };
-                            let mut response = format!(
-                                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
-                                body.len()
-                            );
-                            for (name, value) in &headers {
-                                response.push_str(&format!("{name}: {value}\r\n"));
-                            }
-                            response.push_str("\r\n");
-                            response.push_str(&body);
-                            let _ = stream.write_all(response.as_bytes());
-                        }
-                        if closed || stop.load(Ordering::Relaxed) {
-                            return;
-                        }
-                    }
+                    serve_connection(stream, &stop, &handled, &last_activity, &respond);
                 });
                 handles.lock().expect("test bookkeeping").push(connection);
             }
@@ -205,12 +235,29 @@ pub(crate) fn request_header<'a>(request_lines: &'a [String], name: &str) -> Opt
 }
 
 /// Extracts the `page=` query parameter of a mock request's request line
-/// (0 when absent or unparsable).
+/// (0 when absent or unparsable). The query is split on `&` parameters, so
+/// `per_page=100&page=2` yields `2` — splitting on the `page=` substring
+/// would grab the `per_page` value instead.
 pub(crate) fn request_line_page(request_lines: &[String]) -> u16 {
     request_lines
         .first()
-        .and_then(|line| line.split("page=").nth(1))
-        .and_then(|rest| rest.split(' ').next())
-        .and_then(|page| page.parse().ok())
+        .and_then(|line| line.split('?').nth(1))
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|param| param.strip_prefix("page="))
+        })
+        .and_then(|page| page.trim_end_matches(" HTTP/1.1").parse().ok())
         .unwrap_or(0)
+}
+
+/// Writes a temporary token-pool file for tests and returns its path: the
+/// caller removes it after use. `unique` keeps concurrent test files apart.
+pub(crate) fn temp_token_file(contents: &str, unique: u32) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "git2mail_token_pool_test_{}_{unique}.json",
+        std::process::id()
+    ));
+    std::fs::write(&path, contents).expect("test setup: write temp file");
+    path
 }

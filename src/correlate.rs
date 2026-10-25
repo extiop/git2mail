@@ -105,9 +105,9 @@ impl Correlation {
 
     /// Sanitizes one metadata field of a summary entry: beyond the shared
     /// log sanitizer (control characters become `_`), the characters that
-    /// make up the summary's own line shape (`;` the entry separator, `—`
-    /// and `<`/`>` the fixed `name <email> — language, N commits` field
-    /// separators) are neutralized too, so a hostile author name like
+    /// make up the summary's own line shape (`;`, `—` and `<`/`>` — the
+    /// field separators of the `name <email> — language, N commits` entry
+    /// format) are neutralized too, so a hostile author name like
     /// `Alice <a@x.com> — Rust, 999 commits; Fake Dev` renders as one
     /// visibly mangled field instead of extra plausible "top author"
     /// entries. Never panics.
@@ -189,7 +189,7 @@ struct AuthorAggregate {
     /// Exact-match membership set of the repository names in `repos`:
     /// same dedup-cost rule as `email_set` (an author seen in many
     /// repositories must not pay a linear scan per incoming repository).
-    repo_names: HashSet<String>,
+    repo_name_set: HashSet<String>,
     first_seen_repo: Option<String>,
     total_hits: usize,
     /// Commit hits per repository language (languages only; repositories
@@ -224,10 +224,15 @@ impl CorrelationBuilder {
     pub fn add_repo(&mut self, contribution: RepoContribution) {
         for author in contribution.authors {
             let aggregate = self.authors.entry(author.name).or_default();
-            if aggregate.email_set.insert(author.email.clone()) {
+            // the contains checks guard the clones: a repository with many
+            // already-seen authors must not pay a String clone per author
+            // per repo
+            if !aggregate.email_set.contains(&author.email) {
+                aggregate.email_set.insert(author.email.clone());
                 aggregate.emails.push(author.email);
             }
-            if aggregate.repo_names.insert(contribution.name.clone()) {
+            if !aggregate.repo_name_set.contains(&contribution.name) {
+                aggregate.repo_name_set.insert(contribution.name.clone());
                 aggregate.repos.push(RepoLanguage {
                     name: contribution.name.clone(),
                     language: contribution.language.clone(),
@@ -238,7 +243,11 @@ impl CorrelationBuilder {
             }
             aggregate.total_hits += author.hits;
             if let Some(language) = &contribution.language {
-                *aggregate.language_hits.entry(language.clone()).or_insert(0) += author.hits;
+                // the language key clone is hoisted out of the dedup: the
+                // entry lookup borrows first, the clone happens only when a
+                // new entry is needed
+                let hits = aggregate.language_hits.entry(language.clone()).or_insert(0);
+                *hits += author.hits;
             }
         }
     }
@@ -251,8 +260,13 @@ impl CorrelationBuilder {
             .authors
             .into_iter()
             .map(|(name, aggregate)| {
+                // precomputed lowercase keys: sorting must not allocate a
+                // temporary String per element per comparison; the raw
+                // string breaks the ties the lowercase key cannot (exact-
+                // match dedup keeps case variants), so the order is a total
+                // order and the report is deterministic run-to-run
                 let mut emails = aggregate.emails;
-                emails.sort_by_key(|email| email.to_lowercase());
+                emails.sort_by_cached_key(|email| (email.to_lowercase(), email.clone()));
                 let mut languages: Vec<(String, usize)> =
                     aggregate.language_hits.into_iter().collect();
                 languages.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -269,10 +283,17 @@ impl CorrelationBuilder {
                 }
             })
             .collect();
-        authors.sort_by(|a, b| {
-            b.total_hits
-                .cmp(&a.total_hits)
-                .then_with(|| a.author.to_lowercase().cmp(&b.author.to_lowercase()))
+        // precomputed lowercase keys: the comparator must not allocate a
+        // temporary String per author per comparison; the raw name breaks
+        // the ties (case-variant names with equal hits) so the JSON report
+        // and the summary are deterministic run-to-run, whatever order the
+        // HashMap iterated in
+        authors.sort_by_cached_key(|author| {
+            (
+                std::cmp::Reverse(author.total_hits),
+                author.author.to_lowercase(),
+                author.author.clone(),
+            )
         });
         Correlation { authors }
     }
@@ -303,6 +324,45 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn the_author_and_email_orders_are_total_and_deterministic() {
+        // case-variant names with equal hits tie on the lowercase key: the
+        // raw name must break the tie, or the stable sort keeps the
+        // HashMap's per-process randomized iteration order and the JSON
+        // report varies run-to-run (same hole for exact-case email
+        // variants, which the exact-match dedup keeps both of)
+        let mut builder = CorrelationBuilder::new();
+        // two case-variant authors, equal hits: the lowercase tie-break
+        builder.add_repo(contribution(
+            "a/one",
+            None,
+            &[("alice", "alice@x.com", 2), ("Alice", "alice@x.com", 2)],
+        ));
+        // one author holding two case-variant emails: the exact-match dedup
+        // keeps both, the lowercase key ties on them
+        builder.add_repo(contribution(
+            "a/one",
+            None,
+            &[("Zed", "zed@x.com", 1), ("Zed", "ZED@x.com", 1)],
+        ));
+
+        let correlation = builder.finish();
+        assert_eq!(
+            correlation
+                .authors
+                .iter()
+                .map(|author| author.author.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alice", "alice", "Zed"],
+            "the raw name must break the lowercase tie (uppercase first in ASCII)"
+        );
+        assert_eq!(
+            correlation.authors[2].emails,
+            vec!["ZED@x.com".to_string(), "zed@x.com".to_string()],
+            "the raw email must break the lowercase tie"
+        );
     }
 
     #[test]

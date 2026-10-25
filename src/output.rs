@@ -8,9 +8,7 @@ use crate::errors::Error;
 use log::info;
 use serde::Serialize;
 use serde_json::json;
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -146,7 +144,6 @@ pub fn write_text(directory: &str, file_name: &str, emails: &[String]) -> Result
     })?;
     // the whole output is composed in memory and published atomically (see
     // [`publish_atomically`]): one email per line, the format unchanged
-    //
     let mut content = String::new();
     for email in emails {
         content.push_str(email);
@@ -288,9 +285,7 @@ fn sanitize_file_name(name: &str) -> String {
     // their exact file name, mixed-case names like `Rust` are hashed even
     // alone — documented in doc/src/OUTPUT.md).
     if candidate != name || name.to_lowercase() != name {
-        let mut hasher = DefaultHasher::new();
-        name.hash(&mut hasher);
-        candidate = format!("{candidate}-{:016x}", hasher.finish());
+        candidate = format!("{candidate}-{:016x}", stable_hash(name));
     }
     // A filesystem path component is limited to 255 bytes: a long multibyte
     // search query (GitHub caps queries at 256 *characters*, so a 110-CJK-
@@ -304,15 +299,37 @@ fn sanitize_file_name(name: &str) -> String {
     // would discard any earlier suffix and collide two long names sharing
     // the same prefix — the raw name is what makes the targets distinct)
     if candidate.len() > MAX_FILE_NAME_BYTES {
+        // the cap announces itself: a silent truncation would leave the
+        // analyst guessing why the printed path differs from the target
+        // (same caps-say-so convention as the commit and search ceilings)
+        log::info!(
+            "result file name capped at {MAX_FILE_NAME_BYTES} bytes with a hash suffix (the target name was longer)"
+        );
         let mut end = MAX_FILE_NAME_BYTES;
         while !candidate.is_char_boundary(end) {
             end -= 1;
         }
-        let mut hasher = DefaultHasher::new();
-        name.hash(&mut hasher);
-        return format!("{}-{:016x}", &candidate[..end], hasher.finish());
+        return format!("{}-{:016x}", &candidate[..end], stable_hash(name));
     }
     candidate.to_string()
+}
+
+/// FNV-1a over the raw name bytes: the anti-clobber suffix must be stable
+/// across Rust releases. std's `DefaultHasher` is documented as having an
+/// unspecified algorithm, so a toolchain upgrade could change the suffix:
+/// a rerun of the same query would then write a new file and leave the
+/// previous result stale instead of refreshing it, silently breaking the
+/// documented rerun-overwrite contract. FNV-1a is self-contained, stable,
+/// and only needs to distinguish names, not resist adversaries.
+fn stable_hash(name: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// The conventional stdout path marker: `--json -` writes the report to the
@@ -335,6 +352,26 @@ const STDOUT_PATH_MARKER: &str = "-";
 pub fn ensure_report_target(path: &Path) -> Result<(), Error> {
     if path == Path::new(STDOUT_PATH_MARKER) {
         return Ok(());
+    }
+    // a NUL byte in the path fails every syscall with EINVAL: the pre-flight
+    // surfaces it now instead of after the run's API budget is spent
+    if path.as_os_str().to_string_lossy().contains('\0') {
+        return Err(Error::OutputWrite(format!(
+            "cannot write the JSON report to {}: the path contains a NUL byte",
+            sanitize_log_text(&path.to_string_lossy())
+        )));
+    }
+    // a regular file occupying the parent directory can never become the
+    // report's directory: the pre-flight rejects it now instead of after
+    // the run's API budget is spent
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && parent.is_file()
+    {
+        return Err(Error::OutputWrite(format!(
+            "cannot write the JSON report to {}: its parent path is a file, not a directory",
+            sanitize_log_text(&path.to_string_lossy())
+        )));
     }
     if path.is_dir() {
         return Err(Error::OutputWrite(format!(
@@ -361,7 +398,7 @@ pub fn ensure_report_target(path: &Path) -> Result<(), Error> {
 
 /// Writes any serializable report as pretty JSON at `path` (creating parent
 /// directories when needed): the shared writing logic of the scan report
-/// ([`write_json`]) and of the `user` investigation report. The path `-`
+/// ([`write_scan_report_json`]) and of the `user` investigation report. The path `-`
 /// means the standard output: the report is printed there instead of a
 /// literal file named `-` being created.
 ///
@@ -414,23 +451,22 @@ pub fn write_report_json<T: Serialize>(path: &Path, report: &T) -> Result<(), Er
                 ))
             });
     }
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent).map_err(|err| {
-            Error::OutputWrite(format!(
-                "cannot create {}: {err}",
-                sanitize_log_text(&parent.display().to_string())
-            ))
-        })?;
-    }
-    // the report is published atomically (see [`publish_atomically`]): a
-    // concurrent reader or a concurrent run targeting the same --json path
-    // must observe one complete report, never a half-written one
-    let staging_directory = match path.parent() {
+    // the report directory, computed once: created up front and reused as
+    // the staging root of the atomic publish
+    let parent_dir = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     };
+    fs::create_dir_all(&parent_dir).map_err(|err| {
+        Error::OutputWrite(format!(
+            "cannot create {}: {err}",
+            sanitize_log_text(&parent_dir.display().to_string())
+        ))
+    })?;
+    // the report is published atomically (see [`publish_atomically`]): a
+    // concurrent reader or a concurrent run targeting the same --json path
+    // must observe one complete report, never a half-written one
+    let staging_directory = parent_dir;
     let staging = staging_path(&staging_directory, "git2mail-report");
     publish_atomically(path, &staging, &body)?;
     info!(
@@ -459,7 +495,7 @@ pub fn write_report_json<T: Serialize>(path: &Path, report: &T) -> Result<(), Er
 /// path is carried in the error) and [`Error::Json`] when the report cannot
 /// be serialized. Never panics.
 #[expect(clippy::too_many_arguments)]
-pub fn write_json(
+pub fn write_scan_report_json(
     path: &Path,
     target: &str,
     mode: &str,
@@ -703,6 +739,49 @@ mod tests {
         // trailing-dot trimming is a change too: `a.` must not collapse
         // onto `a`
         assert_ne!(sanitize_file_name("a."), sanitize_file_name("a"));
+    }
+
+    #[test]
+    fn the_anti_clobber_hash_is_stable_across_rust_releases() {
+        // std's DefaultHasher has an unspecified algorithm: a toolchain
+        // upgrade used to change the suffix, so a rerun of the same query
+        // wrote a new file and left the previous result stale instead of
+        // refreshing it. The suffix is now a self-contained FNV-1a, pinned
+        // here by its exact value: if this test fails, the suffix changed
+        // and old result files will no longer be overwritten by reruns
+        assert_eq!(format!("{:016x}", stable_hash("a/b")), "e620c3190468cf61");
+        assert_eq!(format!("{:016x}", stable_hash("a:b")), "e661911904a01160");
+        assert_eq!(format!("{:016x}", stable_hash("Rust")), "ea8ce02b70d73b07");
+        // both suffix sites (case-fold and length cap) derive from the
+        // same hash: the disambiguation test above keeps them coherent,
+        // this pin keeps them stable
+    }
+
+    #[test]
+    fn ensure_report_target_rejects_a_nul_byte_path_before_the_scan() {
+        // a NUL byte fails every syscall with EINVAL: the pre-flight must
+        // surface it before the run's API budget is spent
+        let error = ensure_report_target(Path::new("report\u{0}.json"))
+            .expect_err("a NUL-byte path must be rejected");
+        assert!(
+            matches!(error, Error::OutputWrite(ref details) if details.contains("NUL byte")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_report_target_rejects_a_file_as_parent_before_the_scan() {
+        // a regular file occupying the parent path can never become the
+        // report's directory: reject it pre-flight
+        let file = std::env::temp_dir().join("git2mail-parent-is-a-file");
+        std::fs::write(&file, "not a directory").expect("the temp file must be writable");
+        let target = file.join("report.json");
+        let error = ensure_report_target(&target).expect_err("a file parent must be rejected");
+        assert!(
+            matches!(error, Error::OutputWrite(ref details) if details.contains("parent path is a file")),
+            "unexpected error: {error:?}"
+        );
+        std::fs::remove_file(&file).expect("the temp file must be removable");
     }
 
     #[test]
@@ -1048,7 +1127,7 @@ mod tests {
         ));
         fs::create_dir_all(&directory).expect("test setup: blocker directory");
 
-        let error = write_json(
+        let error = write_scan_report_json(
             &directory,
             "target",
             "repository",
@@ -1197,7 +1276,7 @@ mod tests {
             "git2mail_output_test_{}_report.json",
             std::process::id()
         ));
-        write_json(
+        write_scan_report_json(
             &path,
             "https://github.com/extiop/ctf",
             "repository",
@@ -1233,7 +1312,7 @@ mod tests {
             "git2mail_output_test_{}_partial_report.json",
             std::process::id()
         ));
-        write_json(
+        write_scan_report_json(
             &path,
             "https://github.com/extiop/ctf",
             "search",
@@ -1286,7 +1365,7 @@ mod tests {
         });
         let correlation = builder.finish();
 
-        write_json(
+        write_scan_report_json(
             &path,
             "https://github.com/extiop/ctf",
             "repository",
@@ -1551,6 +1630,16 @@ mod tests {
         );
         // deterministic across runs, valid UTF-8 (cut on a char boundary)
         assert_eq!(name, sanitize_file_name(&long));
+        // the cap announces itself (no silent truncation)
+        let (_, lines) = crate::test_logger::capture(|| {
+            let _ = sanitize_file_name(&long);
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("result file name capped")),
+            "the cap must be announced: {lines:?}"
+        );
         // two distinct long names must not collapse into one result file
         let other = "語".repeat(110);
         assert_ne!(name, sanitize_file_name(&other));

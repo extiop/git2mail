@@ -13,14 +13,17 @@ use std::time::{Duration, Instant};
 /// state before spawning a worker.
 pub(crate) const ANONYMOUS_INDEX: usize = usize::MAX;
 
-/// 1-based display of a pool index, safe for the anonymous quota whose
-/// sentinel index is `usize::MAX` (an `index + 1` would overflow in debug
-/// builds).
-fn display_index(index: usize) -> usize {
+// The pool-member wording for a log line: the anonymous quota has no
+// token, so "token #N" would name something that does not exist. The
+// number is the 0-based pool position — it matches the `tokens.json` key
+// only for a contiguous duplicate-free file (the duplicate warning keeps
+// them aligned), so "token #1" points the user at the `"1"` entry of the
+// file.
+fn pool_member(index: usize) -> String {
     if index == ANONYMOUS_INDEX {
-        0
+        "the anonymous quota".to_string()
     } else {
-        index + 1
+        format!("token #{}", index)
     }
 }
 
@@ -28,6 +31,22 @@ fn display_index(index: usize) -> usize {
 /// Personal access tokens (classic) start with `ghp_`, fine-grained ones with
 /// `github_pat_`.
 const VALID_TOKEN_PREFIXES: [&str; 2] = ["ghp_", "github_pat_"];
+
+/// Upper bound on a `--token-file` read: a token file is a JSON object of a
+/// handful of tokens (a few hundred bytes). A FIFO (`--token-file mypipe`)
+/// would block forever with no diagnostic, and a character device like
+/// `/dev/zero` (valid UTF-8 NUL bytes) grows the read without bound until
+/// the process is killed — neither is ever a token file, so both fail fast
+/// like any other invalid input instead.
+const MAX_TOKEN_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Upper bound on an API response body read: a hostile or broken network
+/// path can announce (or stream) an arbitrarily large body inside the
+/// request timeout, and buffering it exhausts memory on the user's machine
+/// — inconsistent with the hostile-server defenses this module already
+/// enforces (request timeout, Retry-After cap, page-wrap guard). A GitHub
+/// API JSON body never approaches the cap.
+const MAX_RESPONSE_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Pool of GitHub API tokens with round-robin allocation.
 ///
@@ -65,6 +84,91 @@ impl std::fmt::Debug for TokenPool {
             .field("exhausted", &self.exhausted)
             .finish()
     }
+}
+
+/// The same masking rule as the prefix rejection: a short value is
+/// masked entirely, a long one keeps only its 4-char excerpt. Real
+/// tokens are far longer than the excerpt: only then may the first
+/// four characters be shown. A short rejected value (a typo like
+/// `--token abc`) would otherwise be echoed in full, breaking the
+/// "never the full secret" contract.
+fn masked_excerpt(token: &str) -> String {
+    if token.chars().count() > 8 {
+        format!("{}***", token.chars().take(4).collect::<String>())
+    } else {
+        "***".to_string()
+    }
+}
+
+/// What a 403/429 response means for the token that made the request
+/// (see [`TokenPool`]'s client classification).
+enum RateLimitClass {
+    /// The hourly quota is spent: the token is retired for the rest of the
+    /// process and the request rotates to the next live token.
+    Primary,
+    /// The quota is not spent but the token must slow down: parked for the
+    /// carried window, then retried.
+    Secondary(std::time::Duration),
+    /// A permanent refusal (a private resource, a missing token scope):
+    /// surfacing it as a token failure would drain the pool for nothing.
+    Permanent,
+}
+
+/// Reads and parses one token file: the metadata gate (a regular file, at
+/// most [`MAX_TOKEN_FILE_BYTES`]), the read (size-gated by the metadata
+/// check), the UTF-8 BOM strip
+/// (Windows editors prepend it: the JSON parse would otherwise fail with a
+/// bare "expected value at line 1 column 1" on a file that looks perfectly
+/// fine in the editor that produced it — the same BOM-strip rule the bulk
+/// emails reader applies, see `read_addresses` in `crate::email`) and the
+/// parse. Every failure names the file (Debug-escaped once, with its
+/// surrounding quotes trimmed: the Display arm escapes the whole payload a
+/// second time, so a raw `{path:?}` would print doubled quotes), like
+/// every user-typed payload of the crafted "invalid token file" family.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidTokenFile`] for every shape problem and
+/// [`Error::Io`] (via `read_file_error`) for a missing or unreadable file.
+/// Never panics.
+fn read_token_json(path: &Path) -> Result<Value, Error> {
+    let metadata = std::fs::metadata(path).map_err(|err| crate::errors::read_file_error(
+        path,
+        err,
+        "for tokens: copy tokens.example.json to tokens.json and paste your tokens from github.com/settings/tokens",
+    ))?;
+    // bounded per the MAX_TOKEN_FILE_BYTES rationale
+    let path_label = format!("{path:?}").trim_matches('"').to_string();
+    if !metadata.is_file() {
+        return Err(Error::InvalidTokenFile(format!(
+            "{path_label}: not a regular file"
+        )));
+    }
+    if metadata.len() > MAX_TOKEN_FILE_BYTES {
+        return Err(Error::InvalidTokenFile(format!(
+            "{path_label}: file is {} bytes, the maximum is {MAX_TOKEN_FILE_BYTES}",
+            metadata.len()
+        )));
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|err| crate::errors::read_file_error(
+            path,
+            err,
+            "for tokens: copy tokens.example.json to tokens.json and paste your tokens from github.com/settings/tokens",
+        ))?;
+    let raw = match raw.strip_prefix('\u{feff}') {
+        Some(stripped) => stripped.to_string(),
+        None => raw,
+    };
+    serde_json::from_str(&raw).map_err(|err| {
+        // the malformed-JSON case is a broken file, not a broken value: it
+        // belongs to the crafted "invalid token file" family, and it must
+        // name the file (the bare serde message "expected value at line 1
+        // column 1" alone leaves the user guessing which input failed).
+        // Debug-escaped like every user-typed payload and every sibling
+        // InvalidTokenFile variant
+        Error::InvalidTokenFile(format!("{path_label}: {err}"))
+    })
 }
 
 impl TokenPool {
@@ -113,32 +217,15 @@ impl TokenPool {
     /// Validation happens at load time, so an invalid file fails before
     /// any scan. Never panics.
     pub fn from_token_file(path: &Path) -> Result<Self, Error> {
-        // the read failure names the file (see `read_file_error`): a bare
-        // "No such file or directory" would leave the user guessing which
-        // typed input failed
-        let raw = std::fs::read_to_string(path)
-            .map_err(|err| crate::errors::read_file_error(path, err))?;
-        // Windows editors (Notepad, PowerShell redirects) prepend a UTF-8
-        // BOM: left in place, the JSON parse fails with a bare "expected
-        // value at line 1 column 1" on a file that looks perfectly fine in
-        // the editor that produced it. The same BOM-strip rule the bulk
-        // emails reader applies (see `read_addresses` in `crate::email`).
-        let raw = match raw.strip_prefix('\u{feff}') {
-            Some(stripped) => stripped.to_string(),
-            None => raw,
-        };
-        let parsed: Value = serde_json::from_str(&raw).map_err(|err| {
-            // the malformed-JSON case is a broken file, not a broken value:
-            // it belongs to the crafted "invalid token file" family, and it
-            // must name the file (the bare serde message "expected value at
-            // line 1 column 1" alone leaves the user guessing which input
-            // failed). Debug-escaped like every InvalidTokenFile payload
-            Error::InvalidTokenFile(format!("{}: {err}", path.display()))
-        })?;
+        let parsed = read_token_json(path)?;
+        // the path is embedded Debug-escaped once, with its surrounding
+        // quotes trimmed (see [`read_token_json`]): every remaining error
+        // names the file the same way
+        let path_label = format!("{path:?}").trim_matches('"').to_string();
         let object = parsed.as_object().ok_or_else(|| {
-            Error::InvalidTokenFile(
-                "token file must be a JSON object of indexes to tokens".to_string(),
-            )
+            Error::InvalidTokenFile(format!(
+                "{path_label}: token file must be a JSON object of indexes to tokens"
+            ))
         })?;
 
         // Sort by numeric index so the pool order matches the file order even
@@ -147,7 +234,9 @@ impl TokenPool {
         let mut entries: Vec<(usize, &Value)> = Vec::with_capacity(object.len());
         for (key, value) in object {
             let index = key.parse::<usize>().map_err(|_| {
-                Error::InvalidTokenFile(format!("token file key {key:?} is not a numeric index"))
+                Error::InvalidTokenFile(format!(
+                    "{path_label}: token file key {key:?} is not a numeric index"
+                ))
             })?;
             entries.push((index, value));
         }
@@ -156,7 +245,9 @@ impl TokenPool {
         let mut tokens: Vec<String> = Vec::new();
         for (index, value) in entries {
             let token = value.as_str().ok_or_else(|| {
-                Error::InvalidTokenFile(format!("token file entry {index} is not a string"))
+                Error::InvalidTokenFile(format!(
+                    "{path_label}: token file entry {index} is not a string"
+                ))
             })?;
             // same paste-artifact rule as `from_token`: spaces around a
             // token value would fail every request with a misleading
@@ -190,10 +281,9 @@ impl TokenPool {
         // promise of this constructor. An explicit empty `--token` stays the
         // documented way to request anonymous access.
         if tokens.is_empty() {
-            return Err(Error::InvalidTokenFile(
-                "token file contains no usable token (missing, empty or duplicated entries)"
-                    .to_string(),
-            ));
+            return Err(Error::InvalidTokenFile(format!(
+                "{path_label}: token file contains no usable token (missing, empty or duplicated entries)"
+            )));
         }
 
         Ok(Self {
@@ -223,16 +313,13 @@ impl TokenPool {
     /// The error payload is a masked excerpt of the token so that no full
     /// secret ever leaks into logs.
     fn validate(token: &str) -> Result<(), Error> {
-        if token.chars().any(char::is_control) {
-            // the same masking rule as the prefix rejection: a short value
-            // is masked entirely, a long one keeps only its 4-char excerpt
-            let masked = if token.chars().count() > 8 {
-                format!("{}***", token.chars().take(4).collect::<String>())
-            } else {
-                "***".to_string()
-            };
+        if token
+            .chars()
+            .any(|c| char::is_control(c) || c.is_whitespace())
+        {
             return Err(Error::InvalidTokenFormat(format!(
-                "{masked} (contains a control character)"
+                "{} (contains a control character or whitespace)",
+                masked_excerpt(token)
             )));
         }
         if VALID_TOKEN_PREFIXES
@@ -240,15 +327,8 @@ impl TokenPool {
             .any(|prefix| token.starts_with(prefix))
         {
             Ok(())
-        } else if token.chars().count() > 8 {
-            // Real tokens are far longer than the excerpt: only then may the
-            // first four characters be shown. A short rejected value (a
-            // typo like `--token abc`) would otherwise be echoed in full,
-            // breaking the "never the full secret" contract.
-            let masked: String = token.chars().take(4).collect();
-            Err(Error::InvalidTokenFormat(format!("{masked}***")))
         } else {
-            Err(Error::InvalidTokenFormat("***".to_string()))
+            Err(Error::InvalidTokenFormat(masked_excerpt(token)))
         }
     }
 
@@ -508,8 +588,9 @@ impl Client {
     ///
     /// Every failure is enumerated above: [`Error::RateLimitExhausted`],
     /// [`Error::TokenRejected`], [`Error::PrivateOrUnavailable`],
-    /// [`Error::NotFound`], [`Error::EmptyRepository`], [`Error::Json`] and
-    /// [`Error::Http`]. Never panics.
+    /// [`Error::NotFound`], [`Error::EmptyRepository`], [`Error::Io`] (an
+    /// oversized announced body), [`Error::Json`] and [`Error::Http`].
+    /// Never panics.
     pub fn get_json(&self, url: &str) -> Result<Value, Error> {
         // One attempt per token, plus one extra round for the zero-cost retry
         // a `Retry-After: 0` (or any already-elapsed window) explicitly
@@ -529,99 +610,48 @@ impl Client {
             if status == reqwest::StatusCode::FORBIDDEN
                 || status == reqwest::StatusCode::TOO_MANY_REQUESTS
             {
-                let has_retry_after = response
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .is_some();
-                let retry_after = Self::retry_after(&response);
-                let exhausted = Self::quota_exhausted(&response);
-                // The `/search/` endpoints run on a separate, per-minute quota
-                // whose exhaustion responses carry the *search* quota's
-                // `X-RateLimit-Remaining: 0` — the token's hourly core quota
-                // is then untouched, and the search window resets within
-                // seconds. Retiring a healthy token over a hot search minute
-                // would kill single-token runs and burn through multi-token
-                // pools one token per minute, so a spent *search* quota is
-                // always transient. Live GitHub search exhaustion 403s do not
-                // always carry a `Retry-After` header, so the classification
-                // keys on the request path or the `X-RateLimit-Resource:
-                // search` header, never on the window header.
-                // A 429 is always a secondary (transient) limit, even with a
-                // spent-quota header: classifying it as a primary exhaustion
-                // would let a hostile proxy answering every request with
-                // `429` + `Remaining: 0` permanently drain the whole pool
-                // one token per response, although no hourly quota was ever
-                // spent. The check is therefore gated on the status before
-                // the quota header is consulted.
-                let spent_search_quota = exhausted
-                    && (Self::is_search_endpoint(url)
-                        || response
-                            .headers()
-                            .get("x-ratelimit-resource")
-                            .and_then(|value| value.to_str().ok())
-                            == Some("search"));
-                if status != reqwest::StatusCode::TOO_MANY_REQUESTS
-                    && exhausted
-                    && !spent_search_quota
-                {
-                    // Primary rate limit: the hourly quota is spent, retire
-                    // the token and rotate to the next one.
-                    log::info!(
-                        "token #{} has used up its hourly allowance{}",
-                        display_index(index),
-                        if self.tokens.has_other_live(index) {
-                            ": switching to the next available token"
-                        } else {
-                            " and no other token is available"
-                        }
-                    );
-                    self.tokens.mark_exhausted(index);
-                    continue;
-                }
-                let body = response.text().unwrap_or_default();
-                // Any 403/429 that survived the primary-exhaustion check
-                // above and carries a `Retry-After` header is transient,
-                // even when the value is not integer seconds (the RFC 7231
-                // HTTP-date form parses to `None`): a `Retry-After` header
-                // signals a retryable condition, so the token is parked for
-                // the default window instead of the response being treated
-                // as a permanent refusal. A spent search quota is transient
-                // by the same token (see above), window header or not. A
-                // core 403 with both `X-RateLimit-Remaining: 0` and
-                // `Retry-After` never reaches this branch: the primary
-                // classification above retires it (the hourly quota is
-                // spent — sleeping for the wrong window would be worse).
-                let secondary = status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                    || has_retry_after
-                    || spent_search_quota
-                    || Self::body_says_secondary(&body);
-                if secondary {
-                    // Park the token until its window passes (the quota is
-                    // not spent) and rotate to the next live token.
-                    let window = retry_after.unwrap_or(Self::DEFAULT_SECONDARY_PARK);
-                    let deadline = Instant::now() + window;
-                    log::info!(
-                        "GitHub asked token #{} to slow down: pausing it for {} seconds, \
-                         then switching to another token if one is available",
-                        display_index(index),
-                        window.as_secs()
-                    );
-                    self.tokens.mark_limited_until(index, deadline);
-                    if self.tokens.has_other_live(index) {
-                        continue; // rotate to the next live token and retry
-                    }
-                    if window == Duration::ZERO {
-                        // A `Retry-After: 0` (or an already-elapsed window)
-                        // leaves the token live again immediately: an immediate
-                        // retry is explicitly authorized and costs no sleep
-                        // (the extra loop round above bounds hostile servers).
+                // the error-path body is bounded like the success path (see
+                // [`MAX_RESPONSE_BODY_BYTES`]): a hostile 403/429 must not
+                // be able to exhaust memory any more than a hostile 200
+                Self::ensure_bounded_body(&response)?;
+                match Self::classify_rate_limit(url, status, response) {
+                    RateLimitClass::Primary => {
+                        // Primary rate limit: the hourly quota is spent,
+                        // retire the token and rotate to the next one.
+                        self.retire_with_log(
+                            index,
+                            &format!("{} has used up its hourly allowance", pool_member(index)),
+                        );
                         continue;
                     }
-                    break; // nothing to rotate to: sleeping would only delay the failure
+                    RateLimitClass::Secondary(window) => {
+                        // Park the token until its window passes (the quota
+                        // is not spent) and rotate to the next live token.
+                        let deadline = Instant::now() + window;
+                        log::info!(
+                            "GitHub asked {} to slow down: pausing it for {} seconds, \
+                             then switching to another token if one is available",
+                            pool_member(index),
+                            window.as_secs()
+                        );
+                        self.tokens.mark_limited_until(index, deadline);
+                        if self.tokens.has_other_live(index) {
+                            continue; // rotate to the next live token and retry
+                        }
+                        if window == Duration::ZERO {
+                            // A `Retry-After: 0` (or an already-elapsed
+                            // window) leaves the token live again
+                            // immediately: an immediate retry is explicitly
+                            // authorized and costs no sleep (the extra loop
+                            // round above bounds hostile servers).
+                            continue;
+                        }
+                        break; // nothing to rotate to: sleeping would only delay the failure
+                    }
+                    // Permanent 403 (private resource, missing token scope,
+                    // SSO not authorized…).
+                    RateLimitClass::Permanent => return Err(Error::PrivateOrUnavailable),
                 }
-                // Permanent 403 (private resource, missing token scope,
-                // SSO not authorized…).
-                return Err(Error::PrivateOrUnavailable);
             }
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 // The token itself was rejected (revoked, invalid, expired):
@@ -629,16 +659,10 @@ impl Client {
                 // exists, mirroring the worker pools' token-scoped 401
                 // handling. A revoked token in `tokens.json` must not abort
                 // the whole run while healthy tokens sit in the pool.
-                log::info!(
-                    "token #{} was rejected by GitHub (HTTP 401){}",
-                    display_index(index),
-                    if self.tokens.has_other_live(index) {
-                        ": switching to the next available token"
-                    } else {
-                        " and no other token is available"
-                    }
+                self.retire_with_log(
+                    index,
+                    &format!("{} was rejected by GitHub (HTTP 401)", pool_member(index)),
                 );
-                self.tokens.mark_exhausted(index);
                 if self.tokens.has_other_live(index) {
                     continue; // rotate to the next live token and retry
                 }
@@ -666,10 +690,97 @@ impl Client {
                 }
             }
             let response = response.error_for_status()?;
+            Self::ensure_bounded_body(&response)?;
             self.successful_requests.fetch_add(1, Ordering::Relaxed);
             return response.json::<Value>().map_err(Error::from);
         }
         Err(Error::RateLimitExhausted)
+    }
+
+    /// The oversized-body guard shared by the success and error paths (see
+    /// [`MAX_RESPONSE_BODY_BYTES`]): a hostile or broken intermediary must
+    /// not be able to exhaust memory inside the request timeout, whatever
+    /// the status code. A chunked body with no announced length keeps no
+    /// cap here — the announced-length path is the one a hostile server
+    /// controls.
+    fn ensure_bounded_body(response: &reqwest::blocking::Response) -> Result<(), Error> {
+        if let Some(len) = response
+            .content_length()
+            .filter(|len| *len > MAX_RESPONSE_BODY_BYTES)
+        {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "GitHub response body too large: {len} bytes, the maximum is {MAX_RESPONSE_BODY_BYTES} — check your connection (a proxy or captive portal can inject oversized responses) and try again"
+                ),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Retires a token with its plain-English cause and the rotation
+    /// status: one wording for every "this token is done" path.
+    fn retire_with_log(&self, index: usize, reason: &str) {
+        log::info!(
+            "{reason}{}",
+            if self.tokens.has_other_live(index) {
+                ": switching to the next available token"
+            } else {
+                " and no other token is available"
+            }
+        );
+        self.tokens.mark_exhausted(index);
+    }
+
+    /// Classifies a 403/429 response: the hourly quota is spent
+    /// ([`RateLimitClass::Primary`], the token is retired), the quota is
+    /// not spent but the token must slow down
+    /// ([`RateLimitClass::Secondary`], parked for the given window), or the
+    /// refusal is permanent (a private resource, a missing token scope).
+    /// Consumes the response: the body only matters to the classification.
+    fn classify_rate_limit(
+        url: &str,
+        status: reqwest::StatusCode,
+        response: reqwest::blocking::Response,
+    ) -> RateLimitClass {
+        let has_retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .is_some();
+        let retry_after = Self::retry_after(&response);
+        let exhausted = Self::quota_exhausted(&response);
+        // The rationale (search quota vs core quota, hostile
+        // 429-flooding) lives in the `get_json` doc comment.
+        let spent_search_quota = exhausted
+            && (Self::is_search_endpoint(url)
+                || response
+                    .headers()
+                    .get("x-ratelimit-resource")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("search"));
+        if status != reqwest::StatusCode::TOO_MANY_REQUESTS && exhausted && !spent_search_quota {
+            return RateLimitClass::Primary;
+        }
+        let body = response.text().unwrap_or_default();
+        // Any 403/429 that survived the primary-exhaustion check above and
+        // carries a `Retry-After` header is transient, even when the value
+        // is not integer seconds (the RFC 7231 HTTP-date form parses to
+        // `None`): a `Retry-After` header signals a retryable condition, so
+        // the token is parked for the default window instead of the
+        // response being treated as a permanent refusal. A spent search
+        // quota is transient by the same token (see above), window header
+        // or not. A core 403 with both `X-RateLimit-Remaining: 0` and
+        // `Retry-After` never reaches this branch: the primary
+        // classification above retires it (the hourly quota is spent —
+        // sleeping for the wrong window would be worse).
+        let transient_limit = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || has_retry_after
+            || spent_search_quota
+            || Self::body_says_rate_limited(&body);
+        if transient_limit {
+            return RateLimitClass::Secondary(retry_after.unwrap_or(Self::DEFAULT_SECONDARY_PARK));
+        }
+        RateLimitClass::Permanent
     }
 
     /// Whether a response body announces a transient rate limit (GitHub's
@@ -679,7 +790,7 @@ impl Client {
     /// the scan while another token still has budget — or, worse, make a
     /// fully rate-limited scan skip every repository as resource-scoped
     /// failures and exit 0 with a complete-looking empty report.
-    fn body_says_secondary(body: &str) -> bool {
+    fn body_says_rate_limited(body: &str) -> bool {
         let body = body.to_ascii_lowercase();
         body.contains("secondary rate limit")
             || body.contains("abuse")
@@ -697,15 +808,9 @@ impl Client {
     /// a repository *named* `commits`) must not be reported as an "empty
     /// repository".
     fn is_commits_endpoint(url: &str) -> bool {
-        let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-        // the path starts at the first `/` after the host (same technique
-        // as `is_search_endpoint`), so the host/port is never counted as a
-        // path segment
-        let Some(slash) = without_scheme.find('/') else {
+        let Some(path) = Self::url_path(url) else {
             return false;
         };
-        let path = &without_scheme[slash..];
-        let path = path.split(['?', '#']).next().unwrap_or(path);
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         if segments.last() != Some(&"commits") {
             return false;
@@ -727,12 +832,16 @@ impl Client {
     /// the token for a doomed retry every window instead of retiring a
     /// genuinely spent hourly quota).
     fn is_search_endpoint(url: &str) -> bool {
+        Self::url_path(url).is_some_and(|path| path.starts_with("/search/"))
+    }
+
+    /// The URL path (everything from the first `/` after the host, query
+    /// and fragment stripped): the shared shape both endpoint classifiers
+    /// key on, so the host/port is never counted as a path segment.
+    fn url_path(url: &str) -> Option<&str> {
         let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-        match without_scheme.find('/') {
-            // the path starts at the first `/` after the host
-            Some(slash) => without_scheme[slash..].starts_with("/search/"),
-            None => false,
-        }
+        let path = &without_scheme[without_scheme.find('/')?..];
+        Some(path.split(['?', '#']).next().unwrap_or(path))
     }
 
     /// Whether a 403/429 response announces a spent hourly quota
@@ -786,15 +895,6 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
-    fn temp_token_file(contents: &str, unique: u32) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "git2mail_token_pool_test_{}_{unique}.json",
-            std::process::id()
-        ));
-        std::fs::write(&path, contents).expect("test setup: write temp file");
-        path
-    }
-
     #[test]
     fn from_token_accepts_valid_classic_token() {
         let pool = TokenPool::from_token("ghp_abcdefghij").expect("ghp_ token must be valid");
@@ -844,7 +944,7 @@ mod tests {
 
     #[test]
     fn from_token_file_loads_tokens_in_numeric_index_order() {
-        let path = temp_token_file(
+        let path = crate::github::mock::temp_token_file(
             r#"{"0": "ghp_first", "10": "ghp_tenth", "2": "ghp_second"}"#,
             1,
         );
@@ -862,7 +962,7 @@ mod tests {
 
     #[test]
     fn from_token_file_rejects_non_json_object() {
-        let path = temp_token_file(r#"["ghp_first"]"#, 2);
+        let path = crate::github::mock::temp_token_file(r#"["ghp_first"]"#, 2);
         let error = TokenPool::from_token_file(&path).expect_err("must fail");
         std::fs::remove_file(&path).ok();
         assert!(matches!(error, Error::InvalidTokenFile(_)));
@@ -882,7 +982,7 @@ mod tests {
         // line 1 column 1" on a file that looks fine in the editor that
         // produced it (the bulk-emails reader strips the same BOM). The
         // token file must load with the BOM stripped
-        let path = temp_token_file("\u{feff}{\"0\": \"ghp_bom\"}", 8);
+        let path = crate::github::mock::temp_token_file("\u{feff}{\"0\": \"ghp_bom\"}", 8);
         let pool = TokenPool::from_token_file(&path).expect("a BOM-prefixed file must load");
         std::fs::remove_file(&path).ok();
         assert_eq!(pool.acquire(), Some((0, "ghp_bom".to_string())));
@@ -894,7 +994,7 @@ mod tests {
         // ("JSON error: expected value at line 1 column 1") with no file
         // named: the failure belongs to the crafted "invalid token file"
         // family and must carry the path
-        let path = temp_token_file("not json at all", 9);
+        let path = crate::github::mock::temp_token_file("not json at all", 9);
         let error = TokenPool::from_token_file(&path).expect_err("must fail");
         std::fs::remove_file(&path).ok();
         assert!(matches!(error, Error::InvalidTokenFile(_)));
@@ -902,11 +1002,14 @@ mod tests {
             error.to_string().contains(&path.display().to_string()),
             "the malformed-JSON error must name the file: {error}"
         );
+        // the path is debug-escaped: a control character in it cannot pass
+        // raw into the error line
+        assert!(!error.to_string().contains('\u{1b}'));
     }
 
     #[test]
     fn from_token_file_rejects_invalid_token_format() {
-        let path = temp_token_file(r#"{"0": "ghp_ok", "1": "oops"}"#, 3);
+        let path = crate::github::mock::temp_token_file(r#"{"0": "ghp_ok", "1": "oops"}"#, 3);
         let error = TokenPool::from_token_file(&path).expect_err("must fail");
         std::fs::remove_file(&path).ok();
         // a short rejected value is masked entirely: echoing it (even partly)
@@ -934,7 +1037,7 @@ mod tests {
         // run to anonymous access (60 req/h) and only surface much later as
         // a confusing RateLimitExhausted: it must fail at load time instead
         for contents in [r#"{}"#, r#"{"0": ""}"#] {
-            let path = temp_token_file(contents, 7);
+            let path = crate::github::mock::temp_token_file(contents, 7);
             let error = TokenPool::from_token_file(&path).expect_err("must fail");
             std::fs::remove_file(&path).ok();
             assert!(
@@ -946,7 +1049,7 @@ mod tests {
 
     #[test]
     fn from_token_file_skips_empty_entries() {
-        let path = temp_token_file(r#"{"0": "ghp_real", "1": ""}"#, 4);
+        let path = crate::github::mock::temp_token_file(r#"{"0": "ghp_real", "1": ""}"#, 4);
         let pool = TokenPool::from_token_file(&path).expect("token file must load");
         std::fs::remove_file(&path).ok();
         assert_eq!(pool.len(), 1);
@@ -958,7 +1061,10 @@ mod tests {
         // two indexes holding the same secret are one token, not a second
         // quota: keeping both would make a primary exhaustion "rotate" to
         // the same dead secret and let two workers share one quota
-        let path = temp_token_file(r#"{"0": "ghp_same", "1": "ghp_same", "2": "ghp_other"}"#, 6);
+        let path = crate::github::mock::temp_token_file(
+            r#"{"0": "ghp_same", "1": "ghp_same", "2": "ghp_other"}"#,
+            6,
+        );
         let pool = TokenPool::from_token_file(&path).expect("token file must load");
         std::fs::remove_file(&path).ok();
         assert_eq!(pool.len(), 2);
@@ -1022,7 +1128,7 @@ mod tests {
 
     #[test]
     fn from_token_file_rejects_non_numeric_keys() {
-        let path = temp_token_file(r#"{"0": "ghp_ok", "foo": "ghp_bad"}"#, 5);
+        let path = crate::github::mock::temp_token_file(r#"{"0": "ghp_ok", "foo": "ghp_bad"}"#, 5);
         let error = TokenPool::from_token_file(&path).expect_err("must fail");
         std::fs::remove_file(&path).ok();
         assert!(matches!(error, Error::InvalidTokenFile(details) if details.contains("foo")));
@@ -1141,9 +1247,11 @@ mod tests {
             (200, vec![], r#"{"ok": true}"#.to_string())
         });
 
-        let pool =
-            TokenPool::from_token_file(&temp_token_file(r#"{"0": "ghp_a", "1": "ghp_b"}"#, 30))
-                .expect("token file must load");
+        let pool = TokenPool::from_token_file(&crate::github::mock::temp_token_file(
+            r#"{"0": "ghp_a", "1": "ghp_b"}"#,
+            30,
+        ))
+        .expect("token file must load");
         let client = Client::new(pool).expect("client must build");
         let json = client
             .get_json(&format!("{address}/search/repositories?q=x"))
@@ -1165,6 +1273,123 @@ mod tests {
     }
 
     #[test]
+    fn from_token_rejects_internal_whitespace_in_the_value() {
+        // a space is a legal header-value byte: a token like `ghp_ abc`
+        // used to pass load-time validation, be sent verbatim in the
+        // Authorization header and only fail at request time with a 401 —
+        // the fail-fast validation promise must cover whitespace like it
+        // covers control characters
+        let error = TokenPool::from_token("ghp_ abc").expect_err("must fail");
+        assert!(
+            matches!(&error, Error::InvalidTokenFormat(details) if details.contains("whitespace")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn from_token_file_rejects_an_oversized_file() {
+        // the read is bounded by metadata before any byte is buffered: a
+        // mispointed huge file must fail fast with a named-file error
+        // instead of being fully buffered (a character device like
+        // /dev/zero would grow the read without bound until the OOM killer
+        // steps in — not portably testable here, the metadata guard covers
+        // it with the same check)
+        let path = std::env::temp_dir().join(format!(
+            "git2mail_token_pool_oversized_test_{}.json",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).expect("test setup: create temp file");
+        file.set_len(MAX_TOKEN_FILE_BYTES + 1)
+            .expect("test setup: size the sparse temp file");
+        drop(file);
+        let error = TokenPool::from_token_file(&path).expect_err("must fail");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&error, Error::InvalidTokenFile(details) if details.contains("the maximum is")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn from_token_file_rejects_a_non_regular_file() {
+        // a directory is never a token file: it fails fast with the same
+        // named-file error contract as any other structural problem (a
+        // FIFO would block forever — not portably testable here, the
+        // metadata guard covers it with the same check)
+        let error = TokenPool::from_token_file(&std::env::temp_dir()).expect_err("must fail");
+        assert!(
+            matches!(&error, Error::InvalidTokenFile(details) if details.contains("not a regular file")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn get_json_rejects_an_oversized_response_body() {
+        use crate::github::mock::serve_requests;
+        // the body is bounded before parsing when its length is announced:
+        // a hostile or broken intermediary announcing a multi-gigabyte body
+        // must produce an error instead of a buffered read inside the
+        // request timeout (the mismatching body is never read)
+        let (address, server) = serve_requests(move |_, _| {
+            (
+                200,
+                vec![(
+                    "Content-Length".to_string(),
+                    (MAX_RESPONSE_BODY_BYTES + 1).to_string(),
+                )],
+                r#"{"ok": true}"#.to_string(),
+            )
+        });
+        let pool = TokenPool::from_token_file(&crate::github::mock::temp_token_file(
+            r#"{"0": "ghp_a"}"#,
+            32,
+        ))
+        .expect("token file must load");
+        let client = Client::new(pool).expect("client must build");
+        let error = client
+            .get_json(&format!("{address}/repos/owner/repo/commits"))
+            .expect_err("an oversized announced body must be rejected");
+        server.join();
+        assert!(
+            error.to_string().contains("too large"),
+            "the error must name the bound: {error}"
+        );
+    }
+
+    #[test]
+    fn a_403_with_an_oversized_announced_body_is_rejected_not_classified() {
+        use crate::github::mock::serve_requests;
+        // the error-path body is bounded like the success path: a hostile
+        // 403 announcing a multi-gigabyte body must produce the
+        // oversized-body error instead of being classified (and possibly
+        // parked) with a buffered read (the mismatching body is never read)
+        let (address, server) = serve_requests(move |_, _| {
+            (
+                403,
+                vec![(
+                    "Content-Length".to_string(),
+                    (MAX_RESPONSE_BODY_BYTES + 1).to_string(),
+                )],
+                "secondary rate limit".to_string(),
+            )
+        });
+        let pool = TokenPool::from_token_file(&crate::github::mock::temp_token_file(
+            r#"{"0": "ghp_a"}"#,
+            32,
+        ))
+        .expect("token file must load");
+        let client = Client::new(pool).expect("client must build");
+        let error = client
+            .get_json(&format!("{address}/repos/owner/repo/commits"))
+            .expect_err("an oversized announced 403 body must be rejected");
+        server.join();
+        assert!(
+            error.to_string().contains("too large"),
+            "the error must name the bound: {error}"
+        );
+    }
+
+    #[test]
     fn a_core_quota_403_without_a_retry_after_still_retires() {
         use crate::github::mock::serve_requests;
         // The search-quota exemption must not swallow a genuinely spent
@@ -1182,9 +1407,11 @@ mod tests {
             (200, vec![], r#"{"ok": true}"#.to_string())
         });
 
-        let pool =
-            TokenPool::from_token_file(&temp_token_file(r#"{"0": "ghp_a", "1": "ghp_b"}"#, 31))
-                .expect("token file must load");
+        let pool = TokenPool::from_token_file(&crate::github::mock::temp_token_file(
+            r#"{"0": "ghp_a", "1": "ghp_b"}"#,
+            31,
+        ))
+        .expect("token file must load");
         let client = Client::new(pool).expect("client must build");
         client
             .get_json(&format!("{address}/repos/owner/repo/commits"))

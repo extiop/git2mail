@@ -83,6 +83,8 @@ failure only when no token can serve the request.
 | Name pairs x domains | 64 x 64 | variant-generation inputs are truncated before generation |
 | Generated variants | 1000 | global cap on generated candidate addresses |
 | Custom patterns | 64 | `--variant-pattern` accepts at most 64 patterns |
+| Bulk addresses file | 64 MiB | a bulk addresses file larger than 64 MiB is refused before reading |
+| URL length | 2048 bytes | a URL longer than 2048 bytes is rejected before any request |
 
 ## Search
 

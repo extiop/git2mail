@@ -160,9 +160,10 @@ impl fmt::Display for Error {
             Error::RateLimitExhausted => {
                 write!(
                     f,
-                    "GitHub allowed no more requests this hour: every token's \
-                     allowance is used up — wait for the hour to reset, or add \
-                     more tokens with --token / --token-file"
+                    "GitHub allowed no more requests: every token's allowance \
+                     is used up (without --token: the shared anonymous \
+                     allowance is spent) — wait for the limit window to \
+                     reset, or add more tokens with --token / --token-file"
                 )
             }
             Error::TokenRejected => {
@@ -170,7 +171,7 @@ impl fmt::Display for Error {
                     f,
                     "GitHub refused the token (HTTP 401 Unauthorized): it is revoked, \
                      expired or mistyped — create a new token \
-                     on GitHub and update your --token-file"
+                     on GitHub and check your --token or --token-file value"
                 )
             }
             Error::SearchRejected => {
@@ -178,8 +179,8 @@ impl fmt::Display for Error {
                     f,
                     // single-line string, like the TokenRejected arm above
                     "GitHub rejected the search (HTTP 422): the `--user`/`--org` login may not \
-                     exist or be accessible, or a qualifier is invalid — check the target and the \
-                     search qualifiers"
+                     exist or be accessible, or a filter is invalid — check the target and the \
+                     search filters"
                 )
             }
             Error::NotFound => {
@@ -238,7 +239,7 @@ impl fmt::Display for Error {
             Error::InvalidProfile(details) => {
                 write!(
                     f,
-                    "GitHub returned an unusable profile for this account: \
+                    "GitHub returned an unusable payload for this account: \
                      {details} — try again later"
                 )
             }
@@ -289,15 +290,16 @@ impl From<io::Error> for Error {
 /// a Windows editor cannot be read as UTF-8). The path is Debug-escaped
 /// like every user-typed payload echoed to the terminal (control
 /// characters must not pass raw).
-pub(crate) fn read_file_error(path: &Path, err: io::Error) -> Error {
+pub(crate) fn read_file_error(path: &Path, err: io::Error, missing_hint: &str) -> Error {
     let hint = if err.kind() == io::ErrorKind::NotFound {
         // the most common first-run mistake: the highest-frequency case
-        // gets the most explicit guidance, naming the example file and
-        // where to get tokens
-        " — check the path: the file must exist in the folder you ran the \
-         command from (for tokens: copy tokens.example.json to tokens.json \
-         and paste your tokens from github.com/settings/tokens)"
-            .to_string()
+        // gets the most explicit guidance — each caller names its own
+        // remedy (a token file and a bulk addresses file are set up
+        // differently, and the same reader serves both)
+        format!(
+            " — check the path: the file must exist in the folder you ran \
+             the command from ({missing_hint})"
+        )
     } else if err.kind() == io::ErrorKind::InvalidData {
         " (is the file UTF-8-encoded? a file saved as UTF-16 cannot be read)".to_string()
     } else {
@@ -336,49 +338,41 @@ mod tests {
         let io_error = Error::Io(io::Error::other("disk on fire"));
         assert_eq!(io_error.to_string(), "disk on fire");
 
+        let rate_limit = Error::RateLimitExhausted.to_string();
         assert!(
-            Error::RateLimitExhausted
-                .to_string()
-                .contains("every token's allowance is used up")
-                && Error::RateLimitExhausted
-                    .to_string()
-                    .contains("--token-file"),
+            rate_limit.contains("every token's allowance is used up")
+                && rate_limit.contains("--token-file"),
             "the rate-limit error must carry its plain-language cause and its \
-             next step: {}",
-            Error::RateLimitExhausted
+             next step: {rate_limit}"
         );
         // the rejected-token variant carries the status and the next step
         // (create a new token), not raw reqwest jargon — and stays on one
         // terminal line (`eprintln!("[-] {err}")` cannot re-indent an
         // embedded newline, which would raggedly hard-wrap the message)
+        let token_rejected = Error::TokenRejected.to_string();
         assert!(
-            Error::TokenRejected
-                .to_string()
-                .contains("401 Unauthorized")
-                && Error::TokenRejected
-                    .to_string()
-                    .contains("create a new token")
-                && !Error::TokenRejected.to_string().contains('\n'),
-            "unexpected message: {}",
-            Error::TokenRejected
+            token_rejected.contains("401 Unauthorized")
+                && token_rejected.contains("create a new token")
+                && !token_rejected.contains('\n'),
+            "unexpected message: {token_rejected}"
         );
         // the rejected-search variant names the likely causes (a typo'd
         // --user/--org login reads like a tool failure in the raw message)
         // and stays on one terminal line, like the TokenRejected arm
+        let search_rejected = Error::SearchRejected.to_string();
         assert!(
-            Error::SearchRejected.to_string().contains("--user`/`--org")
-                && Error::SearchRejected.to_string().contains("422")
-                && !Error::SearchRejected.to_string().contains('\n'),
-            "unexpected message: {}",
-            Error::SearchRejected
+            search_rejected.contains("--user`/`--org")
+                && search_rejected.contains("422")
+                && !search_rejected.contains('\n'),
+            "unexpected message: {search_rejected}"
         );
         assert!(
             Error::NotFound.to_string().contains("check the spelling"),
             "the not-found error must carry its next step"
         );
+        let no_results = Error::NoResults.to_string();
         assert!(
-            Error::NoResults.to_string().contains("no email found")
-                && Error::NoResults.to_string().contains("git2mail email"),
+            no_results.contains("no email found") && no_results.contains("git2mail email"),
             "the no-result error must explain that the target is live"
         );
         assert!(
@@ -454,14 +448,8 @@ mod tests {
         );
         // the payload is API-derived and echoed to the terminal: control
         // characters are Debug-escaped, not printed raw (log forging)
-        assert!(
-            Error::Organization("a\nb".to_string())
-                .to_string()
-                .contains("is a GitHub organization")
-                && !Error::Organization("a\nb".to_string())
-                    .to_string()
-                    .contains("a\nb is")
-        );
+        let org_error = Error::Organization("a\nb".to_string()).to_string();
+        assert!(org_error.contains("is a GitHub organization") && !org_error.contains("a\nb is"));
         assert_eq!(
             Error::InvalidUsername("a b".to_string()).to_string(),
             "invalid GitHub username: \"a b\" (expected 1-39 ASCII letters, digits or hyphens, without \
@@ -475,7 +463,7 @@ mod tests {
         );
         assert_eq!(
             Error::InvalidProfile("missing `id`".to_string()).to_string(),
-            "GitHub returned an unusable profile for this account: missing \
+            "GitHub returned an unusable payload for this account: missing \
              `id` — try again later"
         );
         assert_eq!(
@@ -509,6 +497,8 @@ mod tests {
         let missing = read_file_error(
             Path::new("nope.json"),
             io::Error::from(io::ErrorKind::NotFound),
+            "for tokens: copy tokens.example.json to tokens.json and paste \
+             your tokens from github.com/settings/tokens",
         );
         assert_eq!(
             missing.to_string(),
@@ -517,12 +507,26 @@ mod tests {
              (for tokens: copy tokens.example.json to tokens.json and paste \
              your tokens from github.com/settings/tokens)"
         );
+        // the remedy is the caller's: a bulk addresses file gets its own
+        // guidance, not the token-file one
+        let missing_addresses = read_file_error(
+            Path::new("addresses.txt"),
+            io::Error::from(io::ErrorKind::NotFound),
+            "one email address per line, # comments allowed",
+        );
+        assert_eq!(
+            missing_addresses.to_string(),
+            "cannot read the file \"addresses.txt\": entity not found — check \
+             the path: the file must exist in the folder you ran the command \
+             from (one email address per line, # comments allowed)"
+        );
         let not_utf8 = read_file_error(
             Path::new("emails.txt"),
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "stream did not contain valid UTF-8",
             ),
+            "",
         );
         assert_eq!(
             not_utf8.to_string(),

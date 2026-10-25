@@ -1,13 +1,13 @@
-//! Organization investigation ): the public
+//! Organization investigation: the public
 //! members, the public repositories and the developers' emails found in
 //! their commits — 100% API (no clone, no scraping, no new dependency).
 //!
-//! No comparable OSINT tool supports organizations: `git2mail org <org>`
-//! fills that gap with the same building blocks as the rest of the crate:
+//! `git2mail org <org>` reuses the same building blocks as the rest of
+//! the crate:
 //!
 //! - the organization itself (`GET /orgs/{org}`; a 404 is a clean
 //!   [`crate::errors::Error::NotFound`]);
-//! - the **public members** (`GET /orgs/{org}/members`, paginated);
+//! - the **public members** (`GET /orgs/{org}/public_members`, paginated);
 //! - the **public repositories** (`GET /orgs/{org}/repos`, paginated,
 //!   capped by the optional `--limit`);
 //! - the **emails** found scanning those repositories' commits with the
@@ -34,6 +34,7 @@ use crate::consts::GITHUB_API_BASE;
 use crate::errors::Error;
 use crate::github::fetch_paginated;
 use crate::output::sanitize_log_text as log_safe;
+use crate::parsers::is_safe_repository_name;
 use crate::sources::{PER_PAGE, Scanner, SearchHit, sort_emails};
 use crate::user::validate_username;
 use log::info;
@@ -87,7 +88,7 @@ pub struct OrgScanned {
 pub struct OrgReport {
     /// The investigated organization.
     pub org: OrgInfo,
-    /// The public member logins (`GET /orgs/{org}/members`).
+    /// The public member logins (`GET /orgs/{org}/public_members`).
     pub members: Vec<String>,
     /// The public repository names (`GET /orgs/{org}/repos`).
     pub repositories: Vec<String>,
@@ -110,27 +111,77 @@ pub struct OrgReport {
 /// organizations follow the same login shape as users),
 /// [`Error::NotFound`] for a missing organization,
 /// [`Error::PrivateOrUnavailable`] or [`Error::RateLimitExhausted`] /
-/// [`Error::Http`] for the corresponding API failures. A repository that
-/// is private or deleted or empty (GitHub answers 409 on its commits
-/// listing) is skipped with a warning and does not abort the
-/// investigation; a rate-limit or transport failure aborts it, so the
-/// report can never silently miss whole repositories — including the kept
-/// partial result of a parallel scan whose dedicated token died mid-scan
-/// (it is reported as [`Error::RateLimitExhausted`] too, unless the dead
-/// token's workers had already covered every listed repository). `limit`
-/// (the optional `--limit`) caps the number of listed repositories. Never
-/// panics.
+/// [`Error::Http`] for the corresponding API failures. The skip-vs-abort
+/// contract is the module-level one. The kept partial result of a
+/// parallel scan whose dedicated token died mid-scan aborts with the
+/// token's real death error (a revoked token is not a spent allowance).
+/// `limit` (the optional `--limit`) caps the number of listed
+/// repositories. Never panics.
 pub fn investigate(scanner: &Scanner, org: &str, limit: Option<usize>) -> Result<OrgReport, Error> {
     investigate_at(scanner, GITHUB_API_BASE, org, limit)
 }
 
 /// The investigation itself, driven against one API base URL:
 /// [`investigate`] is the production entry point (`https://api.github.com`),
-/// and the offline tests run this same code against a loopback mock.
+/// and the offline tests run this same code against a loopback mock. It
+/// filters the raw listing (see [`is_safe_repository_name`]), composes the
+/// scan hits with the API's canonical login and scans them through
+/// [`scan_org_repositories`].
 ///
 /// # Errors
 ///
 /// The same failures as [`investigate`]. Never panics.
+///
+/// What the org repository scan feeds back to the report: the merged
+/// email list, the per-repository email map, how many repositories were
+/// fully scanned, and the token-death error (if any) the caller judges
+/// against the skip-vs-abort contract.
+type OrgScanFeedback = (
+    Vec<String>,
+    BTreeMap<String, Vec<String>>,
+    usize,
+    Option<Error>,
+);
+
+/// Filters the raw listing (untrusted API data: an entry whose name is
+/// empty, a dot segment or carries a path separator or query/fragment
+/// would corrupt the composed scan URL, see [`is_safe_repository_name`],
+/// and desynchronize the per-repository report keys from what was
+/// scanned), then scans the safe repositories with the parallel search's
+/// token-worker pool: every repository becomes a GitHub URL hit the
+/// workers parse and scan, exactly like a search result.
+fn scan_org_repositories(
+    scanner: &Scanner,
+    base: &str,
+    repositories: &[String],
+    canonical_login: &str,
+) -> Result<OrgScanFeedback, Error> {
+    let safe_repositories: Vec<&String> = repositories
+        .iter()
+        .filter(|repository| {
+            if is_safe_repository_name(repository) {
+                true
+            } else {
+                log::warn!(
+                    "skipping a malformed org listing entry: {}",
+                    log_safe(repository)
+                );
+                false
+            }
+        })
+        .collect();
+    let hits: Vec<SearchHit> = safe_repositories
+        .iter()
+        .map(|repository| SearchHit {
+            url: format!("https://github.com/{}/{repository}", canonical_login),
+            language: None,
+        })
+        .collect();
+    let (all, per_repository, repos_scanned, _, _, _, token_death_error) =
+        scanner.scan_repositories_at(base, &hits, false)?;
+    Ok((all, per_repository, repos_scanned, token_death_error))
+}
+
 fn investigate_at(
     scanner: &Scanner,
     base: &str,
@@ -159,44 +210,45 @@ fn investigate_at(
 
     let members: Vec<String> = fetch_paginated(
         client,
-        |page| format!("{base}/orgs/{org}/members?per_page={PER_PAGE}&page={page}"),
+        |page| format!("{base}/orgs/{org}/public_members?per_page={PER_PAGE}&page={page}"),
         parse_members_page,
         None,
     )?;
 
     let repositories: Vec<String> = fetch_paginated(
         client,
-        |page| format!("{base}/orgs/{org}/repos?per_page={PER_PAGE}&page={page}"),
+        |page| {
+            // type=public is explicit: the endpoint defaults to type=all,
+            // so an authenticated token able to see the org's private
+            // repositories would otherwise leak their names into the report
+            // inventory and burn a doomed 403 request (or worse) per one of
+            // them — the documented contract is the public repositories
+            format!("{base}/orgs/{org}/repos?type=public&per_page={PER_PAGE}&page={page}")
+        },
         parse_repos_page,
         limit,
     )?;
 
-    // the repositories are scanned with the parallel search's token-worker
-    // pool: every repository becomes a GitHub URL hit the workers parse and
-    // scan, exactly like a search result. The hits carry the canonical
-    // login from the API (`info.login`), not the login as typed: the
-    // per-repository keys of the report then always agree with
-    // `report.org.login`, whatever casing the user typed
-    let hits: Vec<SearchHit> = repositories
-        .iter()
-        .map(|repository| SearchHit {
-            url: format!("https://github.com/{}/{repository}", info.login),
-            language: None,
-        })
-        .collect();
-    let (all, per_repository, repos_scanned, skipped, _, token_death_partial) =
-        scanner.scan_repositories_at(base, &hits, false)?;
-    // the org contract (module doc and README): the report can never
-    // silently miss whole repositories. A repository that cannot be scanned
-    // on its own is legitimately skipped (counted in `skipped`), but a scan
-    // that kept a partial result after a dedicated token died mid-scan may
-    // have left repositories unscanned: abort with the rate-limit error
-    // instead of writing a complete-looking report, like any other
-    // rate-limit failure. A listed repository counts as covered only when it
-    // was actually scanned or explicitly skipped: work never pulled or left
-    // unfinished by a dead token is neither
-    if token_death_partial && repos_scanned + skipped < repositories.len() {
-        return Err(Error::RateLimitExhausted);
+    // the API resolves the org through redirects: a shape-valid login that
+    // differs from the requested one (beyond casing) is either a rename or
+    // a response the caller should know about — warn, then scan what the
+    // API actually returned
+    if !info.login.eq_ignore_ascii_case(org) {
+        log::warn!(
+            "the API resolved '{}' to '{}': scanning the resolved organization",
+            log_safe(org),
+            log_safe(&info.login)
+        );
+    }
+    let (all, per_repository, repos_scanned, token_death_error) =
+        scan_org_repositories(scanner, base, &repositories, &info.login)?;
+    // token death mid-scan: the skip-vs-abort contract is the module-level
+    // one, but a partial kept after a dedicated token died may have left
+    // repositories unscanned — abort with the token's real death error
+    // instead of writing a complete-looking report (a revoked token is not
+    // a spent allowance)
+    if let Some(death_error) = token_death_error {
+        return Err(death_error);
     }
     let mut all = all;
     sort_emails(&mut all);
@@ -235,12 +287,9 @@ fn parse_org(json: &Value) -> Result<OrgInfo, Error> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     };
-    let login = json
-        .get("login")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::InvalidProfile("organization payload: missing `login`".to_string()))?
-        .to_string();
+    let login = string_field("login").ok_or_else(|| {
+        Error::InvalidProfile("organization payload: missing `login`".to_string())
+    })?;
     Ok(OrgInfo {
         login,
         name: string_field("name"),
@@ -248,7 +297,7 @@ fn parse_org(json: &Value) -> Result<OrgInfo, Error> {
     })
 }
 
-/// Extracts the `login` of every member of a `/orgs/{org}/members` page,
+/// Extracts the `login` of every member of a `/orgs/{org}/public_members` page,
 /// together with the raw item count (the end-of-listing signal of
 /// `fetch_paginated`). An item without a login is skipped, not reported
 /// with an empty one. GitHub returns `[]` for an empty listing: a 200 body
@@ -261,17 +310,7 @@ fn parse_org(json: &Value) -> Result<OrgInfo, Error> {
 /// Returns [`Error::InvalidProfile`] when the body is not a JSON array.
 /// Never panics.
 fn parse_members_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
-    let Some(items) = json.as_array() else {
-        return Err(Error::InvalidProfile(
-            "members payload: not an array".to_string(),
-        ));
-    };
-    let members = items
-        .iter()
-        .filter_map(|item| item.get("login").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect();
-    Ok((members, items.len()))
+    parse_string_field_page(json, "login", "members")
 }
 
 /// Extracts the repository `name` of every repository of a
@@ -287,17 +326,35 @@ fn parse_members_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
 /// Returns [`Error::InvalidProfile`] when the body is not a JSON array.
 /// Never panics.
 fn parse_repos_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
+    parse_string_field_page(json, "name", "repositories")
+}
+
+/// Extracts one string field of every item of a listing page, together
+/// with the raw item count (the end-of-listing signal of
+/// `fetch_paginated`). Items without the field are skipped, not reported.
+/// A 200 body that is not a JSON array is an intermediary or a shape
+/// change, not an empty page, and must fail explicitly.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidProfile`] when the body is not a JSON array.
+/// Never panics.
+fn parse_string_field_page(
+    json: &Value,
+    field: &str,
+    label: &str,
+) -> Result<(Vec<String>, usize), Error> {
     let Some(items) = json.as_array() else {
-        return Err(Error::InvalidProfile(
-            "repositories payload: not an array".to_string(),
-        ));
+        return Err(Error::InvalidProfile(format!(
+            "{label} payload: not an array"
+        )));
     };
-    let repositories = items
+    let values = items
         .iter()
-        .filter_map(|item| item.get("name").and_then(Value::as_str))
+        .filter_map(|item| item.get(field).and_then(Value::as_str))
         .map(str::to_string)
         .collect();
-    Ok((repositories, items.len()))
+    Ok((values, items.len()))
 }
 
 impl OrgReport {
@@ -309,7 +366,7 @@ impl OrgReport {
     /// never forge or spoof log lines. Never panics.
     fn log_summary(&self) {
         info!("============ ORG ============");
-        info!("[+] GitHub name: {}", log_safe(&self.org.login));
+        info!("[+] login: {}", log_safe(&self.org.login));
         if let Some(name) = &self.org.name {
             info!("[+] name: {}", log_safe(name));
         }
@@ -320,7 +377,7 @@ impl OrgReport {
         info!("============ MEMBERS ============");
         if self.members.is_empty() {
             info!(
-                "[-] no public member listed (most companies hide this list — the emails below come from the repositories)"
+                "[-] no public member listed (the organization may keep this list private — the emails below come from the repositories)"
             );
         }
         for member in &self.members {
@@ -338,7 +395,7 @@ impl OrgReport {
         info!("============ EMAILS ============");
         if self.emails.all.is_empty() {
             info!(
-                "[-] no email found in these repositories' commits — try more repositories or add tokens"
+                "[-] no email found in these repositories' commits — scan again with more tokens (--token / --token-file), or a higher --limit if you set one"
             );
         }
         for (repository, emails) in &self.emails.per_repository {
@@ -368,23 +425,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    /// Extracts the `page=` query parameter of a mock request line,
-    /// robust to further parameters after it and to `per_page` sharing the
-    /// `page=` substring.
-    fn page_param(request: &[String]) -> u16 {
-        request
-            .first()
-            .map(|line| line.trim_end_matches(" HTTP/1.1"))
-            .and_then(|line| line.split('?').nth(1))
-            .and_then(|query| {
-                query.split('&').find_map(|param| {
-                    param
-                        .strip_prefix("page=")
-                        .and_then(|page| page.parse().ok())
-                })
-            })
-            .unwrap_or(0)
-    }
+    /// The org-info mock body every investigation starts from: the same
+    /// literal served verbatim at each listing test's fallback arm.
+    const ACME_ORG_INFO: &str = r#"{"login": "acme", "name": "Acme Corp"}"#;
 
     fn commit_json(name: &str, email: &str) -> String {
         serde_json::json!({ "commit": { "author": { "name": name, "email": email } } }).to_string()
@@ -543,7 +586,7 @@ mod tests {
         for endpoint in ["members", "repos"] {
             let (address, server) = serve_requests(move |_index, request| {
                 let line = request.first().map(String::as_str).unwrap_or("");
-                if line.contains("/orgs/acme/members") {
+                if line.contains("/orgs/acme/public_members") {
                     if endpoint == "members" {
                         return (200, vec![], r#"{"message": "HTML error page"}"#.to_string());
                     }
@@ -556,11 +599,7 @@ mod tests {
                     return (200, vec![], "[]".to_string());
                 }
                 // org info
-                (
-                    200,
-                    vec![],
-                    r#"{"login": "acme", "name": "Acme Corp"}"#.to_string(),
-                )
+                (200, vec![], ACME_ORG_INFO.to_string())
             });
 
             let scanner = Scanner::new(None, None).expect("anonymous scanner must build");
@@ -578,8 +617,8 @@ mod tests {
     fn members_are_listed_across_pages() {
         let (address, server) = serve_requests(move |_index, request| {
             let line = request.first().map(String::as_str).unwrap_or("");
-            if line.contains("/orgs/acme/members") {
-                let body = match page_param(request) {
+            if line.contains("/orgs/acme/public_members") {
+                let body = match crate::github::mock::request_line_page(request) {
                     1 => r#"[{"login": "alice"}, {"login": "bob"}]"#.to_string(),
                     2 => r#"[{"login": "carol"}, {"no_login": true}]"#.to_string(),
                     _ => "[]".to_string(),
@@ -623,16 +662,16 @@ mod tests {
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/orgs/acme/repos") {
                 if let Ok(mut pages) = recorded.lock() {
-                    pages.push(page_param(request));
+                    pages.push(crate::github::mock::request_line_page(request));
                 }
-                let body = match page_param(request) {
+                let body = match crate::github::mock::request_line_page(request) {
                     1 => r#"[{"name": "one"}, {"name": "two"}]"#.to_string(),
                     2 => r#"[{"name": "three"}]"#.to_string(),
                     _ => "[]".to_string(),
                 };
                 return (200, vec![], body);
             }
-            if line.contains("/orgs/acme/members") {
+            if line.contains("/orgs/acme/public_members") {
                 return (200, vec![], "[]".to_string());
             }
             if line.contains("/commits") {
@@ -641,11 +680,7 @@ mod tests {
                 return (404, vec![], String::new());
             }
             // org info
-            (
-                200,
-                vec![],
-                r#"{"login": "acme", "name": "Acme Corp"}"#.to_string(),
-            )
+            (200, vec![], ACME_ORG_INFO.to_string())
         });
 
         let scanner = token_scanner(false);
@@ -693,14 +728,14 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(300));
             }
             let line = request.first().map(String::as_str).unwrap_or("");
-            if line.contains("/orgs/acme/members") {
-                return match page_param(request) {
+            if line.contains("/orgs/acme/public_members") {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (200, vec![], r#"[{"login": "alice"}]"#.to_string()),
                     _ => (200, vec![], "[]".to_string()),
                 };
             }
             if line.contains("/orgs/acme/repos") {
-                return match page_param(request) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -710,23 +745,19 @@ mod tests {
                 };
             }
             if line.contains("/repos/acme/one/commits") {
-                return match page_param(request) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (200, vec![], full_commit_page("Alice", "alice@acme.com")),
                     _ => (200, vec![], "[]".to_string()),
                 };
             }
             if line.contains("/repos/acme/two/commits") {
-                return match page_param(request) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (200, vec![], full_commit_page("Bob", "bob@acme.com")),
                     _ => (200, vec![], "[]".to_string()),
                 };
             }
             // org info
-            (
-                200,
-                vec![],
-                r#"{"login": "acme", "name": "Acme Corp"}"#.to_string(),
-            )
+            (200, vec![], ACME_ORG_INFO.to_string())
         });
 
         // two tokens: two workers, one dedicated token each
@@ -779,7 +810,7 @@ mod tests {
         let (address, server) = serve_requests(move |_index, request| {
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/orgs/acme/repos") {
-                return match page_param(request) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -788,14 +819,14 @@ mod tests {
                     _ => (200, vec![], "[]".to_string()),
                 };
             }
-            if line.contains("/orgs/acme/members") {
+            if line.contains("/orgs/acme/public_members") {
                 return (200, vec![], "[]".to_string());
             }
             if line.contains("/repos/acme/one/commits") {
                 // page 1 holds one commit, page 2 ends the listing: the mock
                 // must behave like the API, or fetch_paginated walks every
                 // u16 page of the listing
-                return match page_param(request) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -814,11 +845,7 @@ mod tests {
                 );
             }
             // org info
-            (
-                200,
-                vec![],
-                r#"{"login": "acme", "name": "Acme Corp"}"#.to_string(),
-            )
+            (200, vec![], ACME_ORG_INFO.to_string())
         });
 
         let scanner = token_scanner(false);
@@ -832,6 +859,106 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_partial_result_after_a_token_death_aborts_with_the_real_cause() {
+        // the reduction keeps a partial result when a dedicated token dies
+        // with progress, whatever the death cause: the org caller must
+        // re-raise THAT cause. A revoked token (401 → `TokenRejected`) must
+        // not be misreported as "allowance used up — wait for the window"
+        let (address, server) = serve_requests(move |_index, request| {
+            let line = request.first().map(String::as_str).unwrap_or("");
+            if line.contains("/orgs/acme/repos") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        r#"[{"name": "one"}, {"name": "two"}]"#.to_string(),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            if line.contains("/orgs/acme/public_members") {
+                return (200, vec![], "[]".to_string());
+            }
+            if line.contains("/repos/acme/one/commits") {
+                // page 1 makes real progress, page 2 ends the listing
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        format!("[{}]", commit_json("Alice", "alice@acme.com")),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            if line.contains("/repos/acme/two/commits") {
+                // the dedicated token is revoked: the sole token cannot
+                // rotate, so the request surfaces `TokenRejected`
+                return (401, vec![], r#"{"message": "Bad credentials"}"#.to_string());
+            }
+            // org info
+            (200, vec![], ACME_ORG_INFO.to_string())
+        });
+
+        let scanner = token_scanner(false);
+        let error = investigate_at(&scanner, &address, "acme", None)
+            .expect_err("a kept partial result must abort the org scan");
+        server.join();
+        assert!(
+            matches!(error, Error::TokenRejected),
+            "the real death cause must surface, not a generic rate-limit error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_shape_valid_foreign_login_is_warned_not_silent() {
+        // a shape-valid login differing from the requested org (beyond
+        // casing) is a rename or an unexpected response: the terminal must
+        // say so instead of scanning a foreign org silently
+        let (address, server) = serve_requests(move |_index, request| {
+            let line = request.first().map(String::as_str).unwrap_or("");
+            if line.contains("/orgs/acme/repos") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (200, vec![], r#"[{"name": "one"}]"#.to_string()),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            if line.contains("/orgs/acme/public_members") {
+                return (200, vec![], "[]".to_string());
+            }
+            if line.contains("/repos/evilcorp/one/commits") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        format!("[{}]", commit_json("Alice", "alice@evilcorp.com")),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            // org info: shape-valid foreign login (same casing, different name)
+            (
+                200,
+                vec![],
+                r#"{"login": "evilcorp", "name": "Evil Corp"}"#.to_string(),
+            )
+        });
+
+        let scanner = token_scanner(false);
+        let (outcome, lines) =
+            crate::test_logger::capture(|| investigate_at(&scanner, &address, "acme", None));
+        let report = outcome.expect("a shape-valid foreign login must not abort the scan");
+        server.join();
+
+        assert_eq!(report.org.login, "evilcorp");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("resolved 'acme' to 'evilcorp'")),
+            "the resolution must be warned: {lines:?}"
+        );
+    }
+
+    #[test]
     fn the_scan_hits_carry_the_canonical_organization_login() {
         // the user types `ACME`, the API canonicalizes to `acme`: the
         // per-repository keys must agree with `report.org.login`, not echo
@@ -839,19 +966,19 @@ mod tests {
         let (address, server) = serve_requests(move |_index, request| {
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/orgs/ACME/repos") {
-                return match page_param(request) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (200, vec![], r#"[{"name": "one"}]"#.to_string()),
                     _ => (200, vec![], "[]".to_string()),
                 };
             }
-            if line.contains("/orgs/ACME/members") {
+            if line.contains("/orgs/ACME/public_members") {
                 return (200, vec![], "[]".to_string());
             }
             if line.contains("/repos/acme/one/commits") {
                 // page 1 holds one commit, page 2 ends the listing: the mock
                 // must behave like the API, or fetch_paginated walks every
                 // u16 page of the listing
-                return match page_param(request) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -861,11 +988,7 @@ mod tests {
                 };
             }
             // org info: the canonical login is lowercase
-            (
-                200,
-                vec![],
-                r#"{"login": "acme", "name": "Acme Corp"}"#.to_string(),
-            )
+            (200, vec![], ACME_ORG_INFO.to_string())
         });
 
         let scanner = token_scanner(false);
@@ -879,6 +1002,128 @@ mod tests {
             report.emails.per_repository.get("acme/one"),
             Some(&vec!["alice@acme.com".to_string()]),
             "the per-repository key must carry the canonical login"
+        );
+    }
+
+    #[test]
+    fn a_malformed_listing_name_is_skipped_with_a_warning_not_a_failure() {
+        // wiring test for the listing filter: a hostile ".." name would
+        // otherwise corrupt the composed scan URL and abort the whole org
+        // scan (the parsers reject it at composition time). The filter must
+        // warn-skip the entry so the scan completes on the sane repositories
+        let (address, server) = serve_requests(move |_index, request| {
+            let line = request.first().map(String::as_str).unwrap_or("");
+            if line.contains("/orgs/acme/repos") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        r#"[{"name": ".."}, {"name": "one"}]"#.to_string(),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            if line.contains("/orgs/acme/public_members") {
+                return (200, vec![], "[]".to_string());
+            }
+            if line.contains("/repos/acme/one/commits") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        format!("[{}]", commit_json("Alice", "alice@acme.com")),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            // org info
+            (200, vec![], ACME_ORG_INFO.to_string())
+        });
+
+        let scanner = token_scanner(false);
+        let (outcome, lines) =
+            crate::test_logger::capture(|| investigate_at(&scanner, &address, "acme", None));
+        let report = outcome.expect("the scan must succeed despite the malformed entry");
+        server.join();
+
+        // the inventory keeps the raw listing (the report must reflect what
+        // the org actually lists); the malformed entry is only excluded from
+        // the scanned set
+        assert_eq!(
+            report.repositories,
+            vec!["..".to_string(), "one".to_string()]
+        );
+        assert_eq!(report.scanned.repos, 1, "only the sane entry is scanned");
+        assert_eq!(
+            report.emails.per_repository.get("acme/one"),
+            Some(&vec!["alice@acme.com".to_string()])
+        );
+        assert!(
+            !report
+                .emails
+                .per_repository
+                .keys()
+                .any(|key| key.contains("..")),
+            "the malformed entry must never be scanned"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("skipping a malformed org listing entry")),
+            "the malformed entry must be reported: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_repositories_listing_requests_only_public_repositories() {
+        // the endpoint defaults to type=all: without the explicit type=public
+        // parameter an authenticated token able to see private repositories
+        // would leak their names into the report and burn a doomed request
+        // per one of them — the wire format is pinned here
+        let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let (address, server) = serve_requests(move |_index, request| {
+            if let Some(line) = request.first()
+                && let Ok(mut log) = recorded.lock()
+            {
+                log.push(line.clone());
+            }
+            let line = request.first().map(String::as_str).unwrap_or("");
+            if line.contains("/orgs/acme/repos") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (200, vec![], r#"[{"name": "one"}]"#.to_string()),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            if line.contains("/orgs/acme/public_members") {
+                return (200, vec![], "[]".to_string());
+            }
+            if line.contains("/repos/acme/one/commits") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        format!("[{}]", commit_json("Alice", "alice@acme.com")),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            // org info
+            (200, vec![], ACME_ORG_INFO.to_string())
+        });
+
+        let scanner = token_scanner(false);
+        let report =
+            investigate_at(&scanner, &address, "acme", None).expect("the scan must succeed");
+        server.join();
+
+        assert_eq!(report.org.login, "acme");
+        let requests = requests.lock().expect("the request log must lock");
+        assert!(
+            requests
+                .iter()
+                .any(|line| line.contains("/orgs/acme/repos?type=public&")),
+            "the repositories listing must request type=public: {requests:?}"
         );
     }
 

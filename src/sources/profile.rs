@@ -331,7 +331,7 @@ mod tests {
                 return (200, vec![], "[]".to_string());
             }
             if line.contains("/users/dev/repos") {
-                return match page_of(line) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -345,7 +345,7 @@ mod tests {
                 return (409, vec![], String::new());
             }
             if line.contains("/repos/dev/full/commits") {
-                return match page_of(line) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => {
                         // a full page of 100 commits (all attributing the
                         // same email): the page-size-aware commit listing
@@ -390,7 +390,7 @@ mod tests {
                 // page 1 holds the two repositories, page 2 ends the listing:
                 // the mock must behave like the API, or fetch_paginated walks
                 // every u16 page of the listing
-                return match page_of(line) {
+                return match crate::github::mock::request_line_page(request) {
                     1 => (
                         200,
                         vec![],
@@ -524,20 +524,5 @@ mod tests {
             "unexpected error: {error:?}"
         );
         assert_eq!(server.join(), 1);
-    }
-
-    /// Extracts the `page=` query parameter of a mock request line, robust
-    /// to `per_page` sharing the `page=` substring.
-    fn page_of(line: &str) -> u16 {
-        line.trim_end_matches(" HTTP/1.1")
-            .split('?')
-            .nth(1)
-            .and_then(|query| {
-                query
-                    .split('&')
-                    .find_map(|param| param.strip_prefix("page="))
-            })
-            .and_then(|page| page.parse().ok())
-            .unwrap_or(0)
     }
 }

@@ -4,6 +4,17 @@ Results are always saved in a `results` folder inside the folder you ran the com
 email; the `--json` report (if requested) is still written, with empty
 `emails`.
 
+## Terminal markers
+
+Report lines start with one of four markers: `[+]` (a finding or a success),
+`[!]` (a warning or an uncertain result), `[-]` (an error or an empty result)
+and `[.]` (an informational listing line, used by the `email` report for
+candidate accounts).
+
+The `scan` and `search` terminal reports end with a summary of the
+**top 5 authors** by commit count (their dominant language included); the
+complete author list is in the JSON report's `correlation.authors`.
+
 ## Layout
 
 | Scan | Path |
@@ -14,14 +25,14 @@ email; the `--json` report (if requested) is still written, with empty
 
 ## Text format (default)
 
-One email address per line, sorted (ASCII case-insensitive), deduplicated
+One email address per line, sorted case-insensitively, deduplicated
 across every scanned page and repository.
 
 Addresses on the `users.noreply.github.com` domain (GitHub's alias addresses, which are not real mailboxes) are excluded from the results.
 
-## JSON report (`--json <path>`)
+## JSON report (`--json <path>` or `--json -`)
 
-`--json <path>` additionally writes a JSON report at the path you give (for example `--json report.json`).
+`--json <path>` additionally writes a JSON report at the path you give (for example `--json report.json`). With `--json -`, the same JSON document is printed to stdout instead (only the JSON goes to stdout; the log stays on stderr), which makes the report pipeable into other tools.
 
 ```json
 {
@@ -36,7 +47,7 @@ Addresses on the `users.noreply.github.com` domain (GitHub's alias addresses, wh
         "emails": ["alice@example.com"],
         "repos": [
           { "name": "a/one", "language": "Rust" },
-          { "name": "b/two", "language": "Go" }
+          { "name": "b/two", "language": null }
         ],
         "languages": ["Rust", "Go"],
         "first_seen_repo": "a/one",
@@ -50,7 +61,9 @@ Addresses on the `users.noreply.github.com` domain (GitHub's alias addresses, wh
 The report is written after the text output, at the end of the scan. The
 `correlation` block groups the emails by commit author: for each author it
 lists every address seen in their commits, the repositories they appear in
-(with the repository's primary language), the languages ordered dominant
+(with the repository's primary language; `language` is `null` for `scan`
+runs, which do not spend an extra API call on it — only `search` fills it),
+the languages ordered dominant
 first (most commits, ties alphabetical), the repository where the author was first seen, and the total
 number of hits. A commit without a detected (non-noreply) email is not
 attributed; a commit with no author name is attributed under the email

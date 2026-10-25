@@ -14,14 +14,15 @@ use git2mail::user;
 use log::info;
 use std::path::PathBuf;
 
-/// CLI parameters shared by the `scan` and `search` subcommands.
+/// CLI parameters shared by every subcommand.
 #[derive(clap::Args)]
 struct SharedArgs {
     /// Authenticate with your GitHub token (raises the limit from 60 to
     /// 5000 requests/hour). Create one at github.com/settings/tokens.
     /// Typing it here leaves it visible in your shell history and to other
-    /// programs — prefer `--token-file`; when both are given, a non-empty
-    /// --token wins. `--token ""` on its own runs anonymously
+    /// programs — prefer `--token-file`; when both are given, a non-blank
+    /// --token wins (a whitespace-only --token falls through to
+    /// --token-file). `--token ""` on its own runs anonymously
     #[arg(short, long)]
     token: Option<String>,
     /// File holding one or more GitHub tokens, e.g. {"0": "ghp_…"} — each
@@ -205,10 +206,50 @@ fn non_empty_query(value: &str) -> Result<String, String> {
 
 /// The clap value parser of `user --variant-pattern`: the same client-side
 /// rejection as the library validation, surfaced as a clap usage error
-/// (exit 2) instead of a runtime error, like every malformed qualifier.
+/// (exit 2). Deliberately not the runtime qualifier path (--stars, --created
+/// and the like are validated against the API response shape and exit 1):
+/// two different validation layers, two different exits.
 fn variant_pattern_value(pattern: &str) -> Result<String, String> {
-    crate::user::validate_variant_pattern(pattern).map_err(|err| err.to_string())?;
+    user::validate_variant_pattern(pattern).map_err(|err| match err {
+        // the bare detail, escaping kept: clap already frames the rejection
+        // ("invalid value … for '--variant-pattern'"), the variant's own
+        // "invalid --variant-pattern" prefix would state the flag twice
+        Error::InvalidVariantPattern(details) => format!("{details:?}"),
+        other => other.to_string(),
+    })?;
     Ok(pattern.to_string())
+}
+
+/// Writes one JSON report when a `--json` path was requested, warning (not
+/// failing) on a write error: the caller surfaces its own primary error
+/// instead (the findings must not vanish from both outputs at once).
+fn write_json_best_effort<T: serde::Serialize>(path: Option<&PathBuf>, report: &T) {
+    if let Some(path) = path
+        && let Err(json_err) = output::write_report_json(path, report)
+    {
+        log::warn!("the JSON report could not be written either: {json_err}");
+    }
+}
+
+/// Runs one single-report subcommand (`email`, `emails`, `user`): builds
+/// the scanner from the shared `--token`/`--token-file` options, produces
+/// the report through `produce` and writes the JSON deliverable when
+/// `--json` was requested.
+///
+/// # Errors
+///
+/// Returns the first failure of the scanner build, the report production
+/// or the JSON write. Never panics.
+fn run_report_command<T: serde::Serialize>(
+    shared: &SharedArgs,
+    produce: impl FnOnce(&Scanner) -> Result<T, Error>,
+) -> Result<(), Error> {
+    let scanner = Scanner::new(shared.token.as_deref(), shared.token_file.as_deref())?;
+    let report = produce(&scanner)?;
+    if let Some(path) = shared.json.as_ref() {
+        output::write_report_json(path, &report)?;
+    }
+    Ok(())
 }
 
 fn run() -> Result<(), Error> {
@@ -249,33 +290,18 @@ fn run() -> Result<(), Error> {
             write_outputs(&url, mode, mode, &file_name, outcome, shared.json, &scanner)
         }
         Command::Email { address, shared } => {
-            let scanner = Scanner::new(shared.token.as_deref(), shared.token_file.as_deref())?;
-            let report = email::reverse(&scanner, &address)?;
-            if let Some(path) = shared.json {
-                output::write_report_json(&path, &report)?;
-            }
-            Ok(())
+            run_report_command(&shared, |scanner| email::reverse(scanner, &address))
         }
         Command::Emails { file, shared } => {
-            let scanner = Scanner::new(shared.token.as_deref(), shared.token_file.as_deref())?;
-            let report = email::reverse_bulk(&scanner, &file)?;
-            if let Some(path) = shared.json {
-                output::write_report_json(&path, &report)?;
-            }
-            Ok(())
+            run_report_command(&shared, |scanner| email::reverse_bulk(scanner, &file))
         }
         Command::User {
             username,
             variant_pattern,
             shared,
-        } => {
-            let scanner = Scanner::new(shared.token.as_deref(), shared.token_file.as_deref())?;
-            let report = user::investigate(&scanner, &username, &variant_pattern)?;
-            if let Some(path) = shared.json {
-                output::write_report_json(&path, &report)?;
-            }
-            Ok(())
-        }
+        } => run_report_command(&shared, |scanner| {
+            user::investigate(scanner, &username, &variant_pattern)
+        }),
         Command::Org {
             org: org_login,
             limit,
@@ -285,13 +311,15 @@ fn run() -> Result<(), Error> {
             let report = org::investigate(&scanner, &org_login, limit)?;
             // the same one-email-per-line result file the scan subcommands
             // write: the outreach workflow needs a paste-able list, not a
-            // terminal wall or a JSON file. An empty list stays silent (the
-            // JSON report still records the run); a real text-write failure
-            // surfaces like the scan paths. The JSON report is attempted in
-            // EVERY case: an explicit `--json` deliverable must not vanish
-            // on the empty run (the org scan spends the most API budget of
-            // any subcommand — scan-path parity). write_text logs the path
-            // itself: log nothing extra here
+            // terminal wall or a JSON file. An empty list is a successful
+            // run (user/email parity): log_summary already printed the
+            // org-scoped [-] no-results line, and NoResults' person-oriented
+            // advice does not apply to an org the user chose deliberately —
+            // only a real write failure surfaces. The JSON report is
+            // attempted in EVERY case: an explicit `--json` deliverable must
+            // not vanish on the empty run (the org scan spends the most API
+            // budget of any subcommand — scan-path parity). write_text logs
+            // the path itself: log nothing extra here
             let org_text = output::write_text("org", &report.org.login, &report.emails.all);
             if matches!(&org_text, Err(err) if !matches!(err, Error::NoResults)) {
                 // the text write failed: the user-requested JSON report must
@@ -299,11 +327,7 @@ fn run() -> Result<(), Error> {
                 // the findings must not vanish from both outputs at once);
                 // a JSON failure on top is warned about, then the text
                 // error is surfaced
-                if let Some(path) = shared.json.as_ref()
-                    && let Err(json_err) = output::write_report_json(path, &report)
-                {
-                    log::warn!("the JSON report could not be written either: {json_err}");
-                }
+                write_json_best_effort(shared.json.as_ref(), &report);
                 org_text.map(|_| ())?;
             } else {
                 // text written (or nothing found): the JSON deliverable is
@@ -312,7 +336,8 @@ fn run() -> Result<(), Error> {
                 if let Some(path) = shared.json.as_ref() {
                     output::write_report_json(path, &report)?;
                 }
-                org_text.map(|_| ())?;
+                // `NoResults` is success here (see the comment above): the
+                // enclosing `if` already filtered out every other `Err`
             }
             Ok(())
         }
@@ -380,6 +405,20 @@ fn write_outputs(
     json: Option<PathBuf>,
     scanner: &Scanner,
 ) -> Result<(), Error> {
+    // one JSON report writer for both paths below: the report is written
+    // either propagated (`?`) or best-effort (warn-only), per the caller
+    let write_scan_report_json = |path: &PathBuf| {
+        output::write_scan_report_json(
+            path,
+            target,
+            mode,
+            &outcome.emails,
+            outcome.repos_scanned,
+            scanner.requests_made(),
+            outcome.partial,
+            &outcome.correlation,
+        )
+    };
     let text_result = output::write_text(directory, file_name, &outcome.emails);
     if matches!(&text_result, Err(err) if !matches!(err, Error::NoResults)) {
         // the legacy text write failed: the user-requested JSON report must
@@ -389,19 +428,13 @@ fn write_outputs(
         // a read-only CWD). The text failure stays the surfaced error; if
         // the JSON write fails too, it is warned about on top of it
         if let Some(path) = json
-            && let Err(json_err) = output::write_json(
-                &path,
-                target,
-                mode,
-                &outcome.emails,
-                outcome.repos_scanned,
-                scanner.requests_made(),
-                outcome.partial,
-                &outcome.correlation,
-            )
+            && let Err(json_err) = write_scan_report_json(&path)
         {
             log::warn!("the JSON report could not be written either: {json_err}");
         }
+        // the terminal summary carries the correlation findings the failed
+        // text file no longer does: print it before the early return
+        outcome.correlation.log_summary();
         return text_result.map(|_| ());
     }
     // every non-`NoResults` error early-returned above, so `is_ok()` is
@@ -409,16 +442,7 @@ fn write_outputs(
     // fallback arm that a future condition widening would turn live
     let text_written = text_result.is_ok();
     if let Some(path) = json {
-        output::write_json(
-            &path,
-            target,
-            mode,
-            &outcome.emails,
-            outcome.repos_scanned,
-            scanner.requests_made(),
-            outcome.partial,
-            &outcome.correlation,
-        )?;
+        write_scan_report_json(&path)?;
     }
     // terminal-only summary of the correlated attributes (top authors with
     // their dominant language): the plain-text files stay unchanged
@@ -455,7 +479,8 @@ fn build_logger_with_ambient_filter(
     // (`#[doc(hidden)] pub extern crate`), which lets the helper name the
     // returned builder type without adding a direct dependency
     let mut builder = pretty_env_logger::formatted_builder();
-    // The terminal report vocabulary is `[+]` success / `[-]` error, so a
+    // The terminal report vocabulary is `[+]` success / `[-]` error /
+    // `[!]` warning / `[.]` informational listing, so a
     // warning must carry its own scannable marker (`[!]`) — otherwise a
     // partial-scan warning looks like progress chatter once colors are
     // stripped (redirect, screen reader, plain terminal). The marker is
@@ -794,6 +819,13 @@ mod tests {
                 "the malformed pattern {pattern:?} must be rejected at parse time"
             );
         }
+        // the length cap is enforced by the same value parser
+        let pattern = "x".repeat(129) + "{first}";
+        let cli = Cli::try_parse_from(["git2mail", "user", "jane", "--variant-pattern", &pattern]);
+        assert!(
+            cli.is_err(),
+            "an overlong pattern must be rejected at parse time"
+        );
     }
 
     #[test]
@@ -1033,6 +1065,9 @@ mod tests {
     /// `results/` layout: the text writer writes relative to the current
     /// directory, so the blocker-file scenarios must not touch the real
     /// workspace (the lock keeps parallel tests from racing the chdir).
+    /// Same idea as `output.rs`'s `in_temp_cwd`, kept local: the two
+    /// fixtures isolate different output layouts and must not share a lock
+    /// (their chdirs are orthogonal).
     fn in_temp_cwd<T>(f: impl FnOnce() -> T) -> T {
         use std::path::Path;
         use std::sync::{Mutex, OnceLock};
@@ -1071,7 +1106,7 @@ mod tests {
         // results` run, or a read-only CWD) blocks the legacy text layout:
         // the scan itself succeeded, so the user-requested JSON report must
         // still be written — a hard text-write failure used to abort before
-        // `write_json`, discarding the successful scan's findings from both
+        // `write_scan_report_json`, discarding the successful scan's findings from both
         // outputs at once. The text failure stays the surfaced error
         in_temp_cwd(|| {
             std::fs::write("results", "not a directory").expect("test setup: blocker file");

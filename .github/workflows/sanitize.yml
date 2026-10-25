@@ -18,8 +18,6 @@ jobs:
     strategy:
       matrix:
         changelog: [git2mail]
-        include:
-          - changelog: git2mail
 
     runs-on: ubuntu-latest
     steps:
