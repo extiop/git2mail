@@ -32,6 +32,14 @@ pub enum Error {
     InvalidTokenFile(String),
     /// Every token of the pool has been rate-limited (HTTP 403/429).
     RateLimitExhausted,
+    /// The run stopped because every token of the pool was **parked** by a
+    /// secondary rate limit (GitHub's per-minute search quota or an abuse
+    /// window): the allowances are not spent, the tokens come back on their
+    /// own within minutes. Distinct from [`Error::RateLimitExhausted`],
+    /// whose display names an hourly allowance and a one-hour wait — the
+    /// wrong advice after a per-minute search storm, and a misdiagnosis of
+    /// a healthy pool.
+    RateLimitPaused,
     /// GitHub answered HTTP 401 Unauthorized and no other token of the pool
     /// could take over: the credentials themselves were rejected (a revoked,
     /// expired, or scope-less token). Distinct from
@@ -169,6 +177,16 @@ impl fmt::Display for Error {
                      limit to reset, or add more tokens with --token / \
                      --token-file; emails found before the limit may \
                      not be saved"
+                )
+            }
+            Error::RateLimitPaused => {
+                write!(
+                    f,
+                    "GitHub paused every token with a secondary rate limit (too many \
+                     requests in a short window): the allowances are not spent and \
+                     the tokens come back within minutes — wait a few minutes and \
+                     rerun the command; results found before the pause may not be \
+                     saved"
                 )
             }
             Error::TokenRejected => {
@@ -360,6 +378,15 @@ mod tests {
                 && rate_limit.contains("--token-file"),
             "the rate-limit error must carry its plain-language cause and its \
              next step: {rate_limit}"
+        );
+        // the paused variant is distinct from the exhausted one: the tokens
+        // are parked, not spent, and the wait is minutes, not an hour
+        let paused = Error::RateLimitPaused.to_string();
+        assert!(
+            paused.contains("secondary rate limit")
+                && paused.contains("wait a few minutes")
+                && !paused.contains('\n'),
+            "unexpected message: {paused}"
         );
         // the rejected-token variant carries the status and the next step
         // (create a new token), not raw reqwest jargon — and stays on one

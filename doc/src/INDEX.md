@@ -7,16 +7,30 @@ a command-line tool: you type commands in a terminal, the text window on
 your computer (Terminal on Mac and Linux, PowerShell on Windows), instead
 of clicking buttons.
 
+> **Responsible use.** git2mail collects only publicly available data
+> through the GitHub REST API. Use it solely for lawful, authorized OSINT
+> research, in accordance with the GitHub Terms of Service and applicable
+> laws: email addresses are personal data in many jurisdictions, and the
+> `results/` and report files this tool writes hold them. The README's
+> [responsible-use note](https://github.com/extiop/git2mail#readme) and
+> [Prevention section](https://github.com/extiop/git2mail#prevention) cover
+> the handling duties in detail.
+
 ```
 git2mail scan   --url <github URL> [--token …|--token-file …] [--json <path>]
-git2mail search --query <q> [--language <l>] [--limit N]
+git2mail search --query <q> [--language <l>] [--limit N] [--include-forks]
                 [--token …|--token-file …] [--json <path>]
 git2mail email  <address> [--token …|--token-file …] [--json <path>]
 git2mail emails <file> [--token …|--token-file …] [--json <path>]
-git2mail user   <username> [--variant-pattern <p>]
+git2mail user   <username> [--variant-pattern <p>] [--include-forks]
                 [--token …|--token-file …] [--json <path>]
-git2mail org    <org> [--limit N] [--token …|--token-file …] [--json <path>]
+git2mail org    <org> [--limit N] [--include-forks]
+                [--token …|--token-file …] [--json <path>]
 ```
+
+Forked repositories are skipped by default on `user`, `org` and `search` (their
+commit history mirrors the upstream project's); `--include-forks` scans
+them too.
 
 `search` also accepts filter flags: `--stars`, `--forks`, `--size`,
 `--created`, `--pushed`, `--license`, `--topic`, `--user` and `--org`, with
@@ -60,9 +74,13 @@ pkg-config`).
   with explicit `From` conversions), panics never occur on the runtime
   path, and the test suite runs fully offline against a local HTTP mock.
 - **Blocking I/O with bounded parallelism.** Scans use `reqwest::blocking`
-  over `std` threads; the multi-repository search fan-out spawns
-  `min(live_token_count, repository_count)` workers, one live token per
-  worker, draining a shared queue of repositories. No async runtime.
+  over `std` threads; the multi-repository fan-outs (the keyword search and
+  the org scan, shared with the bulk reverse lookup) spawn
+  `min(token_count, work_count)` workers when tokens are configured, each
+  dedicated the next live token (retired or parked tokens are skipped),
+  draining a shared queue; an anonymous run uses a single shared-quota
+  worker, and if every configured token is already dead the run still
+  fails loudly. No async runtime.
 
 ## Tokens
 

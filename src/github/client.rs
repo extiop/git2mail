@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Pool index used for the anonymous (token-less) quota. `pub(crate)` so the
 /// parallel-scan worker pools can consult the anonymous quota's exhaustion
@@ -25,6 +25,138 @@ fn pool_member(index: usize) -> String {
     } else {
         format!("token #{}", index)
     }
+}
+
+/// The first SET variable of a scope (hyper-util's `get_first_env`): an
+/// empty value still counts as set (it shadows the lowercase twin and the
+/// fallback resolves it).
+fn first_set_proxy(
+    lookup: &impl Fn(&str) -> Option<String>,
+    names: [&str; 2],
+) -> Option<(String, String)> {
+    names
+        .iter()
+        .find_map(|name| lookup(name).map(|value| ((*name).to_string(), value)))
+}
+
+/// The scheme name for a log line: the raw scheme lowercased, or `http`
+/// for a scheme-less value (the stack's assumption).
+fn proxy_scheme_for_log(value: &str) -> String {
+    value
+        .split_once("://")
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .unwrap_or_else(|| "http".to_string())
+}
+
+/// Whether the pinned stack (hyper-util's system matcher over `http::Uri`)
+/// would actually USE this proxy env value. Mirrors its acceptance rules:
+/// the `http`/`https` schemes are normalized case-insensitively, the
+/// `socks4`/`socks4a`/`socks5`/`socks5h` schemes are matched CASE-
+/// SENSITIVELY, a scheme-less value is used as an http proxy ONLY in bare
+/// authority form (a path, query or fragment byte makes the URI invalid),
+/// the whole value must be printable ASCII without the URI-rejected
+/// delimiters, and the authority must survive http-1.5.0's
+/// `validate_authority_bytes` (mirrored by `authority_parses`).
+fn proxy_value_usable(value: &str) -> bool {
+    // the strict authority byte set applied to the WHOLE value: it
+    // over-rejects some path bytes the stack accepts, which only
+    // over-warns (the safe direction)
+    let uri_shaped = value.bytes().all(|byte| {
+        (0x21..=0x7E).contains(&byte)
+            && !matches!(
+                byte,
+                b'|' | b'"' | b'<' | b'>' | b'{' | b'}' | b'^' | b'`' | b'\\'
+            )
+    }) && value.matches('[').count() == value.matches(']').count();
+    if !uri_shaped {
+        return false;
+    }
+    let authority = match value.split_once("://") {
+        Some((scheme, rest)) => {
+            let supported = matches!(scheme, "socks4" | "socks4a" | "socks5" | "socks5h")
+                || scheme.eq_ignore_ascii_case("http")
+                || scheme.eq_ignore_ascii_case("https");
+            if !supported {
+                return false;
+            }
+            // the authority ends at the first path/query/fragment byte
+            match rest.find(['/', '?', '#']) {
+                Some(end) => &rest[..end],
+                None => rest,
+            }
+        }
+        // scheme-less: the stack parses the WHOLE value as an authority
+        None => {
+            if value.contains(['/', '?', '#']) {
+                return false;
+            }
+            value
+        }
+    };
+    authority_parses(authority)
+}
+
+/// A sequential mirror of http-1.5.0's `validate_authority_bytes` (the
+/// validator every proxy URI's authority runs through): bracket state
+/// (`]` before `[`, nested or repeated pairs rejected), the port-colon
+/// counter (an unbracketed IPv6 or a doubled port ends above 1 and is
+/// rejected, while a bracket pair resets it), `%` confined to the
+/// userinfo or the bracketed zone id (a `%` in the hostname fails at the
+/// end), and no empty host after the userinfo's `@`. Any divergence in
+/// the accepted direction would announce a proxy the stack silently
+/// drops, the exact silent de-anonymization this check exists to prevent.
+fn authority_parses(authority: &str) -> bool {
+    if authority.is_empty() {
+        return false; // Empty
+    }
+    let (mut colon_cnt, mut start_bracket, mut end_bracket, mut has_percent) =
+        (0, false, false, false);
+    let mut at_sign_pos = authority.len();
+    let mut end = authority.len();
+    for (index, byte) in authority.bytes().enumerate() {
+        match byte {
+            b'/' | b'?' | b'#' => {
+                end = index; // the authority ends; a path/query follows
+                break;
+            }
+            b'%' => has_percent = true,
+            b':' => {
+                // the stack's MAX_COLONS cap (8): the 9th colon since the
+                // last reset is rejected MID-LOOP (TooManyColons), even
+                // when a later '@' or ']' would have cleared the count
+                if colon_cnt >= 8 {
+                    return false;
+                }
+                colon_cnt += 1;
+            }
+            b'[' => {
+                if has_percent || start_bracket {
+                    return false; // InvalidBracketUsage
+                }
+                start_bracket = true;
+            }
+            b']' => {
+                if !start_bracket || end_bracket {
+                    return false; // InvalidBracketUsage
+                }
+                end_bracket = true;
+                // the colons and the `%` were part of the IPv6 address
+                colon_cnt = 0;
+                has_percent = false;
+            }
+            b'@' => {
+                at_sign_pos = index;
+                // the colons and the `%` were part of the userinfo
+                colon_cnt = 0;
+                has_percent = false;
+            }
+            _ => {}
+        }
+    }
+    start_bracket == end_bracket // MismatchedBrackets
+        && colon_cnt <= 1 // InvalidAuthority
+        && !(end > 0 && at_sign_pos == end - 1) // EmptyAfterAt
+        && !has_percent // InvalidPercent
 }
 
 /// Accepted GitHub token prefixes.
@@ -103,9 +235,13 @@ fn masked_excerpt(token: &str) -> String {
 /// What a 403/429 response means for the token that made the request
 /// (see [`TokenPool`]'s client classification).
 enum RateLimitClass {
-    /// The hourly quota is spent: the token is retired for the rest of the
-    /// process and the request rotates to the next live token.
-    Primary,
+    /// The hourly quota is spent: the token is parked until the window the
+    /// `x-ratelimit-reset` header names (capped, so a hostile header cannot
+    /// park it forever) and the request rotates to the next live token;
+    /// when the header is absent the token is retired for the rest of the
+    /// process instead (a spent allowance with no known reset must not be
+    /// retried on a guess).
+    Primary(Option<std::time::Duration>),
     /// The quota is not spent but the token must slow down: parked for the
     /// carried window, then retried.
     Secondary(std::time::Duration),
@@ -495,6 +631,7 @@ impl Client {
     /// Returns [`Error::Http`] when the underlying HTTP client (its TLS
     /// backend) cannot be built. Never panics.
     pub fn new(tokens: TokenPool) -> Result<Self, Error> {
+        Self::warn_on_proxy_env(|name| std::env::var(name).ok());
         let http = reqwest::blocking::Client::builder()
             .connect_timeout(Self::REQUEST_TIMEOUT)
             .timeout(Self::REQUEST_TIMEOUT)
@@ -520,6 +657,104 @@ impl Client {
         &self.tokens
     }
 
+    /// The proxy environment variables the HTTP stack honors, resolved
+    /// EXACTLY like the pinned stack (hyper-util's system matcher): the
+    /// https scope reads `HTTPS_PROXY`/`https_proxy` (the FIRST SET one,
+    /// even empty — an empty value shadows the lowercase twin) and falls
+    /// back to `ALL_PROXY`/`all_proxy` when the primary is unusable. A
+    /// set-but-unusable value (a typo'd scheme, a missing `://`, a path or
+    /// query on a scheme-less value, whitespace or a URI-rejected byte) is
+    /// silently ignored by the underlying client — the run then leaves from
+    /// the REAL IP while the user believes they are behind their proxy or
+    /// Tor, which for a privacy-sensitive run is silent de-anonymization —
+    /// so the startup names what is used and what is ignored, loudly.
+    /// `HTTP_PROXY` is named too (git2mail's traffic is HTTPS-only, so an
+    /// http-scope proxy is never used for it), a set `NO_PROXY` is warned
+    /// about (it can bypass the proxy for some hosts), and a set
+    /// `REQUEST_METHOD` (the stack's CGI marker) makes it discard EVERY
+    /// proxy variable. The variable VALUES are never logged (a proxy URL
+    /// can carry embedded credentials); only the variable name and the
+    /// scheme are.
+    fn warn_on_proxy_env(lookup: impl Fn(&str) -> Option<String>) {
+        // the stack's CGI marker: set, every proxy variable is discarded
+        let any_set = [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ]
+        .iter()
+        .any(|name| lookup(name).is_some_and(|value| !value.trim().is_empty()));
+        if lookup("REQUEST_METHOD").is_some() {
+            if any_set {
+                log::warn!(
+                    "REQUEST_METHOD is set (the HTTP stack's CGI marker): every proxy \
+                     variable is discarded and requests go DIRECT from your real IP — \
+                     unset it or run outside a CGI environment before a sensitive run"
+                );
+            }
+            return;
+        }
+        let primary = first_set_proxy(&lookup, ["HTTPS_PROXY", "https_proxy"]);
+        let fallback = first_set_proxy(&lookup, ["ALL_PROXY", "all_proxy"]);
+        if let Some((name, value)) = first_set_proxy(&lookup, ["HTTP_PROXY", "http_proxy"])
+            .filter(|(_, value)| !value.trim().is_empty())
+        {
+            // the stack maps the http scope to http-scheme traffic only,
+            // and git2mail speaks only HTTPS: the variable is never used
+            log::info!(
+                "[.] {name} is set ({} proxy): git2mail's traffic is HTTPS-only, \
+                     so an http-scope proxy is never used for it",
+                proxy_scheme_for_log(&value)
+            );
+        }
+        let primary_usable = primary
+            .as_ref()
+            .is_some_and(|(_, value)| proxy_value_usable(value));
+        let fallback_usable = fallback
+            .as_ref()
+            .is_some_and(|(_, value)| proxy_value_usable(value));
+        if let Some((name, value)) = primary
+            .as_ref()
+            .filter(|(_, value)| proxy_value_usable(value))
+        {
+            log::info!(
+                "[.] egress proxy in use: {name} is set ({} proxy)",
+                proxy_scheme_for_log(value)
+            );
+        } else if let Some((name, value)) = fallback
+            .as_ref()
+            .filter(|(_, value)| proxy_value_usable(value))
+        {
+            if let Some((name, _)) = &primary {
+                log::warn!(
+                    "{name} is set but the HTTP stack cannot use it (empty, or not a parsable \
+                     proxy URI): its ALL_PROXY fallback is used instead"
+                );
+            }
+            log::info!(
+                "[.] egress proxy in use: {name} is set ({} proxy)",
+                proxy_scheme_for_log(value)
+            );
+        } else if let Some((name, _)) = primary.as_ref().or(fallback.as_ref()) {
+            log::warn!(
+                "{name} is set but the HTTP stack cannot use it (empty, an unsupported \
+                 scheme, or not a parsable proxy URI): requests go DIRECT from your real \
+                 IP — fix the variable or unset it before a sensitive run"
+            );
+        }
+        let proxy_in_use = primary_usable || fallback_usable;
+        let no_proxy = lookup("NO_PROXY").or_else(|| lookup("no_proxy"));
+        if proxy_in_use && no_proxy.is_some_and(|value| !value.trim().is_empty()) {
+            log::warn!(
+                "NO_PROXY is set: it can bypass the proxy for some hosts — verify your \
+                 exit IP before a sensitive run"
+            );
+        }
+    }
+
     /// How many successful (2xx) requests were made through this client so
     /// far, i.e. roughly how many pages were fetched.
     pub fn requests_made(&self) -> usize {
@@ -532,16 +767,20 @@ impl Client {
     /// pool. Two cases are distinguished:
     ///
     /// - primary quota exhaustion (403 with `X-RateLimit-Remaining: 0`): the
-    ///   token is retired for the rest of the process, then we rotate —
-    ///   except when the spent quota is the *search* quota: the `/search/`
-    ///   endpoints run on a separate, per-minute quota whose exhaustion also
-    ///   carries `Remaining: 0`, but the token's hourly core quota is
-    ///   untouched there and the search window resets within seconds, so the
-    ///   response is transient (park, don't retire). Live GitHub search
-    ///   exhaustion 403s do not always carry a `Retry-After` header, so the
-    ///   search classification keys on the request path or the
-    ///   `X-RateLimit-Resource: search` header, never on the window header.
-    ///   Retiring a healthy token over a hot search minute would kill
+    ///   token is parked until the instant the `x-ratelimit-reset` header
+    ///   names (capped at one hour), then rotates — the spent allowance is a
+    ///   pause, not a death, so the token rejoins the pool at the reset. When
+    ///   the header is absent (a middlebox stripped it), the token is retired
+    ///   for the rest of the process instead of being retried on a guessed
+    ///   window — except when the spent quota is the *search* quota: the
+    ///   `/search/` endpoints run on a separate, per-minute quota whose
+    ///   exhaustion also carries `Remaining: 0`, but the token's hourly core
+    ///   quota is untouched there and the search window resets within
+    ///   seconds, so the response is transient (park, don't retire). Live
+    ///   GitHub search exhaustion 403s do not always carry a `Retry-After`
+    ///   header, so the search classification keys on the request path or
+    ///   the `X-RateLimit-Resource: search` header, never on the window
+    ///   header. Retiring a healthy token over a hot search minute would kill
     ///   single-token runs and burn through multi-token pools one token per
     ///   minute. A 429 is never a primary exhaustion: 429 means "too many
     ///   requests, slow down" (a transient condition), so even a 429
@@ -556,10 +795,11 @@ impl Client {
     ///   nothing). A window that has already elapsed (`Retry-After: 0`) is
     ///   retried immediately at no cost. Precedence: a 403 that also carries
     ///   the primary exhaustion's `X-RateLimit-Remaining: 0` is classified
-    ///   as a primary limit first and retires the token even with the
-    ///   `Retry-After` header — the hourly core quota is spent, and sleeping
-    ///   for a potentially wrong, possibly hour-long window would be worse
-    ///   than rotating to a healthy token;
+    ///   as a primary limit first and parks the token until the named reset
+    ///   (or retires it without a reset header) even with the `Retry-After`
+    ///   header — the hourly core quota is spent, and sleeping for a
+    ///   potentially wrong, possibly hour-long window would be worse than
+    ///   rotating to a healthy token;
     ///
     /// A successful response whose `X-RateLimit-Remaining` happens to be `0`
     /// (the request that consumed the last credit of the hour) is a valid
@@ -572,8 +812,10 @@ impl Client {
     /// semantics the parallel worker pools apply. With nothing to rotate to,
     /// the rejection surfaces as [`Error::TokenRejected`].
     ///
-    /// Once no token can be acquired, [`Error::RateLimitExhausted`] is
-    /// returned (no infinite loop, no wasted sleep).
+    /// Once no token can be acquired, the parked-pool error is returned:
+    /// [`Error::RateLimitExhausted`] when the pool drained on spent hourly
+    /// allowances, [`Error::RateLimitPaused`] when it drained on secondary
+    /// pauses (no infinite loop, no wasted sleep).
     ///
     /// Any other 403 is permanent (private resource, missing token scope,
     /// SSO not authorized…) and maps to [`Error::PrivateOrUnavailable`].
@@ -596,6 +838,11 @@ impl Client {
         // authorizes: the park-deadline has then already passed, so retrying
         // costs no sleep. The +1 keeps even a hostile server answering every
         // retry with `Retry-After: 0` bounded (no infinite loop).
+        // The failure the loop ends with: the classification of the park
+        // that drained the pool (a spent hourly allowance vs a secondary
+        // pause carry different user advice), kept instead of a blanket
+        // "exhausted" for every stop.
+        let mut stop: Option<Error> = None;
         for _ in 0..self.tokens.attempts() + 1 {
             let Some((index, token)) = self.tokens.acquire() else {
                 break; // every token of the pool is currently unusable
@@ -614,20 +861,57 @@ impl Client {
                 // be able to exhaust memory any more than a hostile 200
                 Self::ensure_bounded_body(&response)?;
                 match Self::classify_rate_limit(url, status, response) {
-                    RateLimitClass::Primary => {
-                        // Primary rate limit: the hourly quota is spent,
-                        // retire the token and rotate to the next one.
-                        self.retire_with_log(
-                            index,
-                            &format!("{} has used up its hourly allowance", pool_member(index)),
-                        );
-                        continue;
-                    }
+                    RateLimitClass::Primary(reset) => match reset {
+                        Some(window) => {
+                            // The hourly quota is spent, but GitHub names
+                            // the reset instant: park the token until then
+                            // (it comes back on its own) and rotate to the
+                            // next live token. A spent allowance is a pause,
+                            // not a death: in a long parallel scan the token
+                            // rejoins the pool at the reset instead of
+                            // being lost for the rest of the process.
+                            let deadline = Instant::now() + window;
+                            log::warn!(
+                                "{} has used up its hourly allowance: pausing it until the \
+                                 window resets (in about {} minutes), then switching to another \
+                                 token if one is available",
+                                pool_member(index),
+                                window.as_secs() / 60 + 1
+                            );
+                            self.tokens.mark_limited_until(index, deadline);
+                            if window == Duration::ZERO {
+                                // A reset that has already elapsed (a stale
+                                // header, a slow clock) leaves the token
+                                // live again immediately: the immediate
+                                // retry costs no sleep (the extra loop
+                                // round bounds hostile servers).
+                                continue;
+                            }
+                            if self.tokens.has_other_live(index) {
+                                continue; // rotate to the next live token and retry
+                            }
+                            stop = Some(Error::RateLimitExhausted);
+                            break; // nothing to rotate to: sleeping would only delay the failure
+                        }
+                        None => {
+                            // No reset header (a middlebox stripped it, a
+                            // hostile server): the allowance is spent with
+                            // no known end, so the token is retired for the
+                            // rest of the process instead of being retried
+                            // on a guessed window.
+                            self.retire_with_log(
+                                index,
+                                &format!("{} has used up its hourly allowance", pool_member(index)),
+                            );
+                            stop = Some(Error::RateLimitExhausted);
+                            continue;
+                        }
+                    },
                     RateLimitClass::Secondary(window) => {
                         // Park the token until its window passes (the quota
                         // is not spent) and rotate to the next live token.
                         let deadline = Instant::now() + window;
-                        log::info!(
+                        log::warn!(
                             "one of your tokens hit GitHub's secondary rate limit: pausing it \
                              for {} seconds, then switching to another token if \
                              one is available",
@@ -645,6 +929,7 @@ impl Client {
                             // round above bounds hostile servers).
                             continue;
                         }
+                        stop = Some(Error::RateLimitPaused);
                         break; // nothing to rotate to: sleeping would only delay the failure
                     }
                     // Permanent 403 (private resource, missing token scope,
@@ -693,7 +978,7 @@ impl Client {
             self.successful_requests.fetch_add(1, Ordering::Relaxed);
             return response.json::<Value>().map_err(Error::from);
         }
-        Err(Error::RateLimitExhausted)
+        Err(stop.unwrap_or(Error::RateLimitExhausted))
     }
 
     /// The oversized-body guard shared by the success and error paths (see
@@ -720,7 +1005,7 @@ impl Client {
     /// Retires a token with its plain-English cause and the rotation
     /// status: one wording for every "this token is done" path.
     fn retire_with_log(&self, index: usize, reason: &str) {
-        log::info!(
+        log::warn!(
             "{reason}{}",
             if self.tokens.has_other_live(index) {
                 ": switching to the next available token"
@@ -758,7 +1043,7 @@ impl Client {
                     .and_then(|value| value.to_str().ok())
                     == Some("search"));
         if status != reqwest::StatusCode::TOO_MANY_REQUESTS && exhausted && !spent_search_quota {
-            return RateLimitClass::Primary;
+            return RateLimitClass::Primary(Self::rate_limit_reset(&response));
         }
         let body = response.text().unwrap_or_default();
         // Any 403/429 that survived the primary-exhaustion check above and
@@ -872,6 +1157,28 @@ impl Client {
         ))
     }
 
+    /// Parses the `x-ratelimit-reset` header (a unix epoch timestamp in
+    /// seconds, GitHub's own "when the hourly window resets") into the
+    /// remaining wait, clamped to [`Client::MAX_RETRY_AFTER`] so a hostile
+    /// or clock-skewed header can neither park a token forever nor overflow
+    /// the `Instant + Duration` deadline (which would panic the scan). A
+    /// reset already in the past parses to a zero window: the token is live
+    /// again and the retry is immediate. `None` when the header is absent
+    /// or unparsable: the caller then retires the token instead of guessing
+    /// a window.
+    fn rate_limit_reset(response: &reqwest::blocking::Response) -> Option<Duration> {
+        let value = response
+            .headers()
+            .get("x-ratelimit-reset")?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        Some(Duration::from_secs(value.saturating_sub(now)).min(Self::MAX_RETRY_AFTER))
+    }
+
     /// Sends one GET request with the centralized headers and an
     /// `Authorization` header only when the token is non-empty.
     fn send(&self, url: &str, token: &str) -> Result<reqwest::blocking::Response, Error> {
@@ -893,6 +1200,289 @@ mod tests {
     // be loud, so the zero-panic lints do not apply to the test modules.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn a_malformed_proxy_variable_warns_about_the_silent_direct_bypass() {
+        // the HTTP stack silently IGNORES a set-but-unsupported proxy value
+        // and goes direct: for a privacy-sensitive run that is silent
+        // de-anonymization, so the startup must name it. Values are never
+        // logged (they can carry credentials) — only the variable name and
+        // the scheme.
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "ALL_PROXY").then(|| "socs5://127.0.0.1:9050".to_string())
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("ALL_PROXY") && line.contains("go DIRECT")),
+            "a typo'd proxy scheme must be warned about: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("socs5://")),
+            "the proxy VALUE must never reach the log: {lines:?}"
+        );
+        // a supported scheme is announced, not warned about
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "HTTPS_PROXY").then(|| "socks5h://127.0.0.1:9050".to_string())
+            });
+        });
+        assert!(
+            lines.iter().any(|line| line.contains("egress proxy in use")
+                && line.contains("HTTPS_PROXY")
+                && line.contains("socks5h")),
+            "a supported proxy must be announced: {lines:?}"
+        );
+        assert!(lines.iter().all(|line| !line.contains("DIRECT")));
+        // a whitespace-padded value (a trailing newline from shell quoting)
+        // is announced by the naive check but silently UNUSED by the stack:
+        // it must warn about the direct bypass instead of the false
+        // assurance
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "HTTPS_PROXY").then(|| "socks5h://127.0.0.1:9050\n".to_string())
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("cannot use it") && line.contains("DIRECT")),
+            "a whitespace-padded proxy value must warn about the bypass: {lines:?}"
+        );
+        // a set NO_PROXY can bypass the proxy for some hosts: say so
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| match name {
+                "HTTPS_PROXY" => Some("socks5h://127.0.0.1:9050".to_string()),
+                "NO_PROXY" => Some("github.com".to_string()),
+                _ => None,
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("NO_PROXY") && line.contains("verify your exit IP")),
+            "a set NO_PROXY must carry its own warning: {lines:?}"
+        );
+        // an empty-set uppercase variable SHADOWS the lowercase twin (the
+        // stack's get_first_env returns the first SET one, even empty, and
+        // never reads the twin): announcing the twin would be a false
+        // assurance — the scope is unusable and the run goes DIRECT
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| match name {
+                "HTTPS_PROXY" => Some(String::new()),
+                "https_proxy" => Some("socks5h://127.0.0.1:9050".to_string()),
+                _ => None,
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("HTTPS_PROXY") && line.contains("cannot use it")),
+            "the empty-shadowing variable must be named: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("egress proxy in use")),
+            "the shadowed twin must never be announced: {lines:?}"
+        );
+        // a typo'd primary with a usable ALL_PROXY: the traffic rides the
+        // fallback, so "go DIRECT" would be FALSE — name both
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| match name {
+                "HTTPS_PROXY" => Some("socs5://127.0.0.1:9050".to_string()),
+                "ALL_PROXY" => Some("socks5h://127.0.0.1:9050".to_string()),
+                _ => None,
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("HTTPS_PROXY") && line.contains("cannot use it")),
+            "the unusable primary must be named: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("egress proxy in use") && line.contains("ALL_PROXY")),
+            "the actually-used fallback must be announced: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("go DIRECT")),
+            "no DIRECT claim when a usable fallback exists: {lines:?}"
+        );
+        // a scheme-less value with a trailing path is NOT an authority: the
+        // stack rejects the URI and goes direct
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "HTTPS_PROXY").then(|| "127.0.0.1:8118/".to_string())
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("cannot use it") && line.contains("DIRECT")),
+            "a scheme-less value carrying a path must warn about the bypass: {lines:?}"
+        );
+        // an unbracketed IPv6 (two unbracketed colons) is InvalidAuthority
+        // for the stack: announcing it would be a false assurance
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| (name == "ALL_PROXY").then(|| "fe80::1".to_string()));
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("cannot use it") && line.contains("DIRECT")),
+            "an unbracketed IPv6 must warn about the bypass: {lines:?}"
+        );
+        // a doubled port is InvalidAuthority too
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "HTTPS_PROXY").then(|| "host:8080:9090".to_string())
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("cannot use it") && line.contains("DIRECT")),
+            "a doubled port must warn about the bypass: {lines:?}"
+        );
+        // a bracketed IPv6 with a port stays usable (the bracket pair
+        // resets the port-colon count, exactly like the stack)
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "ALL_PROXY").then(|| "socks5h://[::1]:9050".to_string())
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("egress proxy in use")),
+            "a bracketed IPv6 proxy must be announced: {lines:?}"
+        );
+        // a truncated credential paste (`@` with nothing after) is
+        // EmptyAfterAt for the stack: never announce it
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "HTTPS_PROXY").then(|| "socks5://user@".to_string())
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("cannot use it") && line.contains("DIRECT")),
+            "an empty host after @ must warn about the bypass: {lines:?}"
+        );
+        // the stack's MAX_COLONS cap: the 9th colon since the last reset
+        // is rejected MID-LOOP (a later bracket pair or '@' would have
+        // reset the count, but the stack never gets there)
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "HTTPS_PROXY").then(|| "socks5://u:a:b:c:d:e:f:g:h:i@1.2.3.4".to_string())
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("cannot use it") && line.contains("DIRECT")),
+            "a 9-colon authority must warn about the bypass: {lines:?}"
+        );
+        // a `%` in the hostname is InvalidPercent (only the userinfo and
+        // the bracketed zone id may carry one)
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "HTTPS_PROXY").then(|| "socks5://host%2f:9050".to_string())
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("cannot use it") && line.contains("DIRECT")),
+            "a percent in the hostname must warn about the bypass: {lines:?}"
+        );
+        // an http-scope proxy is never used for HTTPS-only traffic: say so
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "http_proxy").then(|| "socks5://127.0.0.1:9050".to_string())
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("http_proxy") && line.contains("HTTPS-only")),
+            "an http-scope proxy must carry the https-only note: {lines:?}"
+        );
+        // the socks schemes are matched CASE-SENSITIVELY by the stack (an
+        // "SOCKS5://" scheme is silently ignored): announce would be a false
+        // assurance
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "ALL_PROXY").then(|| "SOCKS5://127.0.0.1:9050".to_string())
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("cannot use it") && line.contains("DIRECT")),
+            "an uppercase socks scheme must warn, not announce: {lines:?}"
+        );
+        // socks4/socks4a ARE used by the stack (reqwest's socks feature):
+        // warning "go DIRECT" about them would be a false claim
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "HTTPS_PROXY").then(|| "socks4a://127.0.0.1:9050".to_string())
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("egress proxy in use") && line.contains("socks4a")),
+            "socks4a must be announced as in use, never as ignored: {lines:?}"
+        );
+        // a scheme-less host:port is used by the stack as an http proxy
+        // (the classic Tor-style spelling on an HTTP proxy port)
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "HTTPS_PROXY").then(|| "127.0.0.1:8118".to_string())
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("egress proxy in use") && line.contains("(http proxy)")),
+            "a scheme-less host:port must be announced as an http proxy: {lines:?}"
+        );
+        // a URI-rejected character (a stray pipe from a terminal paste)
+        // makes the stack silently ignore the value: warn, never announce
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| {
+                (name == "HTTPS_PROXY").then(|| "socks5h://127.0.0.1:9050|".to_string())
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("cannot use it") && line.contains("DIRECT")),
+            "a URI-rejected byte must warn about the bypass: {lines:?}"
+        );
+        // REQUEST_METHOD set (the stack's CGI marker): the stack discards
+        // EVERY proxy variable, so nothing is announced at all
+        let ((), lines) = crate::test_logger::capture(|| {
+            Client::warn_on_proxy_env(|name| match name {
+                "REQUEST_METHOD" => Some("GET".to_string()),
+                "HTTPS_PROXY" => Some("socks5h://127.0.0.1:9050".to_string()),
+                _ => None,
+            });
+        });
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("egress proxy in use")),
+            "a CGI environment must silence the announcement: {lines:?}"
+        );
+    }
 
     #[test]
     fn from_token_accepts_valid_classic_token() {
@@ -997,8 +1587,15 @@ mod tests {
         let error = TokenPool::from_token_file(&path).expect_err("must fail");
         std::fs::remove_file(&path).ok();
         assert!(matches!(error, Error::InvalidTokenFile(_)));
+        // the path is Debug-escaped inside the error (backslashes doubled
+        // on Windows): match on the bare file name, which survives the
+        // escaping untouched on every platform
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a UTF-8 temp file name");
         assert!(
-            error.to_string().contains(&path.display().to_string()),
+            error.to_string().contains(name),
             "the malformed-JSON error must name the file: {error}"
         );
         // the path is debug-escaped: a control character in it cannot pass
@@ -1389,12 +1986,14 @@ mod tests {
     }
 
     #[test]
-    fn a_core_quota_403_without_a_retry_after_still_retires() {
+    fn a_core_quota_403_without_a_reset_header_still_retires() {
         use crate::github::mock::serve_requests;
         // The search-quota exemption must not swallow a genuinely spent
         // *core* quota: a 403 with the hourly quota spent and no resource
-        // header (the core default) stays a primary exhaustion even without
-        // a `Retry-After` window — the token is retired for the process.
+        // header (the core default) stays a primary exhaustion. Without the
+        // `x-ratelimit-reset` header (the header a middlebox can strip),
+        // there is no known window to park the token until: it is retired
+        // for the process instead of being retried on a guessed window.
         let (address, server) = serve_requests(move |index, _request| {
             if index == 0 {
                 return (
@@ -1419,10 +2018,101 @@ mod tests {
         let exhausted = client.tokens.exhausted.lock().expect("unpoisoned lock");
         assert!(
             matches!(exhausted.get(&0), Some(None)),
-            "a spent core quota must permanently retire the token: {:?}",
+            "a spent core quota with no reset header must permanently retire \
+             the token: {:?}",
             exhausted.get(&0)
         );
         drop(exhausted);
         server.join();
+    }
+
+    #[test]
+    fn a_spent_core_quota_parks_until_the_reset_header_instead_of_retiring() {
+        use crate::github::mock::serve_requests;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // GitHub names the reset instant on a spent hourly quota: the token
+        // is parked until then (it rejoins the pool on its own), NOT retired
+        // for the process — a long parallel scan must get its token back at
+        // the reset instead of losing it forever. The retired fallback is
+        // pinned by a_core_quota_403_without_a_reset_header_still_retires.
+        let resets = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_secs()
+            + 120;
+        let handled = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&handled);
+        let (address, server) = serve_requests(move |index, _request| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            if index == 0 {
+                return (
+                    403,
+                    vec![
+                        ("X-RateLimit-Remaining".to_string(), "0".to_string()),
+                        ("X-RateLimit-Reset".to_string(), resets.to_string()),
+                    ],
+                    "API rate limit exceeded for user ID 29679238.".to_string(),
+                );
+            }
+            (200, vec![], r#"{"ok": true}"#.to_string())
+        });
+
+        let pool = TokenPool::from_token_file(&crate::github::mock::temp_token_file(
+            r#"{"0": "ghp_a", "1": "ghp_b"}"#,
+            31,
+        ))
+        .expect("token file must load");
+        let client = Client::new(pool).expect("client must build");
+        client
+            .get_json(&format!("{address}/repos/owner/repo/commits"))
+            .expect("the parked token must rotate to the healthy one");
+        server.join();
+
+        let exhausted = client.tokens.exhausted.lock().expect("unpoisoned lock");
+        assert!(
+            matches!(exhausted.get(&0), Some(Some(_))),
+            "a spent core quota with a reset header must park the token, \
+             not retire it: {:?}",
+            exhausted.get(&0)
+        );
+        drop(exhausted);
+        assert!(
+            !client.tokens.is_retired(0),
+            "the parked token must not be marked retired"
+        );
+        assert!(
+            handled.load(Ordering::Relaxed) >= 2,
+            "the request must have rotated to the second token"
+        );
+    }
+
+    #[test]
+    fn a_secondary_park_stop_is_reported_as_paused_not_exhausted() {
+        use crate::github::mock::serve_requests;
+        // When the whole pool drains on secondary pauses (the search quota,
+        // an abuse window), the run must not be reported as an exhausted
+        // hourly allowance: the tokens are parked, not spent, and the advice
+        // is minutes, not an hour.
+        let (address, server) = serve_requests(move |_index, _request| {
+            (
+                429,
+                vec![("Retry-After".to_string(), "600".to_string())],
+                String::new(),
+            )
+        });
+        let client = Client::new(TokenPool::from_token("ghp_a").expect("valid token"))
+            .expect("client must build");
+        let error = client
+            .get_json(&format!("{address}/repos/owner/repo/commits"))
+            .expect_err("a fully parked pool must fail");
+        server.join();
+        assert!(
+            matches!(error, Error::RateLimitPaused),
+            "a secondary-park stop must surface the dedicated paused error: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("wait a few minutes"),
+            "the paused error must carry its next step: {error}"
+        );
     }
 }

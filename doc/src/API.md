@@ -41,14 +41,27 @@ A `403` whose `x-ratelimit-remaining` header is `0` means a quota is
 spent, and which quota decides the reaction:
 
 - on the core endpoints, the token's hourly quota is spent: the token is
-  **retired** (removed from the allocation pool for the rest of the run) and the request is retried with the next available token. A retired
-  token never comes back;
+  **parked** until the instant the `x-ratelimit-reset` header names (capped
+  at one hour so a hostile header cannot park it indefinitely), then
+  returns automatically, and the request is retried with the next available
+  token. A spent allowance is a pause, not a death: a long parallel scan
+  gets its token back at the reset. When the header is absent (a middlebox
+  stripped it), there is no known window to wait for: the token is
+  **retired** (removed from the allocation pool for the rest of the run)
+  instead of being retried on a guessed window. A retired token never
+  comes back;
 - on the `/search/` endpoints (or any response carrying
   `X-RateLimit-Resource: search`), the spent quota is the separate
   per-minute search quota: the token's hourly core quota is untouched, so
   the token is only **parked** for the short search window. Retiring a
   healthy token over a hot search minute would drain multi-token pools
   one token per minute.
+
+When a run stops because every token is unusable, the error names the
+cause: an hourly allowance drained pool stops with "every token's allowance
+is used up" (`RateLimitExhausted`), while a pool parked by secondary
+windows stops with the dedicated paused message ("wait a few minutes",
+`RateLimitPaused`).
 
 A `403` with `x-ratelimit-remaining` above `0` is a genuine refusal (for
 example a private or missing resource) and is **not** treated as rate limiting, unless it carries a `Retry-After` header, the secondary-limit body, or a primary-limit body whose quota header a middlebox stripped (the body text "API rate limit exceeded" is treated as transient too, since the missing header makes the two indistinguishable); those cases park the token
@@ -77,9 +90,9 @@ failure only when no token can serve the request.
 | Limit | Value | Effect |
 |-------|-------|--------|
 | Events timeline | 300 events | GitHub caps profile events; the listing stops there honestly |
-| Repository commits | 10 pages x 100 | a listing deeper than 1000 commits stops with an explicit truncation note |
+| Repository commits | full history | the default-branch walk ends when GitHub's listing ends (a short page); nothing is truncated locally |
 | Search results | 1000 | GitHub's documented search ceiling; reaching it ends the listing with a warning |
-| Reverse-email candidates | 50 repositories | budget cap of the `email`/`emails` reverse lookup |
+| Reverse-email candidates | full listing | every candidate repository the search serves is verified, each over its full default-branch history (until a `commit-author` match ends the lookup early) |
 | Name pairs x domains | 64 x 64 | variant-generation inputs are truncated before generation |
 | Generated variants | 1000 | global cap on generated candidate addresses |
 | Custom patterns | 64 | `--variant-pattern` accepts at most 64 patterns |

@@ -10,10 +10,9 @@
 //!    `+`, e.g. `jane.dupont` → `jane dupont`), with the raw local part when
 //!    it differs (e.g. `janedupont`) and with the domain itself
 //!    (`acme.com`) — at most three queries. The repositories whose name,
-//!    description or topics mention these tokens become candidates, capped
-//!    at `MAX_CANDIDATE_REPOS` distinct repositories. The budget bounds the
-//!    API cost of one address (3 queries, 50 candidates, each verified over
-//!    at most its 10 most recent default-branch commit pages).
+//!    description or topics mention these tokens become candidates, with
+//!    no local cap: every repository the search serves (bounded by GitHub's
+//!    1000-result search window per query) is a candidate.
 //! 2. **Commit verification**: every candidate repository's (default-branch)
 //!    commits are scanned for a commit whose author email is exactly the
 //!    target: the local part ASCII case-insensitively, the domain matched
@@ -21,9 +20,8 @@
 //!    the strongest attribution is found. The listing is never narrowed by the
 //!    commits API `author` parameter: the commit author login is not
 //!    necessarily the email local part, and a narrowing would silently drop
-//!    the target's own commits (false negatives). Only the most recent
-//!    `MAX_COMMIT_PAGES` pages of each candidate's default branch are
-//!    listed, so one address can never walk an entire repository history.
+//!    the target's own commits (false negatives). Each candidate's
+//!    default-branch history is walked to its end (no local budget).
 //! 3. **Account resolution**: a matching commit whose API payload embeds a
 //!    GitHub author object resolves the account with the `commit-author`
 //!    confidence; when the author object is absent (deleted account), the
@@ -39,28 +37,23 @@
 //!
 //! # API-only deltas (documented)
 //!
-//! - the commits API exposes the default branch only;
+//! - the commit walk covers the default branch only (per-branch walking multiplies the request cost and is not attempted);
 //! - the candidates are limited to repositories whose name, description
-//!   or topics mention the local-part tokens or the domain, capped at
-//!   `MAX_CANDIDATE_REPOS`: an email never used in a public commit of one
-//!   of those candidates cannot be found;
+//!   or topics mention the local-part tokens or the domain: an email never
+//!   used in a public commit of one of those candidates cannot be found;
 //! - the `repo-owner-weak` attribution is a heuristic: the repository owner
 //!   committed the matching email but the commit carries no GitHub author
 //!   object, so the login behind it is only presumed (and a repository
 //!   owner may be an organization rather than a user — resolve the account
 //!   type before acting on a weak attribution);
-//! - only the most recent `MAX_COMMIT_PAGES` pages of each candidate's
-//!   default branch are scanned (every commit counts toward the cap): a
-//!   matching commit deeper in the repository history is missed.
 
 use crate::consts::GITHUB_API_BASE;
 use crate::errors::Error;
 use crate::github::{Client, fetch_paginated_with_page_size};
-use crate::output::sanitize_log_text as log_safe;
 use crate::parsers;
+use crate::sanitize::log_safe;
 use crate::sources::{
-    MAX_COMMIT_PAGES, PER_PAGE, SEARCH_RESULT_CEILING, Scanner, SearchQualifiers,
-    parse_search_page, search_q, worker_count,
+    PER_PAGE, SEARCH_RESULT_CEILING, Scanner, SearchQualifiers, parse_search_page, search_q,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -68,28 +61,9 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-
-/// Cap on the number of distinct candidate repositories verified per email
-/// (the first half of the heuristic budget: the repository search can only
-/// ever surface a sample). Together with `MAX_COMMIT_PAGES` — at most 10
-/// commit pages per candidate — it bounds the API cost of one address
-/// honestly.
-const MAX_CANDIDATE_REPOS: usize = 50;
-
-// The budget-spent branch of the candidate search returns a sub-page-size
-// raw count so the page-size-aware loop's short-page end fires (see
-// `reverse_at`): the invariant `MAX_CANDIDATE_REPOS < PER_PAGE` is what
-// keeps that end condition reachable, so it is asserted at compile time —
-// raising the budget to a full page or more would silently degrade the
-// branch into one extra wasted search page per query.
-const _: () = assert!(
-    MAX_CANDIDATE_REPOS < PER_PAGE as usize,
-    "MAX_CANDIDATE_REPOS must stay below PER_PAGE: the budget-spent branch relies on a sub-page-size raw count to end the query's walk"
-);
 
 /// Confidence of an account resolved through the commit author object
 /// embedded in the API response: the strongest attribution.
@@ -147,6 +121,9 @@ pub struct Evidence {
 /// account encountered along the way.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EmailReport {
+    /// The when/what of the report (generation timestamp, tool version).
+    #[serde(flatten)]
+    pub provenance: crate::output::Provenance,
     /// The looked-up email address, as provided and trimmed of surrounding
     /// whitespace (the CLI argument is trimmed before the lookup runs).
     pub email: String,
@@ -185,10 +162,18 @@ pub struct BulkSummary {
 /// unmatched — see [`BulkSummary::skipped`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct BulkReport {
+    /// The when/what of the report (generation timestamp, tool version).
+    #[serde(flatten)]
+    pub provenance: crate::output::Provenance,
     /// One report per processed address, in file order. Addresses that were
-    /// never processed are absent (they are counted in
+    /// never processed are absent (they are listed in
+    /// [`BulkReport::skipped_addresses`], counted in
     /// [`BulkSummary::skipped`] and warned about in the log).
     pub results: Vec<EmailReport>,
+    /// The addresses a stopped worker never reached, in file order — the
+    /// inventory behind [`BulkSummary::skipped`]: an operator re-running the
+    /// interrupted lookups must not have to diff two files to find them.
+    pub skipped_addresses: Vec<String>,
     /// The matched/unmatched/skipped counts.
     pub summary: BulkSummary,
 }
@@ -208,7 +193,7 @@ pub struct BulkReport {
 /// JSON array (an intermediary or a shape change, not an empty page). A
 /// candidate repository that is private, deleted or
 /// empty (GitHub answers 409 on its commits listing) is skipped with a
-/// warning. Never panics.
+/// warning.
 pub fn reverse(scanner: &Scanner, address: &str) -> Result<EmailReport, Error> {
     let (report, searched) = reverse_at(scanner.client(), GITHUB_API_BASE, address)?;
     log_report(&report, searched);
@@ -234,25 +219,12 @@ pub fn reverse(scanner: &Scanner, address: &str) -> Result<EmailReport, Error> {
 /// skipped with a warning (counted in the summary's `skipped`, absent from
 /// `results`: never-processed work is never counted as unmatched). Any
 /// other worker failure — including the OS refusing to spawn a worker
-/// ([`Error::WorkerFailed`]) — aborts the bulk run. Never panics.
+/// ([`Error::WorkerFailed`]) — aborts the bulk run.
 pub fn reverse_bulk(scanner: &Scanner, path: &Path) -> Result<BulkReport, Error> {
-    let addresses = read_addresses(path)?;
-    if addresses.is_empty() {
-        log::info!(
-            "[-] no usable email address in {}",
-            log_safe(&path.display().to_string())
-        );
-        return Ok(BulkReport::default());
-    }
-    let (report, failure) = reverse_bulk_at(scanner, GITHUB_API_BASE, &addresses);
-    if failure.is_some() && !report.results.is_empty() {
-        log::warn!(
-            "the bulk run aborted early: the results computed before the failure follow ({} of {} addresses checked)",
-            report.results.len(),
-            report.summary.total
-        );
-    }
-    log_bulk_report(&report);
+    // library convenience over [`reverse_bulk_with_partial`]: on an abort
+    // the partial report is logged, then only the error propagates (the
+    // CLI path uses the tuple form to reach the `--json` file too)
+    let (report, failure) = reverse_bulk_with_partial(scanner, GITHUB_API_BASE, path);
     if let Some(err) = failure {
         return Err(err);
     }
@@ -274,6 +246,17 @@ pub fn reverse_bulk_with_partial(
         Ok(addresses) => addresses,
         Err(err) => return (BulkReport::default(), Some(err)),
     };
+    // name the shape of the spend before it starts: three candidate
+    // searches per address (each bounded by GitHub's 1000-result search
+    // window) and a full history walk per candidate repository — the only
+    // ceilings are GitHub's, so the honest cost statement is the shape,
+    // not a fabricated number
+    if !addresses.is_empty() {
+        log::info!(
+            "[.] reverse lookups for {} addresses: up to 3 candidate searches each (duplicates collapse, GitHub's 1000-result ceiling per query) and a full history walk per candidate repository (until a commit-author match ends the lookup early), shared across the token pool",
+            addresses.len()
+        );
+    }
     if addresses.is_empty() {
         log::info!(
             "[-] no usable email address in {}",
@@ -300,50 +283,35 @@ pub fn reverse_bulk_with_partial(
 ///
 /// # Errors
 ///
-/// The same failures as [`reverse`]. Never panics.
+/// The same failures as [`reverse`].
 fn reverse_at(client: &Client, base: &str, address: &str) -> Result<(EmailReport, usize), Error> {
     let (local, domain) = split_email(address)?;
     let queries = candidate_queries(local, domain);
 
     // stage 1: candidate repositories from the local-part tokens and the
-    // domain, deduplicated by URL, capped at MAX_CANDIDATE_REPOS. The
-    // listing is driven through the page-size-aware loop: its short-page
-    // end and its raw-count ceiling keep the walk inside GitHub's
-    // documented 1000-result search window, so an over-abundant query can
-    // neither reach the out-of-window 422 page nor cost the candidates its
-    // pages already fetched (a plain raw walk would discard them with a
-    // warning after burning ~11 wasted requests). The per-query budget is
-    // spent on distinct candidates only: the deduplication runs while the
-    // pages stream in, and a page whose every hit duplicates an earlier
-    // query's candidates keeps the walk alive instead of spending the
-    // budget on items that were thrown away
-    let mut hits: Vec<crate::sources::SearchHit> = Vec::new();
+    // domain, deduplicated by URL, NO local cap. The listing is driven
+    // through the page-size-aware loop: its short-page end and its
+    // raw-count ceiling keep the walk inside GitHub's documented
+    // 1000-result search window, so an over-abundant query can neither
+    // reach the out-of-window 422 page nor cost the candidates its pages
+    // already fetched (a plain raw walk would discard them with a warning
+    // after burning ~11 wasted requests)
+    let mut hits: Vec<crate::sources::RepoHit> = Vec::new();
     let mut seen_urls: HashSet<String> = HashSet::new();
     for query in queries {
-        if hits.len() >= MAX_CANDIDATE_REPOS {
-            log::warn!(
-                "candidate repositories capped at {MAX_CANDIDATE_REPOS}: remaining queries skipped"
-            );
-            break;
-        }
-        let room = MAX_CANDIDATE_REPOS - hits.len();
         // per-query seen set, seeded with the candidates already kept and
         // dropped when the query fails, so the hits of its fetched pages
         // stay available to the next query
         let seen = RefCell::new(seen_urls.clone());
-        // distinct candidates this query already kept: the per-query budget
-        // counts those, never the raw listed items (duplicates against the
-        // earlier queries must not spend the budget before the fresh hits
-        // of the later pages are reached)
-        let kept = Cell::new(0usize);
         // raw listed items of this query, counted as the pages stream in:
         // the sibling listings' honesty rule — when a query fails mid-walk,
         // the skip warning must say how many listed candidates it discarded
         let listed = Cell::new(0usize);
-        // set when this query discarded fresh candidates (more listed than
-        // the remaining budget): the honest boundary signal — a walk that
-        // ended exactly at the cap cannot claim anything was skipped
-        let truncated = Cell::new(false);
+        // raw items of this query INCLUDING repeats, to detect the
+        // documented 1000-result window cut (a query that fills the window
+        // must say so instead of ending silently: candidates beyond it were
+        // never seen)
+        let raw_seen = Cell::new(0usize);
         match fetch_paginated_with_page_size(
             client,
             |page| {
@@ -353,9 +321,14 @@ fn reverse_at(client: &Client, base: &str, address: &str) -> Result<(EmailReport
                 )
             },
             |json| {
-                let (page_hits, raw_count) = parse_search_page(json)?;
+                // include_forks = true, deliberately unlike `user`/`org`/
+                // `search`: the reverse lookup wants ANY repository carrying
+                // the address, and the subject's commits often live in forks
+                // of their own upstream work
+                let (page_hits, raw_count) = parse_search_page(json, true)?;
                 listed.set(listed.get() + page_hits.len());
-                let mut fresh: Vec<crate::sources::SearchHit> = Vec::new();
+                raw_seen.set(raw_seen.get() + raw_count);
+                let mut fresh: Vec<crate::sources::RepoHit> = Vec::new();
                 {
                     let mut seen = seen.borrow_mut();
                     for hit in page_hits {
@@ -364,35 +337,11 @@ fn reverse_at(client: &Client, base: &str, address: &str) -> Result<(EmailReport
                         }
                     }
                 }
-                let remaining = room - kept.get();
-                if fresh.len() > remaining {
-                    truncated.set(true);
-                }
-                if fresh.len() >= remaining {
-                    // the budget of distinct candidates is spent by this
-                    // page: keep only the candidates that fill it and end
-                    // the walk through the raw count — capped below the
-                    // page size (the budget is at most MAX_CANDIDATE_REPOS
-                    // = 50 < PER_PAGE), so the page-size-aware loop's
-                    // short-page end fires and no further page of this
-                    // query is requested. A full page may hold more
-                    // candidates than the budget: say so (a page ending
-                    // exactly at the cap proves nothing about the next one)
-                    if raw_count >= usize::from(PER_PAGE) {
-                        truncated.set(true);
-                    }
-                    fresh.truncate(remaining);
-                    kept.set(room);
-                    let spent = fresh.len();
-                    return Ok((fresh, spent));
-                }
-                kept.set(kept.get() + fresh.len());
                 Ok((fresh, raw_count))
             },
-            // the raw ceiling only guards the documented 1000-result window
-            // (an all-duplicates walk must still stop instead of reaching
-            // the out-of-window 422): the per-query budget is enforced by
-            // the fresh-count branch above
+            // the raw ceiling guards the documented 1000-result window (an
+            // all-duplicates walk must still stop instead of reaching the
+            // out-of-window 422)
             Some(SEARCH_RESULT_CEILING),
             PER_PAGE,
         ) {
@@ -416,7 +365,9 @@ fn reverse_at(client: &Client, base: &str, address: &str) -> Result<(EmailReport
             }
             // a query the API rejected outright (an over-long or odd local
             // part composed into an invalid `q`) is query-scoped too, not a
-            // scan-wide failure: the next query may still run
+            // scan-wide failure: the next query may still run. Deliberately
+            // NOT the shared `crate::sources::classify_search_window_422`
+            // (sources/mod.rs): a 422 must stay scoped to this one query
             Err(Error::Http(err))
                 if err.status() == Some(reqwest::StatusCode::UNPROCESSABLE_ENTITY) =>
             {
@@ -427,14 +378,13 @@ fn reverse_at(client: &Client, base: &str, address: &str) -> Result<(EmailReport
             }
             Err(err) => return Err(err),
         }
-
-        if truncated.get() {
-            // the last query itself discarded candidates: the loop-top
-            // warning never fired, say so — hedged, because a walk that
-            // ended exactly at the cap proves nothing about what a further
-            // page would have held
+        if raw_seen.get() >= SEARCH_RESULT_CEILING {
+            // the walk ended on the window cut, not on a listing end: a
+            // further page of the SAME query would answer the out-of-window
+            // 422, but the window may hide candidates the lookup never saw
+            // (hedged: an exact hit proves nothing about a further page)
             log::warn!(
-                "the search may hold candidates beyond the budget: candidate repositories capped at {MAX_CANDIDATE_REPOS}"
+                "candidate search {query:?} reached GitHub's 1000-result window: candidates beyond it were not seen"
             );
         }
     }
@@ -455,13 +405,8 @@ fn reverse_at(client: &Client, base: &str, address: &str) -> Result<(EmailReport
                 continue;
             }
         };
-        // the page-size-aware walk counts raw commits and ends on a short
-        // final page: a candidate shorter than the cap costs no trailing
-        // empty-page request (material against the anonymous hourly budget
-        // — up to one wasted request per candidate, `MAX_CANDIDATE_REPOS`
-        // candidates per lookup)
-        let listed_commits = Cell::new(0usize);
-        let commit_ceiling = MAX_COMMIT_PAGES * usize::from(PER_PAGE);
+        // the page-size-aware walk ends on a short final page: no local
+        // budget, the only ceilings are GitHub's
         let commits: Vec<CommitEntry> = match fetch_paginated_with_page_size(
             client,
             |page| {
@@ -477,30 +422,12 @@ fn reverse_at(client: &Client, base: &str, address: &str) -> Result<(EmailReport
             },
             |json| {
                 let (page_commits, raw_count) = parse_candidate_commit_page(json)?;
-                listed_commits.set(listed_commits.get() + raw_count);
                 Ok((page_commits, raw_count))
             },
-            Some(commit_ceiling),
+            None,
             PER_PAGE,
         ) {
-            Ok(commits) => {
-                if listed_commits.get() >= commit_ceiling {
-                    // the raw-count ceiling was reached: the walk was cut at
-                    // the candidate budget (a candidate with exactly
-                    // `commit_ceiling` commits also lands here — the "may"
-                    // phrasing keeps the warning honest for that boundary
-                    // case too). Say so instead of letting the report look
-                    // complete: the same honesty warning the repository and
-                    // user walks emit
-                    log::warn!(
-                        "repository {}/{}: only the most recent {} commits were scanned (built-in limit), older commits may hold emails that were missed",
-                        log_safe(owner.as_str()),
-                        log_safe(repository.as_str()),
-                        listed_commits.get()
-                    );
-                }
-                commits
-            }
+            Ok(commits) => commits,
             // resource-scoped failure (deleted, private or empty candidate —
             // GitHub answers 409 on /commits for a repository with no
             // commits): skip it and keep verifying the remaining candidates
@@ -572,6 +499,7 @@ fn reverse_at(client: &Client, base: &str, address: &str) -> Result<(EmailReport
     };
     Ok((
         EmailReport {
+            provenance: crate::output::Provenance::now(),
             email: address.trim().to_string(),
             account,
             evidence,
@@ -589,7 +517,6 @@ fn reverse_at(client: &Client, base: &str, address: &str) -> Result<(EmailReport
 /// # Errors
 ///
 /// Returns [`Error::InvalidEmail`] and [`Error::NoreplyEmail`] as described.
-/// Never panics.
 fn split_email(address: &str) -> Result<(&str, &str), Error> {
     // paste artifacts are trimmed like everywhere else: a quoted target
     // (`"jane@acme.com"` copied with its shell quotes) must resolve to the
@@ -661,9 +588,9 @@ fn email_matches(candidate_email: &str, local: &str, domain: &str) -> bool {
 
 /// One commit of a candidate repository's default-branch listing: what is
 /// needed to resolve and evidence the account when its author email matches
-/// the target. Every commit of a page is kept (whatever its author email),
-/// so a non-matching page still counts toward the `MAX_COMMIT_PAGES` budget
-/// instead of leaving the listing unbounded.
+/// the target. Every commit of a page is kept (whatever its author email):
+/// the per-author attribution of the correlation report is built from the
+/// full listing, not only from the matching commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommitEntry {
     /// The commit sha (the evidence), when the payload carried one.
@@ -678,9 +605,11 @@ struct CommitEntry {
 }
 
 /// Extracts every commit of a `/commits` page, with the raw item count (the
-/// end-of-listing signal of `fetch_paginated`). Every commit counts toward
-/// the page budget: a page holding no commit that matches the target still
-/// advances the cap, so the listing can never walk the whole history. A 200
+/// end-of-listing signal of `fetch_paginated`). Every commit of the page is
+/// kept whatever its author email (the per-author attribution and the
+/// noreply technique feed from the full listing), and the walk has no local
+/// budget: it covers the candidate's full default-branch history and ends
+/// when GitHub's listing ends. A 200
 /// body that is not a JSON array is an intermediary or a shape change, not
 /// an empty page, and fails explicitly instead of silently ending the
 /// lookup as a complete-looking no-match (the same explicit-requirement
@@ -725,10 +654,11 @@ fn parse_candidate_commit_page(json: &Value) -> Result<(Vec<CommitEntry>, usize)
 /// # Errors
 ///
 /// Returns [`Error::InvalidUrl`] when the URL does not parse as a
-/// repository. Never panics.
+/// repository.
 fn repository_parts(url: &str) -> Result<(String, String), Error> {
-    let owner = parsers::get_author(url.to_string())?;
-    let repository = parsers::get_repository(url.to_string())?;
+    let (owner, repository) = parsers::parse_github_url(url)?;
+    let repository = repository
+        .ok_or_else(|| Error::InvalidUrl(format!("{url}: candidate url has no repository part")))?;
     if repository.is_empty() {
         return Err(Error::InvalidUrl(format!(
             "{url}: candidate url has no repository part"
@@ -752,7 +682,7 @@ fn push_candidate_account(candidates: &mut Vec<Account>, account: Account) {
 
 /// Logs the human-readable terminal report of one reverse lookup. Every
 /// untrusted string (login, repository, sha, email) is sanitized first, so a
-/// hostile commit or repository can never forge log lines. Never panics.
+/// hostile commit or repository can never forge log lines.
 fn log_report(report: &EmailReport, searched: usize) {
     // one rendering of an optional account id: "unknown" when absent
     let id_label = |id: Option<u64>| id.map_or_else(|| "unknown".to_string(), |id| id.to_string());
@@ -811,7 +741,6 @@ fn log_report(report: &EmailReport, searched: usize) {
 
 /// Logs the human-readable terminal report of a bulk reverse lookup: one
 /// line per processed address, then the matched/unmatched/skipped summary.
-/// Never panics.
 fn log_bulk_report(report: &BulkReport) {
     log::info!("============ EMAILS REVERSE LOOKUP ============");
     for email_report in &report.results {
@@ -852,7 +781,7 @@ const MAX_ADDRESSES_FILE_BYTES: u64 = 64 * 1024 * 1024;
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] when the file cannot be read. Never panics.
+/// Returns [`Error::Io`] when the file cannot be read.
 /// The read_file_error hint every addresses-file failure carries: the
 /// expected format, so the user knows what the reader accepts.
 const ADDRESSES_HINT: &str = "one email address per line, # comments allowed";
@@ -929,7 +858,10 @@ fn read_addresses(path: &Path) -> Result<Vec<String>, Error> {
 /// [`reverse_at`], so anything else that escapes is a scan-wide condition
 /// and must abort the whole bulk run.
 fn bulk_failure_is_token_death(err: &Error) -> bool {
-    matches!(err, Error::RateLimitExhausted | Error::TokenRejected)
+    matches!(
+        err,
+        Error::RateLimitExhausted | Error::RateLimitPaused | Error::TokenRejected
+    )
 }
 
 /// What one bulk worker reports back: the per-address results it produced
@@ -961,104 +893,29 @@ fn reverse_bulk_at(
         return (BulkReport::default(), None);
     }
     let tokens = scanner.client().tokens();
-    // Each worker is dedicated the next *live* token when any token is live
-    // (see [`crate::github::client::TokenPool::live_indices`]), the same
-    // seam as the parallel scan: a token the pool already retired or parked
-    // must not own a worker slot while healthy tokens sit beyond the worker
-    // range — with fewer addresses than tokens, every spawned worker could
-    // otherwise own a dead token and abort the whole bulk run without a
-    // single request. When every token is dead (or the pool is anonymous)
-    // the positional assignment is kept, so the all-dead reduction still
-    // fails loudly with [`Error::RateLimitExhausted`] and the anonymous
-    // pool keeps its single shared-quota worker.
-    let live = tokens.live_indices();
-    let workers = worker_count(
-        if live.is_empty() {
-            tokens.len()
-        } else {
-            live.len()
+    // The live-token assignment, the spawn-failure degradation and the
+    // exactly-one-report-per-worker collection live in the shared
+    // [`crate::github::pool`] runner (the same seam as the parallel scan):
+    // a token the pool already retired or parked must not own a worker slot
+    // while healthy tokens sit beyond the worker range — with fewer
+    // addresses than tokens, every spawned worker could otherwise own a
+    // dead token and abort the whole bulk run without a single request.
+    let reports: Vec<BulkWorkerReport> = crate::github::pool::run_token_worker_pool(
+        tokens,
+        addresses
+            .iter()
+            .enumerate()
+            .map(|(index, address)| (index, address.clone())),
+        |cause| BulkWorkerReport {
+            results: Vec::new(),
+            requests: 0,
+            failure: Some(Error::WorkerFailed(format!("bulk reverse {cause}"))),
+            token_died: false,
         },
-        addresses.len(),
+        |work_rx, aborted, dedicated_token, start_dead| {
+            bulk_worker(dedicated_token, base, work_rx, aborted, start_dead)
+        },
     );
-
-    // work queue: every address is sent once with its file index, then the
-    // sender is dropped, so `recv` returns `Err` once the queue is drained
-    let (work_tx, work_rx) = mpsc::channel::<(usize, String)>();
-    for (index, address) in addresses.iter().enumerate() {
-        // the receiver lives in this same function, so the send cannot fail
-        let _ = work_tx.send((index, address.clone()));
-    }
-    drop(work_tx);
-    let work_rx = Arc::new(Mutex::new(work_rx));
-
-    let (result_tx, result_rx) = mpsc::channel::<BulkWorkerReport>();
-    // set as soon as a worker fails, so the others stop pulling work
-    let aborted = AtomicBool::new(false);
-
-    std::thread::scope(|scope| {
-        let work_rx = &work_rx;
-        let aborted = &aborted;
-        for worker in 0..workers {
-            // the `worker`-th live token when any token is live; the
-            // positional token otherwise (the all-dead fallback keeps the
-            // loud all-workers-dead reduction). `None` is the anonymous
-            // quota (no tokens at all)
-            let assigned = live.get(worker).copied().unwrap_or(worker);
-            let dedicated_token = tokens.dedicated_token(assigned);
-            // a dedicated token the parent pool already retired or parked
-            // (nothing reaches the shared client in the bulk run today, but
-            // the same seam as the parallel scan stays guarded) never spawns
-            // a worker doomed to a dead first request. An anonymous quota
-            // retired or parked by the parent pool is guarded the same way
-            let start_dead = match dedicated_token {
-                Some(_) => tokens.is_exhausted(assigned),
-                None => tokens.is_exhausted(crate::github::client::ANONYMOUS_INDEX),
-            };
-            let worker_tx = result_tx.clone();
-            // `Builder::spawn_scoped` instead of `scope.spawn`: the OS
-            // refusing the thread creation must degrade to a reported
-            // failure, not panic out of the documented never-panic
-            // contract
-            match std::thread::Builder::new().spawn_scoped(scope, move || {
-                let report = bulk_worker(dedicated_token, base, work_rx, aborted, start_dead);
-                let _ = worker_tx.send(report);
-            }) {
-                Ok(_handle) => {}
-                Err(_) => {
-                    // no thread for this worker: report the prepared
-                    // failure, so the reduction still receives exactly
-                    // one report per worker instead of hanging on a
-                    // missing one
-                    let _ = result_tx.send(BulkWorkerReport {
-                        results: Vec::new(),
-                        requests: 0,
-                        failure: Some(Error::WorkerFailed(
-                            "the OS refused to spawn a bulk reverse worker".to_string(),
-                        )),
-                        token_died: false,
-                    });
-                }
-            }
-        }
-    });
-    drop(result_tx); // the scope joined every worker: no more reports
-
-    // every worker sent exactly one report (the scope joined them and
-    // `result_tx` is still held here), so the recv cannot fail; the
-    // fallback arm stays as the never-panic degradation the crate's
-    // zero-panic lints require
-    let reports: Vec<BulkWorkerReport> = (0..workers)
-        .map(|_| {
-            result_rx.recv().unwrap_or_else(|_| BulkWorkerReport {
-                results: Vec::new(),
-                requests: 0,
-                failure: Some(Error::WorkerFailed(
-                    "bulk reverse worker did not report".to_string(),
-                )),
-                token_died: false,
-            })
-        })
-        .collect();
     let (slots, failure, worker_requests) = reduce_bulk_reports(reports, addresses);
     scanner.add_worker_requests(worker_requests);
 
@@ -1067,7 +924,7 @@ fn reverse_bulk_at(
     // verified no-match
     let mut results: Vec<EmailReport> = Vec::with_capacity(addresses.len());
     let mut matched = 0usize;
-    let mut skipped = 0usize;
+    let mut skipped_addresses: Vec<String> = Vec::new();
     for (index, slot) in slots.into_iter().enumerate() {
         match slot {
             Some(email_report) => {
@@ -1077,7 +934,10 @@ fn reverse_bulk_at(
                 results.push(email_report);
             }
             None => {
-                skipped += 1;
+                // the inventory of the never-processed addresses travels in
+                // the report (not just the count): an operator re-running
+                // the interrupted lookups must not have to diff two files
+                skipped_addresses.push(addresses[index].clone());
                 log::warn!(
                     "email {} could not be checked (its lookup was interrupted): counted as skipped, not unmatched",
                     log_safe(&addresses[index])
@@ -1089,9 +949,14 @@ fn reverse_bulk_at(
         total: results.len(),
         matched,
         unmatched: results.len() - matched,
-        skipped,
+        skipped: skipped_addresses.len(),
     };
-    let report = BulkReport { results, summary };
+    let report = BulkReport {
+        provenance: crate::output::Provenance::now(),
+        skipped_addresses,
+        results,
+        summary,
+    };
     if let Some(err) = failure {
         // an abort-class failure must not erase the lookups already paid
         // for: the partial report travels back alongside the error (the
@@ -1111,7 +976,7 @@ fn reverse_bulk_at(
 fn bulk_worker(
     dedicated_token: Option<&str>,
     base: &str,
-    work_rx: &Arc<Mutex<mpsc::Receiver<(usize, String)>>>,
+    work_rx: &Mutex<mpsc::Receiver<(usize, String)>>,
     aborted: &AtomicBool,
     start_dead: bool,
 ) -> BulkWorkerReport {
@@ -1253,6 +1118,7 @@ mod tests {
     // be loud, so the zero-panic lints do not apply to the test modules.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use std::sync::Arc;
 
     // ---- address validation ----
 
@@ -1646,6 +1512,7 @@ mod tests {
         (
             index,
             EmailReport {
+                provenance: crate::output::Provenance::now(),
                 email: "jane@acme.com".to_string(),
                 account: login.map(|login| Account {
                     login: login.to_string(),
@@ -1856,6 +1723,7 @@ mod tests {
     #[test]
     fn email_report_serializes_the_documented_json_shape() {
         let report = EmailReport {
+            provenance: crate::output::Provenance::now(),
             email: "jane@acme.com".to_string(),
             account: Some(Account {
                 login: "janedoe".to_string(),
@@ -1882,9 +1750,19 @@ mod tests {
         assert_eq!(json["evidence"]["commit_sha"], "abc123");
         assert_eq!(json["evidence"]["author_email"], "jane@acme.com");
         assert_eq!(json["candidates"][0]["confidence"], "commit-author");
+        // the provenance is universal (doc/src/OUTPUT.md: every report
+        // carries it, the one-address report included): a dropped field
+        // must fail this shape test
+        assert_eq!(json["tool_version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            json["generated_at"]
+                .as_str()
+                .is_some_and(|stamp| stamp.len() == 20 && stamp.ends_with('Z'))
+        );
 
         // the weak attribution carries a null id and never overstates
         let weak = EmailReport {
+            provenance: crate::output::Provenance::now(),
             email: "jane@acme.com".to_string(),
             account: Some(Account {
                 login: "acme".to_string(),
@@ -1900,6 +1778,7 @@ mod tests {
 
         // unmatched: account and evidence are null
         let unmatched = EmailReport {
+            provenance: crate::output::Provenance::now(),
             email: "jane@acme.com".to_string(),
             account: None,
             evidence: None,
@@ -1914,7 +1793,10 @@ mod tests {
     #[test]
     fn bulk_report_serializes_the_list_plus_summary_shape() {
         let report = BulkReport {
+            provenance: crate::output::Provenance::now(),
+            skipped_addresses: Vec::new(),
             results: vec![EmailReport {
+                provenance: crate::output::Provenance::now(),
                 email: "jane@acme.com".to_string(),
                 account: None,
                 evidence: None,
@@ -1934,6 +1816,18 @@ mod tests {
             json["summary"],
             serde_json::json!({"total": 1, "matched": 0, "unmatched": 1, "skipped": 0})
         );
+        // the provenance is universal: top level AND per results entry
+        // (each entry stamps the moment its own lookup finished)
+        assert_eq!(json["tool_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            json["results"][0]["tool_version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(
+            json["skipped_addresses"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
     }
 
     #[test]
@@ -1942,6 +1836,7 @@ mod tests {
         // at the sanitizer helper: a dropped `log_safe()` call must fail
         // this test (capturing logger, see `crate::test_logger`)
         let report = EmailReport {
+            provenance: crate::output::Provenance::now(),
             email: "jane@acme.com".to_string(),
             account: Some(Account {
                 login: "ev\u{1b}[31mil\n".to_string(),
@@ -2416,20 +2311,16 @@ mod tests {
     }
 
     #[test]
-    fn the_candidate_repositories_are_capped_at_the_documented_budget() {
-        let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&requests);
+    fn a_candidate_query_that_fills_the_1000_result_window_warns_about_it() {
+        // the documented search window: a query whose raw items fill it
+        // (10 full pages of 100) stops on the window cut, not on a listing
+        // end — the warning must say candidates beyond it were never seen
+        // instead of ending silently
         let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
-            if let Some(line) = request.first()
-                && let Ok(mut log) = recorded.lock()
-            {
-                log.push(line.clone());
-            }
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/search/repositories") {
-                // a full page of 100 hits: only the first 50 may be kept
                 let items: Vec<String> = (0..100)
-                    .map(|i| format!(r#"{{"html_url": "https://github.com/acme/repo{i}"}}"#))
+                    .map(|i| format!(r#"{{"html_url": "https://github.com/acme/repo{}"}}"#, i))
                     .collect();
                 return (
                     200,
@@ -2444,23 +2335,67 @@ mod tests {
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let ((report, searched), lines) = crate::test_logger::capture(|| {
+        let ((report, _searched), lines) = crate::test_logger::capture(|| {
+            reverse_at(&client, &address, "jane@acme.com").expect("the lookup must succeed")
+        });
+        server.join();
+
+        assert!(report.account.is_none());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("reached GitHub's 1000-result window")),
+            "the window cut must warn about the candidates it hid: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_full_page_of_distinct_candidates_is_kept_whole_with_no_local_cap() {
+        // no local candidate cap: every candidate the search serves is
+        // verified. A full page of 100 distinct candidates on the first
+        // query keeps all 100 (the old 50-budget would have thrown half),
+        // and the walk continues to the next page instead of ending on the
+        // budget's short-page signal
+        let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
+            if let Some(line) = request.first()
+                && let Ok(mut log) = recorded.lock()
+            {
+                log.push(line.clone());
+            }
+            let line = request.first().map(String::as_str).unwrap_or("");
+            if line.contains("/search/repositories") {
+                let page = crate::github::mock::request_line_page(request);
+                if page == 1 {
+                    let items: Vec<String> = (0..100)
+                        .map(|i| format!(r#"{{"html_url": "https://github.com/acme/repo{i}"}}"#))
+                        .collect();
+                    return (
+                        200,
+                        vec![],
+                        format!(r#"{{"items": [{}]}}"#, items.join(",")),
+                    );
+                }
+                // page 2: the short page that ends the listing
+                return (200, vec![], r#"{"items": []}"#.to_string());
+            }
+            if line.contains("/repos/acme/") {
+                return (200, vec![], "[]".to_string());
+            }
+            (404, vec![], String::new())
+        });
+
+        let client = crate::github::Client::anonymous().expect("client must build");
+        let ((report, searched), _lines) = crate::test_logger::capture(|| {
             reverse_at(&client, &address, "jane@acme.com").expect("the lookup must succeed")
         });
         server.join();
 
         assert!(report.account.is_none());
         assert_eq!(
-            searched, MAX_CANDIDATE_REPOS,
-            "the heuristic budget must cap the verified candidates"
-        );
-        // the cap is never silent: when the budget is spent (here by the
-        // first query's full page), the warning must be on the log
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("candidate repositories capped at 50")),
-            "the candidate-cap warning must be logged, got: {lines:?}"
+            searched, 100,
+            "every candidate the first query serves must be verified"
         );
         let requests = requests.lock().expect("request log must lock");
         assert_eq!(
@@ -2468,18 +2403,19 @@ mod tests {
                 .iter()
                 .filter(|line| line.contains("/search/"))
                 .count(),
-            1,
-            "a single full page is enough to fill the cap: no second search page"
+            4,
+            "a full page must NOT end the walk: each of the address's two \
+             queries (the local part, the domain) walks its own page 1 + \
+             the page-2 listing end"
         );
     }
 
     #[test]
-    fn a_full_page_filling_the_budget_exactly_warns_about_possible_more() {
-        // the budget spent EXACTLY by a full page (50 distinct candidates,
-        // the page holding 100 raw items): the walk ends through the
-        // short-page signal, and the candidates a further page may hold
-        // must not be discarded silently — the warning fires even though
-        // nothing was truncated
+    fn raw_duplicates_inside_one_page_never_dilute_the_candidates() {
+        // a page mixing 50 distinct candidates with 50 repeats of the
+        // first: deduplication keeps the 50 distinct ones and the raw
+        // repeats change nothing (the raw count still feeds the walk's
+        // pagination, not the candidate list)
         let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/search/repositories") {
@@ -2502,22 +2438,16 @@ mod tests {
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let ((_, searched), lines) = crate::test_logger::capture(|| {
+        let ((_, searched), _lines) = crate::test_logger::capture(|| {
             reverse_at(&client, &address, "jane@acme.com").expect("the lookup must succeed")
         });
         server.join();
 
-        assert_eq!(searched, MAX_CANDIDATE_REPOS);
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("candidate repositories capped at 50")),
-            "a budget filled exactly by a full page must still warn: {lines:?}"
-        );
+        assert_eq!(searched, 50);
     }
 
     #[test]
-    fn the_commit_verification_is_capped_per_candidate_repository() {
+    fn the_commit_verification_walks_each_candidates_full_history() {
         let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/search/repositories") {
@@ -2540,13 +2470,16 @@ mod tests {
                 };
             }
             if line.contains("/repos/acme/") {
-                // every page holds 100 commits, none of them matching the
-                // target: the listing must stop at MAX_COMMIT_PAGES pages
-                // anyway instead of walking the whole repository history
-                let commits: Vec<String> = (0..100)
+                // 11 full pages of commits, none matching the target, then
+                // the short 12th page that ends the listing: the candidate's
+                // FULL history is walked (the old 10-page budget would have
+                // cut the last two pages)
+                let page = crate::github::mock::request_line_page(request);
+                let count = if page <= 11 { 100 } else { 37 };
+                let commits: Vec<String> = (0..count)
                     .map(|i| {
                         commit_json(
-                            &format!("sha{i}"),
+                            &format!("sha{page}-{i}"),
                             "bob@other.org",
                             serde_json::json!({ "login": "bob", "id": 7 }),
                         )
@@ -2567,64 +2500,16 @@ mod tests {
         // each of the two queries walks its full listing (a page of raw
         // duplicates must not stop the walk before the fresh hits of its
         // later pages): a full page then the empty page that ends it, plus
-        // at most MAX_COMMIT_PAGES commit pages for the single candidate:
-        // the history is never walked page after page
-        assert_eq!(handled, 4 + MAX_COMMIT_PAGES);
+        // the candidate's full 12-page history (11 full + 1 short)
+        assert_eq!(handled, 4 + 12);
     }
 
     #[test]
-    fn the_commit_cap_warns_instead_of_staying_silent() {
-        // a candidate whose history fills the whole per-repository budget:
-        // the walk is cut at MAX_COMMIT_PAGES pages and a warning says the
-        // history may be incomplete (the same honesty warning the scan and
-        // user walks emit), instead of the report silently pretending it
-        // saw the whole history
-        let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
-            let line = request.first().map(String::as_str).unwrap_or("");
-            if line.contains("/search/repositories") {
-                return (
-                    200,
-                    vec![],
-                    r#"{"items": [{"html_url": "https://github.com/acme/lib"}]}"#.to_string(),
-                );
-            }
-            if line.contains("/repos/acme/lib/commits") {
-                // every page holds 100 non-matching commits: the budget is
-                // spent on the first 10 pages
-                let commits: Vec<String> = (0..100)
-                    .map(|i| {
-                        commit_json(
-                            &format!("sha{i}"),
-                            "bob@other.org",
-                            serde_json::json!({ "login": "bob", "id": 7 }),
-                        )
-                    })
-                    .collect();
-                return (200, vec![], format!("[{}]", commits.join(",")));
-            }
-            (404, vec![], String::new())
-        });
-
-        let client = crate::github::Client::anonymous().expect("client must build");
-        let (outcome, lines) =
-            crate::test_logger::capture(|| reverse_at(&client, &address, "jane@acme.com"));
-        let (report, _) = outcome.expect("the lookup must succeed");
-        server.join();
-
-        assert!(report.account.is_none());
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("only the most recent 1000 commits were scanned")),
-            "the commit-cap warning must be logged, got: {lines:?}"
-        );
-    }
-
-    #[test]
-    fn duplicate_hits_do_not_eat_the_candidate_budget() {
+    fn duplicate_hits_are_deduplicated_and_fresh_candidates_are_all_kept() {
         // the second query's page leads with the two candidates the first
-        // query already collected: the per-query budget must be spent on
-        // distinct candidates only, so the 50-candidate cap is still filled
+        // query already collected: deduplication keeps the FRESH candidates
+        // behind them, so no stale cap hides the candidates the duplicates
+        // would have evicted
         let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/search/repositories") {
@@ -2645,8 +2530,8 @@ mod tests {
                 if line.contains("q=jane.dupont") {
                     // second query: the page leads with the two
                     // already-collected candidates, then 98 distinct new
-                    // ones: the room left (48) must be filled with the new
-                    // ones, not eaten by the duplicates
+                    // ones: all 98 fresh candidates are kept — the page
+                    // leads with duplicates but no cap throws anything away
                     let mut items: Vec<String> = vec![
                         r#"{"html_url": "https://github.com/acme/one"}"#.to_string(),
                         r#"{"html_url": "https://github.com/acme/two"}"#.to_string(),
@@ -2662,7 +2547,7 @@ mod tests {
                         format!(r#"{{"items": [{}]}}"#, items.join(",")),
                     );
                 }
-                // the domain query is never reached: the cap is already full
+                // the domain query's listing
                 return (200, vec![], r#"{"items": []}"#.to_string());
             }
             if line.contains("/repos/") {
@@ -2679,8 +2564,8 @@ mod tests {
 
         assert!(report.account.is_none());
         assert_eq!(
-            searched, MAX_CANDIDATE_REPOS,
-            "duplicate hits must not eat the per-query candidate budget"
+            searched, 100,
+            "the two lead duplicates are deduplicated, the 98 fresh candidates are all kept (no cap eats them)"
         );
     }
 
@@ -2764,11 +2649,14 @@ mod tests {
     }
 
     #[test]
-    fn the_per_query_budget_is_spent_on_distinct_candidates_across_pages() {
-        // one query, two pages: 30 distinct candidates on the first page
-        // (the rest are its own repeats), then 40 distinct ones on the
-        // second: only the 20 that fill the 50-candidate cap may be kept,
-        // and the walk must stop there instead of burning a third page
+    fn all_distinct_candidates_survive_across_a_querys_pages() {
+        // two full pages per query, the same listing served to each of the
+        // address's three queries (the folded name, the raw local part, the
+        // domain): 30 distinct candidates on the first page (the rest are
+        // its own repeats), then 70 distinct ones on the second (plus
+        // repeats): NO cap truncates anything — all 100 distinct candidates
+        // are kept, and each query's walk continues to the short page that
+        // ends the listing
         let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/search/repositories") {
@@ -2787,9 +2675,9 @@ mod tests {
                         items
                     }
                     2 => {
-                        // 40 fresh candidates, then 60 repeats of the first
+                        // 70 fresh candidates, then 30 repeats of the first
                         // one to fill the page
-                        let mut items: Vec<String> = (30..70)
+                        let mut items: Vec<String> = (30..100)
                             .map(|i| {
                                 format!(r#"{{"html_url": "https://github.com/acme/repo{i}"}}"#)
                             })
@@ -2798,9 +2686,8 @@ mod tests {
                         items.resize(100, first);
                         items
                     }
-                    // the budget is spent by page 2: page 3 must never be
-                    // requested
-                    _ => return (500, vec![], String::new()),
+                    // the short page that ends the listing
+                    _ => return (200, vec![], r#"{"items": []}"#.to_string()),
                 };
                 return (
                     200,
@@ -2821,13 +2708,13 @@ mod tests {
 
         assert!(report.account.is_none());
         assert_eq!(
-            searched, MAX_CANDIDATE_REPOS,
-            "the cap must be filled by distinct candidates across the query's pages"
+            searched, 100,
+            "every distinct candidate across the query's pages must be kept (no cap)"
         );
-        // two search pages (the second one ends the walk through the
-        // budget's short-page signal) plus one empty commit listing per
-        // candidate
-        assert_eq!(handled, 2 + MAX_CANDIDATE_REPOS);
+        // each of the three queries walks page 1 + the short page 2 that
+        // ends its listing (6 search pages), plus one empty commit listing
+        // per candidate
+        assert_eq!(handled, 6 + 100);
     }
 
     #[test]
@@ -2849,7 +2736,7 @@ mod tests {
             // the fast worker a long hold on its address and leaves the
             // second worker time to claim the other one
             if index > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/search/repositories") {
@@ -3163,10 +3050,7 @@ mod tests {
         let ((report, failure), lines) = crate::test_logger::capture(|| {
             reverse_bulk_with_partial(&scanner, &address, &addresses_path)
         });
-        assert!(
-            matches!(failure, Some(_)),
-            "a 5xx mid-run must abort the bulk run"
-        );
+        assert!(failure.is_some(), "a 5xx mid-run must abort the bulk run");
         assert_eq!(
             report.results.len(),
             1,
@@ -3190,6 +3074,16 @@ mod tests {
         )
         .expect("the partial report must be valid JSON");
         assert_eq!(parsed["results"].as_array().map(Vec::len), Some(1));
+        // the skipped inventory travels in the report, not only in the log:
+        // an operator re-running the interrupted lookups reads the addresses
+        // from the JSON instead of diffing two files
+        assert_eq!(
+            parsed["skipped_addresses"],
+            serde_json::json!(["doomed@acme.com"])
+        );
+        assert_eq!(parsed["summary"]["skipped"], 1);
+        // the provenance stamps the partial report too
+        assert_eq!(parsed["tool_version"], env!("CARGO_PKG_VERSION"));
         std::fs::remove_file(&json_path).ok();
         std::fs::remove_file(&addresses_path).ok();
         server.join();

@@ -36,8 +36,10 @@
 //!
 //! # API-only deltas (documented)
 //!
-//! - the REST commits API exposes the default branch only (the clone-based tools iterate
-//!   all branches), so the history and emails are the ones visible on the
+//! - the commit walk covers the default branch only (the API *can* address
+//!   other refs via a `sha` parameter, but per-branch walking multiplies the
+//!   request cost and is not attempted), so the history and emails are the
+//!   ones visible on the
 //!   default branches;
 //! - the noreply history only reveals usernames for targets that committed
 //!   at least once with the `id+username@users.noreply.github.com` form.
@@ -53,42 +55,56 @@
 //!
 //! # Request budget
 //!
-//! Unlike the reverse-email heuristic (which caps itself at 50 candidate
-//! repositories), the `user` and `org` investigations are exhaustive on
-//! their listings: the target's repositories and the organization's members
-//! and repositories walk every page until the API answers the empty
-//! end-of-listing page. Two budgets bound the rest, so that no single step
-//! can burn the whole hourly token pool and abort a nearly-complete
-//! investigation:
+//! Unlike the reverse-email heuristic (which bounds itself by its
+//! candidate-search queries), the `user` and `org` investigations are
+//! exhaustive on their listings: the target's repositories and the
+//! organization's members and repositories walk every page until the API
+//! answers the empty end-of-listing page, and each listed repository's
+//! default-branch commit walk covers the full history with no local budget.
+//! One documented API ceiling remains, so that no single step can burn the
+//! whole hourly token pool and abort a nearly-complete investigation:
 //!
-//! - every listed repository's default-branch commit walk is capped at 10
-//!   pages of 100 commits (the `sources::repository::MAX_COMMIT_PAGES` ×
-//!   `sources::PER_PAGE` budget shared by every repository scan) — and a
-//!   warning says the history may be incomplete when the budget cuts the
-//!   walk;
 //! - the external-contributions search is capped at GitHub's documented
 //!   1000-result search window.
 //!
 //! A prolific target therefore costs requests proportionally to its public
-//! history — bounded by the token pool, the API rate limits and these two
+//! history — bounded by the token pool, the API rate limits and this
 //! budgets.
 
 use crate::consts::{GITHUB_API_BASE, NOREPLY_DOMAIN, WEB_FLOW_EMAIL};
 use crate::errors::Error;
 use crate::github::{Client, fetch_paginated, fetch_paginated_with_page_size};
-use crate::output::sanitize_log_text as log_safe;
-use crate::sources::{MAX_COMMIT_PAGES, PER_PAGE, SEARCH_RESULT_CEILING, Scanner, is_usable_email};
-use log::info;
-use reqwest::StatusCode;
-use serde::Serialize;
-use serde_json::Value;
+use crate::sources::{PER_PAGE, SEARCH_RESULT_CEILING, Scanner, is_usable_email};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+mod parsing;
+mod report;
+mod variants;
+
+#[cfg(test)]
+use crate::user::variants::{MAX_GENERATED_VARIANTS, MAX_VARIANT_NAME_PAIRS, generate_variants};
+pub(crate) use parsing::validate_username;
+#[cfg(test)]
+use report::VariantMatch;
+pub use report::{
+    EmailSighting, ExternalContribution, NameSighting, Profile, SecondaryAccount, SshKey,
+    UserReport, UsernameSighting, Variants,
+};
+pub use variants::validate_variant_pattern;
+pub(crate) use variants::{MAX_CUSTOM_VARIANT_PATTERNS, MAX_VARIANT_DOMAINS, build_variants};
+#[cfg(test)]
+use variants::{MAX_VARIANT_PATTERN_BYTES, pair_from_folded_name};
+
+use crate::sanitize::log_safe;
+use crate::user::parsing::{
+    CommitPeople, ExternalHit, parse_external_page, parse_keys_page, parse_people_page,
+    parse_profile, parse_user_repos_page,
+};
 
 /// RFC 5321 caps a forward-path at 254 bytes: a commit email field longer
 /// than that is never a deliverable mailbox, so it can neither be the
 /// target's real address nor feed the variant engine a usable "domain".
 const MAX_COMMIT_EMAIL_BYTES: usize = 254;
-
 /// Upper bound on a commit author/committer name fed to the folded-name
 /// map: git permits arbitrarily long names, and a hostile commit can plant
 /// a multi-megabyte field that would amplify into memory, report and logs
@@ -96,220 +112,28 @@ const MAX_COMMIT_EMAIL_BYTES: usize = 254;
 /// the lengths). 4096 bytes is far above any real name.
 const MAX_COMMIT_NAME_BYTES: usize = 4096;
 
-/// Upper bound on one caller-supplied `--variant-pattern` template: a
-/// longer pattern can only be pathological (the generated local-part must
-/// fit RFC 5321's 64-byte bound anyway), and every count in the engine is
-/// capped against hostile input — so is this one.
-const MAX_VARIANT_PATTERN_BYTES: usize = 128;
-
-/// The `profile` object of the investigation report: the fields of
-/// `GET /users/{u}` that carry OSINT value. Absent fields are `null`
-/// (`public_repos` defaults to `0`).
-#[derive(Debug, Clone, Serialize)]
-pub struct Profile {
-    /// The profile login (unique, case-insensitive).
-    pub login: String,
-    /// The numeric GitHub id: the stable key of the noreply technique.
-    pub id: u64,
-    /// The display name set by the account ("Jane Dupont").
-    pub name: Option<String>,
-    /// The company field.
-    pub company: Option<String>,
-    /// The blog URL field.
-    pub blog: Option<String>,
-    /// The location field.
-    pub location: Option<String>,
-    /// The public email field.
-    pub email: Option<String>,
-    /// The bio field.
-    pub bio: Option<String>,
-    /// The Twitter/X username field.
-    pub twitter_username: Option<String>,
-    /// How many public repositories the account owns.
-    pub public_repos: u64,
-    /// The account creation date (ISO 8601).
-    pub created_at: Option<String>,
-    /// The GitHub account type (`User`, `Organization`, `Bot`).
-    #[serde(rename = "type")]
-    pub account_type: Option<String>,
-}
-
-/// One username of the `usernames_history`: a login the target committed
-/// with (noreply `<id>+<username>` form, id matching the target's), the
-/// names seen with it and the repositories where it appeared.
-#[derive(Debug, Clone, Serialize)]
-pub struct UsernameSighting {
-    /// The username revealed by the noreply email.
-    pub username: String,
-    /// The commit names seen with this username (normalized: lowercased,
-    /// ASCII-folded — see the variants section of the README).
-    pub names: Vec<String>,
-    /// The target's repositories where this username was seen.
-    pub repos: Vec<String>,
-}
-
-/// One name of the `names_history`: a commit name seen with the target's
-/// id (noreply form or legacy `<id>@users.noreply.github.com` form), and
-/// the repositories where it appeared.
-#[derive(Debug, Clone, Serialize)]
-pub struct NameSighting {
-    /// The commit name, normalized (lowercased, ASCII-folded).
-    pub name: String,
-    /// The target's repositories where this name was seen.
-    pub repos: Vec<String>,
-}
-
-/// One email of the `emails` (and `local_identities`) lists: an email found
-/// on the target's repositories' commits, the names seen with it and the
-/// repositories where it appeared.
-#[derive(Debug, Clone, Serialize)]
-pub struct EmailSighting {
-    /// The email as found in the commits.
-    pub email: String,
-    /// The commit names seen with this email (normalized).
-    pub names: Vec<String>,
-    /// The target's repositories where this email was seen.
-    pub repos: Vec<String>,
-}
-
-/// One variant email of the `variants.matched` list: a generated
-/// `first/last × domain` combination that was actually observed among the
-/// target's commit emails.
-#[derive(Debug, Clone, Serialize)]
-pub struct VariantMatch {
-    /// The variant email, matched against an observed commit email
-    /// (case-insensitively).
-    pub email: String,
-    /// The pattern that generated it (`first.last`, `firstlast`,
-    /// `initiallast`, `first_last`, `initial_last`, `first`, `last`,
-    /// `initial.last` — the built-in variants combinatorics).
-    pub pattern: String,
-    /// The domain the variant was generated for.
-    pub domain: String,
-}
-
-/// The `variants` object: the email variants combinatorics
-/// (`{first}.{last}`, `{first}{last}`, `{initial}{last}`, `{first}_{last}`,
-/// `{initial}_{last}`, `{first}`, `{last}`, `{initial}.{last}`) applied to
-/// the first/last names extracted from the profile name and the commit
-/// names seen with the target's id (noreply technique), crossed with the
-/// domains deduced from the emails already found on the target (noreply
-/// excluded).
-#[derive(Debug, Clone, Serialize)]
-pub struct Variants {
-    /// Generated variant emails that were actually observed in the target's
-    /// commits.
-    pub matched: Vec<VariantMatch>,
-    /// Generated variant emails that were never observed (candidates to
-    /// check elsewhere, not findings).
-    pub generated: Vec<String>,
-}
-
-/// One candidate secondary account of the `secondary_accounts` list, with
-/// the evidence that flagged it. Both detection kinds are heuristics.
-#[derive(Debug, Clone, Serialize)]
-pub struct SecondaryAccount {
-    /// How the candidate was detected: `co-author` (an email seen in two or
-    /// more of the target's repositories whose names never overlap the
-    /// target's own names), `noreply-username` (a noreply pair whose id
-    /// differs from the target's but whose username matches a known target
-    /// username) or `noreply-name` (same, but only the commit names match a
-    /// known target name).
-    pub kind: String,
-    /// The identity behind the candidate: the email itself for `co-author`,
-    /// or the `id+username@users.noreply.github.com` noreply address for the
-    /// noreply kinds.
-    pub identity: String,
-    /// The names seen with this identity (normalized).
-    pub names: Vec<String>,
-    /// The target's repositories where this identity was seen (the evidence).
-    pub repos: Vec<String>,
-}
-
-/// One public SSH key of the `ssh_keys` list (`GET /users/{u}/keys`).
-#[derive(Debug, Clone, Serialize)]
-pub struct SshKey {
-    /// The GitHub key id.
-    pub id: u64,
-    /// The public key material (`ssh-ed25519 AAAA…`, `ssh-rsa AAAA…`).
-    pub key: String,
-}
-
-/// One repository of the `external_contributions` list: a repository
-/// outside the target's own account holding commits authored by the target
-/// (`search/commits q=author:<user> -user:<user>`).
-#[derive(Debug, Clone, Serialize)]
-pub struct ExternalContribution {
-    /// The repository `owner/name`.
-    pub repository: String,
-    /// The repository HTML URL, when the search result carried one.
-    pub url: Option<String>,
-    /// How many authored commits the search listing exposed for this
-    /// repository (at most the number of listed pages × page size: the
-    /// listing caps the count, the repository is the finding).
-    pub commits: usize,
-}
-
-/// The full investigation report: the terminal summary sections and the
-/// enriched `--json` shape, documented in the README.
-#[derive(Debug, Clone, Serialize)]
-pub struct UserReport {
-    /// The investigated profile.
-    pub profile: Profile,
-    /// The usernames history revealed by the noreply technique.
-    pub usernames_history: Vec<UsernameSighting>,
-    /// The names history seen with the target's id.
-    pub names_history: Vec<NameSighting>,
-    /// The emails found on the target's repositories (noreply addresses
-    /// excluded: they feed the histories instead).
-    pub emails: Vec<EmailSighting>,
-    /// The email variants, matched and generated.
-    pub variants: Variants,
-    /// The potential secondary accounts, with their evidence.
-    pub secondary_accounts: Vec<SecondaryAccount>,
-    /// The public SSH keys of the account.
-    pub ssh_keys: Vec<SshKey>,
-    /// The external contributions of the target.
-    pub external_contributions: Vec<ExternalContribution>,
-    /// The machine-local identities (UPN-like) among the found emails,
-    /// flagged by the documented heuristic.
-    pub local_identities: Vec<EmailSighting>,
-}
-
-/// Runs the full investigation of one GitHub user: fetches the profile,
-/// walks the target's repositories' commits (noreply technique and emails),
-/// lists the external contributions and the SSH keys, then builds the
-/// report and logs the terminal summary.
-///
-/// The report carries the usernames/names history (noreply technique), the
-/// emails and their variants, potential secondary accounts, the public SSH
-/// keys and the external contributions.
-///
-/// `custom_variant_patterns` are the caller-supplied `--variant-pattern`
-/// templates (e.g. `{last}{first}`), appended to the built-in patterns;
-/// they are validated here (syntax and a 64-pattern cap) so a library
-/// caller gets the same client-side rejection as the CLI.
+/// Investigates one GitHub profile end to end: the target's own
+/// repositories' commit walk (the noreply technique's source), the
+/// external-contributions search and the SSH keys listing, folded into the
+/// documented report. See the module documentation for the request budget.
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidUsername`] when `username` is not a valid GitHub
-/// username (rejected client-side, before any network request),
-/// [`Error::Organization`] when the profile is an organization (the message
-/// points at the dedicated `org` subcommand), [`Error::NotFound`] for a
-/// missing profile, [`Error::PrivateOrUnavailable`] or
-/// [`Error::RateLimitExhausted`] / [`Error::Http`] for the corresponding API
-/// failures. The skip-vs-abort contract (unscannable repositories, rate
-/// limits) is the module-level one. Never panics.
+/// The corresponding API failures: a private or nonexistent target,
+/// rate-limit and transport conditions, the malformed-payload errors of
+/// the parsers.
 pub fn investigate(
     scanner: &Scanner,
     username: &str,
     custom_variant_patterns: &[String],
+    include_forks: bool,
 ) -> Result<UserReport, Error> {
     investigate_at_with_patterns(
         scanner.client(),
         GITHUB_API_BASE,
         username,
         custom_variant_patterns,
+        include_forks,
     )
 }
 
@@ -321,12 +145,13 @@ pub fn investigate(
 ///
 /// # Errors
 ///
-/// The same failures as [`investigate`]. Never panics.
+/// The same failures as [`investigate`].
 fn investigate_at_with_patterns(
     client: &Client,
     base: &str,
     username: &str,
     custom_variant_patterns: &[String],
+    include_forks: bool,
 ) -> Result<UserReport, Error> {
     validate_username(username)?;
     if custom_variant_patterns.len() > MAX_CUSTOM_VARIANT_PATTERNS {
@@ -359,7 +184,7 @@ fn investigate_at_with_patterns(
     let repositories: Vec<String> = fetch_paginated(
         client,
         |page| format!("{base}/users/{username}/repos?per_page={PER_PAGE}&page={page}"),
-        parse_repository_page,
+        |json| parse_user_repos_page(json, include_forks),
         None,
     )?;
     scan_repository_commits(client, base, &repositories, &mut investigation)?;
@@ -399,15 +224,13 @@ fn investigate_at_with_patterns(
 }
 
 /// Walks each target repository's default-branch commit listing and feeds
-/// every commit identity to the investigation. The same per-repository
-/// commit budget as every other repository scan ([`MAX_COMMIT_PAGES`]) —
-/// the walk sits mid-investigation, so one large repository must not burn
-/// the hourly token pool and abort a nearly-complete investigation. A
-/// resource-scoped failure (a private, deleted or empty repository —
-/// GitHub answers 409 on `/commits` for one with no commits) skips the
-/// repository with a warning instead of discarding what the other
-/// repositories already gave; a rate-limit or transport failure is a
-/// scan-wide condition and propagates.
+/// every commit identity to the investigation. The walk covers the
+/// repository's full default-branch history with no local budget, like
+/// every other repository scan. A resource-scoped failure (a private,
+/// deleted or empty repository — GitHub answers 409 on `/commits` for one
+/// with no commits) skips the repository with a warning instead of
+/// discarding what the other repositories already gave; a rate-limit or
+/// transport failure is a scan-wide condition and propagates.
 fn scan_repository_commits(
     client: &Client,
     base: &str,
@@ -424,13 +247,8 @@ fn scan_repository_commits(
             );
             continue;
         };
-        // the same per-repository commit budget as every other repository
-        // scan ([MAX_COMMIT_PAGES]): the walk sits mid-investigation (the
-        // SSH keys and the external contributions come after), so a single
-        // large repository must not burn the whole hourly token pool on one
-        // commit history and abort a nearly-complete investigation
-        let listed_commits = std::cell::Cell::new(0usize);
-        let commit_ceiling = MAX_COMMIT_PAGES * usize::from(PER_PAGE);
+        // no local budget: the walk ends when GitHub's listing ends, the
+        // only ceilings are GitHub's
         let commits: Vec<CommitPeople> = match fetch_paginated_with_page_size(
             client,
             |page| {
@@ -445,28 +263,12 @@ fn scan_repository_commits(
             },
             |json| {
                 let (page_people, raw_count) = parse_people_page(json)?;
-                listed_commits.set(listed_commits.get() + raw_count);
                 Ok((page_people, raw_count))
             },
-            Some(commit_ceiling),
+            None,
             PER_PAGE,
         ) {
-            Ok(commits) => {
-                if listed_commits.get() >= commit_ceiling {
-                    // the raw-count ceiling was reached: the walk was cut at
-                    // the repository budget (a repository with exactly
-                    // `commit_ceiling` commits also lands here — the "may"
-                    // phrasing keeps the warning honest for that boundary
-                    // case too). Say so instead of letting the report look
-                    // complete
-                    log::warn!(
-                        "repository {}: only the most recent {} commits were scanned (built-in limit), older commits may hold emails that were missed",
-                        log_safe(full_name),
-                        listed_commits.get()
-                    );
-                }
-                commits
-            }
+            Ok(commits) => commits,
             // a resource-scoped failure (a private, deleted or empty
             // repository — GitHub answers 409 on /commits for a repository
             // with no commits) must not abort the whole investigation and
@@ -508,7 +310,7 @@ fn scan_repository_commits(
 /// # Errors
 ///
 /// Returns [`Error::SearchRejected`] on a page-1 422 and propagates every
-/// other failure. Never panics.
+/// other failure.
 fn fetch_external_hits(
     client: &Client,
     base: &str,
@@ -544,17 +346,29 @@ fn fetch_external_hits(
         // network worked, so the generic Http message ("check your
         // internet connection") would mislead — `SearchRejected`
         // carries the real cause and the next step
-        Err(Error::Http(err)) if err.status() == Some(StatusCode::UNPROCESSABLE_ENTITY) => {
-            if collected.get() == 0 {
-                return Err(Error::SearchRejected);
+        Err(err) => {
+            match crate::sources::classify_search_window_422(&err, collected.get()) {
+                // a page-1 422 is the API rejecting the query itself (bad
+                // qualifier shape, unsupported search): reached means the
+                // network worked, so the generic Http message ("check your
+                // internet connection") would mislead — `SearchRejected`
+                // carries the real cause and the next step
+                Some(crate::sources::SearchWindow422::Reject) => {
+                    return Err(Error::SearchRejected);
+                }
+                // a window 422 past the ceiling ends the listing with a
+                // warning instead of aborting the whole investigation with
+                // a raw HTTP error (the same seam as the parallel search)
+                Some(crate::sources::SearchWindow422::Cut) => {
+                    log::warn!(
+                        "external contributions cut at GitHub's 1000-result search ceiling: {} collected contributions discarded",
+                        collected.get()
+                    );
+                    Vec::new()
+                }
+                None => return Err(err),
             }
-            log::warn!(
-                "external contributions cut at GitHub's 1000-result search ceiling: {} collected contributions discarded",
-                collected.get()
-            );
-            Vec::new()
         }
-        Err(err) => return Err(err),
     };
     if collected.get() >= SEARCH_RESULT_CEILING {
         // the walk reached the raw-count ceiling in its normal completion
@@ -640,396 +454,6 @@ fn fold_emails(
 /// (case-insensitively). Both input dimensions are capped (see the
 /// `MAX_VARIANT_*` constants): commit names and commit emails are
 /// forgeable and uncapped, and the raw combinatorics multiplied them into
-/// an analyst-machine DoS.
-fn build_variants(
-    known_names: BTreeSet<String>,
-    name_weights: &BTreeMap<String, usize>,
-    profile_name: Option<&str>,
-    domains: Vec<String>,
-    email_keys: BTreeSet<String>,
-    custom_variant_patterns: &[String],
-) -> Variants {
-    // One O(N) pass: fold every name once and accumulate its raw
-    // sighting weight into its (first, last) pair. The previous
-    // per-pair ranking re-scanned and re-folded ALL known names for
-    // EVERY distinct pair — quadratic in the uncapped, target-forgeable
-    // commit-name count (the per-repository walk cap bounds one
-    // repository, but the target's own repositories multiply it), all
-    // paid BEFORE the MAX_VARIANT_NAME_PAIRS truncation below
-    // a BTreeMap keeps the pair iteration deterministic (pair asc), so
-    // the stable weight sort below resolves equal weights
-    // deterministically — a dropped tie-break cannot hide behind
-    // HashMap's randomized order
-    let mut pair_weights: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for name in &known_names {
-        if let Some(pair) = pair_from_folded_name(&fold_name(name)) {
-            *pair_weights.entry(pair).or_default() += name_weights.get(name).copied().unwrap_or(0);
-        }
-    }
-    let mut weighted_pairs: Vec<((String, String), usize)> = pair_weights.into_iter().collect();
-    weighted_pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let mut pairs: Vec<(String, String)> =
-        weighted_pairs.into_iter().map(|(pair, _)| pair).collect();
-    let profile_pair = profile_name
-        .and_then(folded_commit_name)
-        .and_then(|name| pair_from_folded_name(&name));
-    if let Some(profile_pair) = profile_pair {
-        pairs.retain(|pair| pair != &profile_pair);
-        pairs.insert(0, profile_pair);
-    }
-    if pairs.len() > MAX_VARIANT_NAME_PAIRS {
-        log::warn!(
-            "address guessing used only the top {MAX_VARIANT_NAME_PAIRS} name spellings ({} seen): the least common spellings were skipped",
-            pairs.len()
-        );
-        pairs.truncate(MAX_VARIANT_NAME_PAIRS);
-    }
-    let mut matched: Vec<VariantMatch> = Vec::new();
-    let mut matched_emails: BTreeSet<String> = BTreeSet::new();
-    let mut generated: BTreeSet<String> = BTreeSet::new();
-    for (first, last) in pairs {
-        for domain in &domains {
-            for (email, pattern) in
-                generate_variants(&first, &last, domain, custom_variant_patterns)
-            {
-                if email_keys.contains(&email) {
-                    // two known names can collapse onto the same
-                    // generated address ("Jane Dupont" → (jane, dupont)
-                    // and "J Dupont" → (j, dupont) both produce
-                    // jdupont@…): the email is reported once, with the
-                    // pattern of the first built-in-ordered pair that hit it
-                    if matched_emails.insert(email.clone()) {
-                        matched.push(VariantMatch {
-                            email,
-                            pattern,
-                            domain: domain.clone(),
-                        });
-                    }
-                } else if generated.len() < MAX_GENERATED_VARIANTS {
-                    // the generated list is capped (a hostile target must
-                    // not be able to inflate the report without bound);
-                    // the matching above keeps running so a variant
-                    // beyond the cap can still be reported as matched
-                    generated.insert(email);
-                }
-            }
-        }
-    }
-    if generated.len() >= MAX_GENERATED_VARIANTS {
-        if custom_variant_patterns.is_empty() {
-            log::warn!(
-                "the list of guessed addresses stops at {MAX_GENERATED_VARIANTS} entries: extra guesses are not listed (confirmed addresses are unaffected)"
-            );
-        } else {
-            log::warn!(
-                "the list of guessed addresses stops at {MAX_GENERATED_VARIANTS} entries: extra guesses are not listed (confirmed addresses are unaffected); the built-in patterns alone can fill this list on a broad target, so custom --variant-pattern guesses that were confirmed are still reported but some unconfirmed ones may be missing from the list"
-            );
-        }
-    }
-    Variants {
-        matched,
-        generated: generated.into_iter().collect(),
-    }
-}
-
-/// Validates a GitHub username client-side, before any network request:
-/// 1 to 39 ASCII letters, digits or hyphens, without a leading or trailing
-/// hyphen and without consecutive hyphens (GitHub's documented username
-/// rules). Used both for the `user` target and for the commit-forged
-/// noreply username payloads (see [`parse_noreply`]): a shape GitHub could
-/// never have issued must not plant a bogus past username.
-pub(crate) fn validate_username(username: &str) -> Result<(), Error> {
-    let valid = !username.is_empty()
-        && username.len() <= 39
-        && !username.starts_with('-')
-        && !username.ends_with('-')
-        && !username.contains("--")
-        && username
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-');
-    if valid {
-        Ok(())
-    } else {
-        Err(Error::InvalidUsername(username.to_string()))
-    }
-}
-
-/// The shared listing guard: a 200 body that is not a JSON array is an
-/// intermediary or a shape change, not an empty page, and must fail
-/// explicitly (the error text names the payload, per call site).
-///
-/// # Errors
-///
-/// Returns [`Error::InvalidProfile`] with `message` when the body is not a
-/// JSON array. Never panics.
-fn require_array<'a>(json: &'a Value, message: &str) -> Result<&'a [Value], Error> {
-    match json.as_array() {
-        Some(items) => Ok(items.as_slice()),
-        None => Err(Error::InvalidProfile(message.to_string())),
-    }
-}
-
-/// Extracts the documented profile fields from a `GET /users/{u}` body.
-/// `login` and `id` are required: the noreply technique keys on the id and
-/// the report on the login, so a partial body without them must fail
-/// explicitly instead of silently producing a report with an empty login
-/// and an id (`0`) that can never match. Every other field is optional: a
-/// partial body yields `None`s instead of failing the whole investigation.
-///
-/// # Errors
-///
-/// Returns [`Error::InvalidProfile`] when `login` or `id` is missing from
-/// the payload. Never panics.
-fn parse_profile(json: &Value) -> Result<Profile, Error> {
-    let string_field = |name: &str| {
-        json.get(name)
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    };
-    let login = string_field("login")
-        .ok_or_else(|| Error::InvalidProfile("missing `login`".to_string()))?;
-    let id = json
-        .get("id")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| Error::InvalidProfile("missing `id`".to_string()))?;
-    Ok(Profile {
-        login,
-        id,
-        name: string_field("name"),
-        company: string_field("company"),
-        blog: string_field("blog"),
-        location: string_field("location"),
-        email: string_field("email"),
-        bio: string_field("bio"),
-        twitter_username: string_field("twitter_username"),
-        public_repos: json
-            .get("public_repos")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        created_at: string_field("created_at"),
-        account_type: string_field("type"),
-    })
-}
-
-/// Extracts the `full_name` of every repository of a `/repos` page,
-/// together with the raw item count (the end-of-listing signal of
-/// `fetch_paginated`). GitHub returns `[]` for an empty listing: a 200 body
-/// that is not an array at all is an intermediary or a shape change, not an
-/// empty page, and must fail explicitly instead of yielding a
-/// complete-looking zero-repository report (the same explicit-requirement
-/// rule as the `org` investigation's listings).
-///
-/// # Errors
-///
-/// Returns [`Error::InvalidProfile`] when the body is not a JSON array.
-/// Never panics.
-fn parse_repository_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
-    let items = require_array(json, "repositories payload: not an array")?;
-    // the listing contract is completeness: an entry without its `full_name`
-    // is skipped, but counted and warned about (the count stays the
-    // end-of-listing signal of `fetch_paginated`) instead of silently
-    // shrinking the investigated set — the same explicit rule the org and
-    // search listings apply to malformed entries. A forked repository is
-    // skipped too (warned, never silently): its default branch mirrors the
-    // upstream history the REST commits API exposes, so scanning it burns
-    // the commit budget on data that is not the target's and its upstream
-    // authors would pollute the co-author heuristics with false secondary
-    // accounts — the same public-listing rule the search and org walks apply
-    let mut repositories = Vec::new();
-    let mut malformed = 0usize;
-    let mut forks = 0usize;
-    for item in items {
-        if item.get("fork").and_then(Value::as_bool) == Some(true) {
-            forks += 1;
-            continue;
-        }
-        match item.get("full_name").and_then(Value::as_str) {
-            Some(name) => repositories.push(name.to_string()),
-            None => malformed += 1,
-        }
-    }
-    if malformed > 0 {
-        let plural = if malformed > 1 { "entries" } else { "entry" };
-        log::warn!("{malformed} malformed {plural} skipped in the repositories listing");
-    }
-    if forks > 0 {
-        let plural = if forks > 1 {
-            "repositories"
-        } else {
-            "repository"
-        };
-        log::warn!("{forks} forked {plural} skipped (their history is upstream's)");
-    }
-    Ok((repositories, items.len()))
-}
-
-/// The people a single commit exposes: both the author and the committer
-/// name/email pairs (the noreply technique reads the committer too).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommitPeople {
-    pub(crate) author_name: Option<String>,
-    pub(crate) author_email: Option<String>,
-    pub(crate) committer_name: Option<String>,
-    pub(crate) committer_email: Option<String>,
-}
-
-/// Extracts the author and committer identities of every commit of a
-/// `/commits` page, together with the raw item count. Unlike the 0.5.0
-/// email scan, noreply addresses are kept: they are the noreply technique's
-/// raw material. The per-commit parsing stays tolerant (a commit whose
-/// identity fields cannot be read is skipped), but a 200 body that is not a
-/// JSON array is an intermediary or a shape change, not an empty page, and
-/// fails explicitly like the other listings of the investigation instead of
-/// silently ending a repository's commit walk as a complete-looking empty
-/// result.
-///
-/// # Errors
-///
-/// Returns [`Error::InvalidProfile`] when the body is not a JSON array.
-/// Never panics.
-fn parse_people_page(json: &Value) -> Result<(Vec<CommitPeople>, usize), Error> {
-    let mut people: Vec<CommitPeople> = Vec::new();
-    let mut malformed = 0usize;
-    let items = require_array(json, "commits payload: not an array")?;
-    for item in items {
-        let Some(commit) = item.get("commit") else {
-            // an entry without its commit object carries no identity at
-            // all: skipped with a warning, never silently (the same
-            // warn-and-count rule the org and search listings apply)
-            malformed += 1;
-            continue;
-        };
-        let field = |role: &str, name: &str| {
-            commit
-                .get(role)
-                .and_then(|role| role.get(name))
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        };
-        people.push(CommitPeople {
-            author_name: field("author", "name"),
-            author_email: field("author", "email"),
-            committer_name: field("committer", "name"),
-            committer_email: field("committer", "email"),
-        });
-    }
-    if malformed > 0 {
-        log::warn!("{malformed} malformed entries skipped in the commits listing");
-    }
-    Ok((people, items.len()))
-}
-
-/// One external-contribution search hit: the repository holding a commit
-/// authored by the target.
-#[derive(Debug)]
-struct ExternalHit {
-    repository: String,
-    url: Option<String>,
-}
-
-/// Extracts the external repositories of a `search/commits` page: the
-/// repository `full_name` and `html_url` of every listed commit, with the
-/// raw item count. A rejected search (`{"items": null}`) ends the listing.
-/// A 200 body without an `items` field at all, or with an `items` field that
-/// is neither an array nor `null`, is an intermediary or a shape change, not
-/// an empty page, and fails explicitly (the same rule as
-/// [`crate::sources::search`]'s `parse_search_page`) instead of yielding a
-/// complete-looking report whose external-contributions section silently
-/// went missing.
-///
-/// # Errors
-///
-/// Returns [`Error::InvalidProfile`] when the body carries no `items` field
-/// or an `items` field that is neither an array nor `null`. Never panics.
-fn parse_external_page(json: &Value) -> Result<(Vec<ExternalHit>, usize), Error> {
-    let Some(items) = json.get("items") else {
-        return Err(Error::InvalidProfile(
-            "external payload: no `items` field".to_string(),
-        ));
-    };
-    let Some(items) = items.as_array() else {
-        if items.is_null() {
-            // a rejected search (`{"items": null}`) is a documented empty page
-            return Ok((Vec::new(), 0));
-        }
-        // any other non-array shape is an intermediary or a shape change,
-        // not an empty page: it must fail explicitly instead of silently
-        // ending the listing as a complete-looking empty result
-        return Err(Error::InvalidProfile(
-            "external payload: `items` is not an array".to_string(),
-        ));
-    };
-    let mut hits = Vec::new();
-    let mut malformed = 0usize;
-    for item in items {
-        let Some(repository) = item.get("repository").and_then(Value::as_object) else {
-            malformed += 1;
-            continue;
-        };
-        let Some(full_name) = repository.get("full_name").and_then(Value::as_str) else {
-            malformed += 1;
-            continue;
-        };
-        hits.push(ExternalHit {
-            repository: full_name.to_string(),
-            url: repository
-                .get("html_url")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        });
-    }
-    if malformed > 0 {
-        let plural = if malformed > 1 { "entries" } else { "entry" };
-        log::warn!("{malformed} malformed {plural} skipped in the external contributions listing");
-    }
-    Ok((hits, items.len()))
-}
-
-/// Extracts the public SSH keys of a `/users/{u}/keys` page, with the raw
-/// item count. An item missing its `id` or `key` material is skipped (a
-/// partial payload is not reported with a fake `id` 0 that can never
-/// match), mirroring the explicit-requirement strictness applied to the
-/// profile's `login`/`id`. A 200 body that is not a JSON array is an
-/// intermediary or a shape change, not an empty listing, and fails
-/// explicitly like the other listings of the investigation (the per-commit
-/// parsing stays tolerant: a commit it cannot read is skipped).
-///
-/// # Errors
-///
-/// Returns [`Error::InvalidProfile`] when the body is not a JSON array.
-/// Never panics.
-fn parse_keys_page(json: &Value) -> Result<(Vec<SshKey>, usize), Error> {
-    let items = require_array(json, "keys payload: not an array")?;
-    // the public endpoint documents exactly {id, key}: the title and
-    // creation date exist only on the authenticated `/user/keys` listing,
-    // so nothing here may claim them. An entry missing `id` or `key` is
-    // skipped with a warning like every other listing's malformed entries,
-    // never silently
-    let mut keys = Vec::new();
-    let mut malformed = 0usize;
-    for item in items {
-        let Some((id, key)) = item
-            .get("id")
-            .and_then(Value::as_u64)
-            .zip(item.get("key").and_then(Value::as_str))
-        else {
-            malformed += 1;
-            continue;
-        };
-        keys.push(SshKey {
-            id,
-            key: key.to_string(),
-        });
-    }
-    if malformed > 0 {
-        let plural = if malformed > 1 { "entries" } else { "entry" };
-        log::warn!("{malformed} malformed {plural} skipped in the SSH keys listing");
-    }
-    Ok((keys, items.len()))
-}
-
 /// Folds one commit name for the report, trimmed (a hostile whitespace-only
 /// name like `"   "` must not plant noise in the histories) and dropped when
 /// nothing remains.
@@ -1043,432 +467,6 @@ fn folded_commit_name(name: &str) -> Option<String> {
     }
     let folded = fold_name(name.trim());
     (!folded.is_empty()).then_some(folded)
-}
-
-impl UserReport {
-    /// Logs the human-readable terminal report: one section per finding
-    /// family (PROFILE / USERNAMES HISTORY / EMAILS / VARIANTS / SECONDARY
-    /// ACCOUNTS / SSH KEYS / EXTERNAL CONTRIBUTIONS), with the local
-    /// identities flagged inside the EMAILS section. An empty section prints
-    /// its own explicit `[-]` line instead of disappearing silently. Every
-    /// untrusted string (commit metadata, profile fields)
-    /// is sanitized first: control characters become `_`, so a
-    /// hostile commit can never forge or spoof log lines. Never panics.
-    fn log_summary(&self) {
-        let profile = &self.profile;
-        info!("============ PROFILE ============");
-        info!(
-            "[+] login: {} (id {})",
-            log_safe(&profile.login),
-            profile.id
-        );
-        for (label, field) in [
-            ("name", &profile.name),
-            ("company", &profile.company),
-            ("blog", &profile.blog),
-            ("location", &profile.location),
-            ("email", &profile.email),
-            ("bio", &profile.bio),
-            ("twitter", &profile.twitter_username),
-            ("created at", &profile.created_at),
-        ] {
-            if let Some(value) = field {
-                info!("[+] {label}: {}", log_safe(value));
-            }
-        }
-        info!(
-            "[+] type: {}",
-            profile
-                .account_type
-                .as_deref()
-                .map(log_safe)
-                .unwrap_or_else(|| "unknown".to_string())
-        );
-        info!("[+] public repos: {}", profile.public_repos);
-
-        info!("============ USERNAMES HISTORY ============");
-        if self.usernames_history.is_empty() {
-            info!(
-                "[-] no past username found (no scanned commit carries an <id>+<username> noreply address)"
-            );
-        }
-        for sighting in &self.usernames_history {
-            info!(
-                "[+] {}: names [{}], repos [{}]",
-                log_safe(&sighting.username),
-                log_safe(&sighting.names.join(", ")),
-                log_safe(&sighting.repos.join(", "))
-            );
-        }
-
-        info!("============ EMAILS ============");
-        if self.emails.is_empty() {
-            info!("[-] no email found on the target's repositories");
-        }
-        for sighting in &self.emails {
-            info!(
-                "[+] {}: names [{}], repos [{}]",
-                log_safe(&sighting.email),
-                log_safe(&sighting.names.join(", ")),
-                log_safe(&sighting.repos.join(", "))
-            );
-        }
-        for sighting in &self.local_identities {
-            info!(
-                "[!] local identity (heuristic): {} (names [{}], repos [{}])",
-                log_safe(&sighting.email),
-                log_safe(&sighting.names.join(", ")),
-                log_safe(&sighting.repos.join(", "))
-            );
-        }
-
-        info!("============ VARIANTS ============");
-        if self.variants.matched.is_empty() && self.variants.generated.is_empty() {
-            info!("[-] no name/domain pair to generate variants from");
-        }
-        for variant in &self.variants.matched {
-            info!(
-                "[+] confirmed (seen in their commits): {} (pattern {}, domain {})",
-                log_safe(&variant.email),
-                variant.pattern,
-                log_safe(&variant.domain)
-            );
-        }
-        for email in &self.variants.generated {
-            info!(
-                "[!] guessed, not confirmed: {} (do not contact this address without checking it first)",
-                log_safe(email)
-            );
-        }
-
-        info!("============ SECONDARY ACCOUNTS ============");
-        if self.secondary_accounts.is_empty() {
-            info!("[-] no secondary account candidate");
-        }
-        // these are heuristics, not confirmations: a junior analyst must
-        // never read a possible alias as an established fact
-        info!(
-            "[.] the accounts below are candidates suggested by name overlap, not confirmed links"
-        );
-        for account in &self.secondary_accounts {
-            info!(
-                "[.] possible account: {} ({}): names [{}], repos [{}]",
-                log_safe(&account.identity),
-                account.kind,
-                log_safe(&account.names.join(", ")),
-                log_safe(&account.repos.join(", "))
-            );
-        }
-
-        info!("============ SSH KEYS ============");
-        if self.ssh_keys.is_empty() {
-            info!("[-] no public SSH key");
-        }
-        for key in &self.ssh_keys {
-            info!("[+] {}", log_safe(&key.key));
-        }
-
-        info!("============ EXTERNAL CONTRIBUTIONS ============");
-        if self.external_contributions.is_empty() {
-            info!("[-] no external contribution found");
-        }
-        for contribution in &self.external_contributions {
-            info!(
-                "[+] {}: {} commits ({})",
-                log_safe(&contribution.repository),
-                contribution.commits,
-                contribution
-                    .url
-                    .as_deref()
-                    .map(log_safe)
-                    .unwrap_or_else(|| "no url".to_string())
-            );
-        }
-    }
-}
-
-/// Parses a GitHub noreply email into its numeric owner id and, when the
-/// modern `<id>+<username>` form is used, the username it carries:
-///
-/// - `12345+jane@users.noreply.github.com` → `(12345, Some("jane"))`;
-/// - `12345@users.noreply.github.com` (legacy pre-2017 form) →
-///   `(12345, None)`: it reveals the id only, so callers fall back to the
-///   current username;
-/// - any other email (real address, wrong domain, non-numeric id, empty
-///   username) → `None`.
-///
-/// The username is only accepted when it follows GitHub's full username
-/// shape (1-39 ASCII letters, digits or hyphens, without leading/trailing
-/// or consecutive hyphens — see [`validate_username`]):
-/// commit author emails are free-form and attacker-influenceable, so a
-/// payload like `42+jane doe@users.noreply.github.com` or `42+j--ane@…`
-/// must never plant a bogus past username in the report. Such an email
-/// falls back to the legacy id-only handling (`(42, None)`).
-fn parse_noreply(email: &str) -> Option<(u64, Option<&str>)> {
-    let (local, domain) = email.rsplit_once('@')?;
-    if !domain.eq_ignore_ascii_case(NOREPLY_DOMAIN) {
-        return None;
-    }
-    if let Some((id, username)) = local.split_once('+') {
-        let id = id.parse::<u64>().ok()?;
-        if username.is_empty() {
-            return None;
-        }
-        if validate_username(username).is_ok() {
-            Some((id, Some(username)))
-        } else {
-            // not a possible GitHub username: keep the id (legacy handling)
-            // but never record the free-form payload as a past username
-            Some((id, None))
-        }
-    } else {
-        let id = local.parse::<u64>().ok()?;
-        Some((id, None))
-    }
-}
-
-/// Whether an email looks machine-local (UPN-like, e.g.
-/// `jeanpierre@My-Computer.local`). **Documented heuristic**: a domain
-/// ending with `.local` or `.lan` (mDNS/Windows workgroup conventions), or
-/// a single-label domain with no dot at all (`jeanpierre@mycomputer`).
-/// A dotful public-looking domain is never flagged, and a false positive
-/// only adds one candidate to the `local_identities` list.
-fn is_local_identity(email: &str) -> bool {
-    let Some((_, domain)) = email.rsplit_once('@') else {
-        return false;
-    };
-    let domain = domain.to_ascii_lowercase();
-    domain.ends_with(".local") || domain.ends_with(".lan") || !domain.contains('.')
-}
-
-/// ASCII-folds a name for email-variant generation: lowercased, and the
-/// accents stripped **only for the common Latin-1 range** (hand-rolled, no
-/// unicode crate), plus the Latin digraphs `ß`→`ss`, `æ`→`ae` and
-/// `œ`→`oe` and the stroke letters `ø`→`o`. Any other script (Cyrillic,
-/// CJK, …) is kept raw: the variants generated from it simply will not
-/// match ASCII emails, which is the honest behavior.
-fn fold_name(name: &str) -> String {
-    let mut folded = String::with_capacity(name.len());
-    for c in name.to_lowercase().chars() {
-        match c {
-            'à'..='å' => folded.push('a'),
-            'ç' => folded.push('c'),
-            'è'..='ë' => folded.push('e'),
-            'ì'..='ï' => folded.push('i'),
-            'ñ' => folded.push('n'),
-            'ò'..='ö' => folded.push('o'),
-            'ø' => folded.push('o'),
-            'ù'..='ü' => folded.push('u'),
-            'ý' | 'ÿ' => folded.push('y'),
-            'ß' => folded.push_str("ss"),
-            'æ' => folded.push_str("ae"),
-            'œ' => folded.push_str("oe"),
-            other => folded.extend(other.to_lowercase()),
-        }
-    }
-    folded
-}
-
-/// The variant engine's input caps. Commit names and commit emails are
-/// attacker-forgeable and uncapped (one merged PR can plant thousands of
-/// name spellings and email domains), and the combinatorics multiply
-/// every known name pair by every deduced email domain: measured on the
-/// uncapped engine, 300 planted names × 300 planted domains produce
-/// 361,200 variants and seconds of CPU (extrapolating to a hostile
-/// 5,000-commit PR: tens of millions of variants, minutes-to-hours of CPU
-/// and a multi-gigabyte report). A real target has a handful of name
-/// spellings and mail domains; beyond the caps the extra inputs are
-/// attacker noise, so the engine is bounded deterministically (sorted
-/// pairs, most-sighted domains first) with a warning when a cap bites.
-const MAX_VARIANT_NAME_PAIRS: usize = 64;
-
-/// See [`MAX_VARIANT_NAME_PAIRS`]: the per-scan cap on the distinct email
-/// domains fed to the variant engine (most-sighted domains first, ties
-/// broken alphabetically, noreply excluded as before).
-const MAX_VARIANT_DOMAINS: usize = 64;
-
-/// See [`MAX_VARIANT_NAME_PAIRS`]: the cap on the report's generated-variant
-/// list. Matching is unaffected: every capped combination is still tested
-/// against the observed emails, so a variant beyond the list cap can still
-/// be reported as matched.
-const MAX_GENERATED_VARIANTS: usize = 1000;
-
-/// The cap on the caller-supplied custom variant patterns
-/// (`user --variant-pattern`): the patterns are analyst input, not forgeable
-/// commit metadata, but the same combinatorics warning applies — every
-/// pattern multiplies every capped name pair by every capped domain, so an
-/// absurd pattern count would only slow the analyst's own machine down and
-/// bloat the report past the generated-list cap. 64 keeps the useful
-/// conventions of a whole team and fails fast beyond.
-const MAX_CUSTOM_VARIANT_PATTERNS: usize = 64;
-
-/// Validates one caller-supplied custom variant pattern
-/// (`user --variant-pattern`). A pattern is a template with `{first}`,
-/// `{last}` and `{initial}` placeholders (e.g. `{last}{first}` produces
-/// `doejohn@…`); braces are only allowed as placeholders, only printable
-/// ASCII is allowed (`@`, whitespace, control and zero-width characters
-/// would forge a candidate address no mail system could ever have
-/// produced, or worse inject into the report), and the expansion is
-/// lowercased at generation time so the literal part matches observed
-/// emails case-insensitively like the built-ins. The rejection is
-/// client-side, before any network request.
-///
-/// # Errors
-///
-/// [`Error::InvalidVariantPattern`] with a description of the first problem
-/// found. Never panics.
-pub fn validate_variant_pattern(pattern: &str) -> Result<(), Error> {
-    // every count in the engine is capped against hostile metadata: a
-    // pattern is CLI input, so the cap is a client-side rejection (the
-    // generated local-part fits well under RFC 5321's 64-byte local-part
-    // bound anyway — a longer pattern can only be pathological)
-    if pattern.len() > MAX_VARIANT_PATTERN_BYTES {
-        return Err(Error::InvalidVariantPattern(format!(
-            "the pattern is {} bytes, the maximum is {MAX_VARIANT_PATTERN_BYTES}",
-            pattern.len()
-        )));
-    }
-    if pattern.trim().is_empty() {
-        return Err(Error::InvalidVariantPattern("the pattern is empty".into()));
-    }
-    if pattern.chars().any(char::is_whitespace) {
-        return Err(Error::InvalidVariantPattern(format!(
-            "whitespace is not allowed in {pattern}"
-        )));
-    }
-    if pattern.contains('@') {
-        return Err(Error::InvalidVariantPattern(format!(
-            "'@' is not allowed in {pattern}: the domain comes from the deduced domains, not \
-             from the pattern"
-        )));
-    }
-    if let Some(character) = pattern
-        .chars()
-        .find(|character| !character.is_ascii_graphic())
-    {
-        return Err(Error::InvalidVariantPattern(format!(
-            "only printable ASCII is allowed, found {} in {pattern}",
-            character
-        )));
-    }
-    let mut placeholders = 0usize;
-    let mut rest = pattern;
-    while let Some(open) = rest.find('{') {
-        let after = &rest[open + 1..];
-        let Some(close) = after.find('}') else {
-            return Err(Error::InvalidVariantPattern(format!(
-                "unclosed '{{' in {pattern}"
-            )));
-        };
-        match &after[..close] {
-            "first" | "last" | "initial" => placeholders += 1,
-            other => {
-                return Err(Error::InvalidVariantPattern(format!(
-                    "unknown placeholder {{{other}}} in {pattern} (expected {{first}}, \
-                     {{last}} or {{initial}})"
-                )));
-            }
-        }
-        rest = &after[close + 1..];
-    }
-    if placeholders == 0 {
-        return Err(Error::InvalidVariantPattern(format!(
-            "the pattern {pattern} carries no {{first}}/{{last}}/{{initial}} placeholder"
-        )));
-    }
-    // a stray '}' (with or without a matching '{') is not a valid placeholder
-    // and would silently pass into the generated address
-    if pattern.matches('}').count() != placeholders {
-        return Err(Error::InvalidVariantPattern(format!(
-            "a '}}' outside a placeholder is not allowed in {pattern}"
-        )));
-    }
-    Ok(())
-}
-
-/// Generates the variant emails of one `(first, last)` name pair
-/// for one domain, in the fixed built-in order (first.last, firstlast,
-/// initiallast, first_last, initial_last, first, last, initial.last),
-/// followed by the caller-supplied custom patterns in their CLI order
-/// (e.g. `{last}{first}`), deduplicated
-/// (a first name equal to the last one, or a single-letter first name,
-/// collapse several patterns onto the same email). With no last name, only
-/// the bare `{first}` pattern makes sense among the built-ins, and the
-/// custom patterns requiring a last name are skipped.
-fn generate_variants(
-    first: &str,
-    last: &str,
-    domain: &str,
-    custom_patterns: &[String],
-) -> Vec<(String, String)> {
-    let initial = first.chars().next().map(String::from).unwrap_or_default();
-    let emails: Vec<(String, &'static str)> = if last.is_empty() {
-        vec![(format!("{first}@{domain}"), "first")]
-    } else {
-        vec![
-            (format!("{first}.{last}@{domain}"), "first.last"),
-            (format!("{first}{last}@{domain}"), "firstlast"),
-            (format!("{initial}{last}@{domain}"), "initiallast"),
-            (format!("{first}_{last}@{domain}"), "first_last"),
-            (format!("{initial}_{last}@{domain}"), "initial_last"),
-            (format!("{first}@{domain}"), "first"),
-            (format!("{last}@{domain}"), "last"),
-            (format!("{initial}.{last}@{domain}"), "initial.last"),
-        ]
-    };
-    let mut generated: Vec<(String, String)> = Vec::new();
-    for (email, pattern) in emails {
-        if !generated.iter().any(|(seen, _)| seen == &email) {
-            generated.push((email, pattern.to_string()));
-        }
-    }
-    // the custom patterns come after the built-ins, in their CLI order;
-    // the pattern label in the report is the template itself:
-    // self-documenting, and distinguishable from the built-in patterns
-    for template in custom_patterns {
-        if let Some(local) = expand_pattern(template, first, last, &initial) {
-            let email = format!("{local}@{domain}");
-            if !generated.iter().any(|(seen, _)| seen == &email) {
-                generated.push((email, template.clone()));
-            }
-        }
-    }
-    generated
-}
-
-/// Expands one custom variant template into the local part of one name
-/// pair's candidate address: `{first}`, `{last}` and `{initial}` are
-/// replaced by the folded name parts (the `@domain` is appended by the
-/// caller, like the built-ins), and the whole expansion is lowercased so
-/// the literal part of the template matches observed emails
-/// case-insensitively, exactly like the built-ins (`J.{last}` must match
-/// the observed `j.dupont@acme.com`, not miss it). A template requiring a
-/// last name is skipped (not an error) when the pair carries none, exactly
-/// like the built-ins collapse in that case.
-fn expand_pattern(template: &str, first: &str, last: &str, initial: &str) -> Option<String> {
-    if template.contains("{last}") && last.is_empty() {
-        return None;
-    }
-    let expanded = template
-        .replace("{first}", first)
-        .replace("{last}", last)
-        .replace("{initial}", initial)
-        .to_lowercase();
-    (!expanded.is_empty()).then_some(expanded)
-}
-
-/// Folds one already-folded name into its `(first, last)` variant pair.
-fn pair_from_folded_name(folded: &str) -> Option<(String, String)> {
-    let tokens: Vec<&str> = folded.split_whitespace().collect();
-    if tokens.is_empty() {
-        return None;
-    }
-    let last = if tokens.len() == 1 {
-        ""
-    } else {
-        tokens[tokens.len() - 1]
-    };
-    Some((tokens[0].to_string(), last.to_string()))
 }
 
 /// The names and repositories accumulated behind one identity.
@@ -1609,7 +607,7 @@ impl Investigation {
                     // control-bearing payload, or a GitHub noreply address
                     // whose id could not be parsed. The same structural
                     // acceptance rule the scan paths enforce through
-                    // `keep_email`: the email list is documented as
+                    // `EmailList::keep`: the email list is documented as
                     // noreply-free and well-shaped, and a domainless value
                     // the `email` subcommand itself would reject as invalid
                     // must never be reported as a found email (nor feed the
@@ -1694,16 +692,32 @@ impl Investigation {
     /// pending foreign noreply pairs are judged against the complete
     /// target-name sets, and the variants are generated and matched.
     fn finish(
-        mut self,
+        self,
         external: Vec<ExternalContribution>,
         ssh_keys: Vec<SshKey>,
         custom_variant_patterns: &[String],
     ) -> UserReport {
+        // the accumulator fields are destructured once: every field is an
+        // owned local, consumed exactly where the report needs it — no
+        // `mem::take` choreography whose ordering constraints a later edit
+        // could silently break
+        let Self {
+            profile,
+            known_usernames,
+            known_names,
+            observed_usernames,
+            observed_names,
+            emails,
+            other_noreplies,
+            // the pending-pair index is a lookup accelerator of the
+            // accumulation phase: the report never reads it
+            other_noreply_index: _,
+        } = self;
+
         // raw sighting weight per known name, read before the names history
         // consumes the accumulators: the variant engine's pair ranking (see
         // the variants block below) needs the counts
-        let name_weights: BTreeMap<String, usize> = self
-            .observed_names
+        let name_weights: BTreeMap<String, usize> = observed_names
             .iter()
             .map(|(name, accum)| (name.clone(), accum.sightings))
             .collect();
@@ -1714,7 +728,7 @@ impl Investigation {
             )
         };
 
-        let usernames_history = std::mem::take(&mut self.observed_usernames)
+        let usernames_history = observed_usernames
             .into_iter()
             .map(|(username, accum)| {
                 let (names, repos) = sightings(&accum);
@@ -1725,7 +739,7 @@ impl Investigation {
                 }
             })
             .collect();
-        let names_history = std::mem::take(&mut self.observed_names)
+        let names_history = observed_names
             .into_iter()
             .map(|(name, accum)| NameSighting {
                 name,
@@ -1740,13 +754,13 @@ impl Investigation {
         // sightings across the target's commits, while planting one commit
         // per junk domain — or per planted name on a junk domain — cannot
         // outweigh it the way distinct-name/repo counts allowed
-        let email_keys: BTreeSet<String> = self.emails.keys().cloned().collect();
+        let email_keys: BTreeSet<String> = emails.keys().cloned().collect();
         let mut domain_weights: BTreeMap<String, usize> = BTreeMap::new();
-        for (key, (_, accum)) in &self.emails {
+        for (key, (_, accum)) in &emails {
             let Some((_, domain)) = key.rsplit_once('@') else {
                 continue;
             };
-            if domain.eq_ignore_ascii_case(NOREPLY_DOMAIN) {
+            if crate::sources::is_noreply_email(key) {
                 continue;
             }
             *domain_weights.entry(domain.to_string()).or_default() += accum.sightings;
@@ -1768,9 +782,8 @@ impl Investigation {
         // the local identities, the recurring co-authors and the per-email
         // sightings are folded from the email list (see [`fold_emails`])
         let (local_identities, email_sightings, coauthor_accounts) =
-            fold_emails(std::mem::take(&mut self.emails), &self.known_names);
+            fold_emails(emails, &known_names);
         let mut secondary_accounts = coauthor_accounts;
-        let other_noreplies = std::mem::take(&mut self.other_noreplies);
         for other in other_noreplies {
             let identity = match &other.username {
                 Some(username) => format!("{}+{username}@{NOREPLY_DOMAIN}", other.id),
@@ -1780,14 +793,14 @@ impl Investigation {
                 .username
                 .as_deref()
                 .map(str::to_lowercase)
-                .is_some_and(|username| self.known_usernames.contains(&username))
+                .is_some_and(|username| known_usernames.contains(&username))
             {
                 "noreply-username"
             } else if other
                 .people
                 .names
                 .iter()
-                .any(|name| self.known_names.contains(name))
+                .any(|name| known_names.contains(name))
             {
                 "noreply-name"
             } else {
@@ -1813,18 +826,18 @@ impl Investigation {
         // PR of alphabetically-first junk names must not evict the real
         // pair. The profile name is API-derived and unforgable, so its pair
         // is always kept first, above the cap
-        let known_names = std::mem::take(&mut self.known_names);
         let variants = build_variants(
             known_names,
             &name_weights,
-            self.profile.name.as_deref(),
+            profile.name.as_deref(),
             domains,
             email_keys,
             custom_variant_patterns,
         );
 
         UserReport {
-            profile: self.profile,
+            provenance: crate::output::Provenance::now(),
+            profile,
             usernames_history,
             names_history,
             emails: email_sightings,
@@ -1837,12 +850,99 @@ impl Investigation {
     }
 }
 
+/// Parses a GitHub noreply email into its numeric owner id and, when the
+/// modern `<id>+<username>` form is used, the username it carries:
+///
+/// - `12345+jane@users.noreply.github.com` → `(12345, Some("jane"))`;
+/// - `12345@users.noreply.github.com` (legacy pre-2017 form) →
+///   `(12345, None)`: it reveals the id only, so callers fall back to the
+///   current username;
+/// - any other email (real address, wrong domain, non-numeric id, empty
+///   username) → `None`.
+///
+/// The username is only accepted when it follows GitHub's full username
+/// shape (1-39 ASCII letters, digits or hyphens, without leading/trailing
+/// or consecutive hyphens — see [`validate_username`]):
+/// commit author emails are free-form and attacker-influenceable, so a
+/// payload like `42+jane doe@users.noreply.github.com` or `42+j--ane@…`
+/// must never plant a bogus past username in the report. Such an email
+/// falls back to the legacy id-only handling (`(42, None)`).
+fn parse_noreply(email: &str) -> Option<(u64, Option<&str>)> {
+    let (local, domain) = email.rsplit_once('@')?;
+    if !crate::sources::is_noreply_email(email) {
+        return None;
+    }
+    // `local` and `domain` are re-derived here: the shared noreply rule
+    // gates the domain, this parser still needs the id+username shape of
+    // the local part
+    let _ = domain;
+    if let Some((id, username)) = local.split_once('+') {
+        let id = id.parse::<u64>().ok()?;
+        if username.is_empty() {
+            return None;
+        }
+        if validate_username(username).is_ok() {
+            Some((id, Some(username)))
+        } else {
+            // not a possible GitHub username: keep the id (legacy handling)
+            // but never record the free-form payload as a past username
+            Some((id, None))
+        }
+    } else {
+        let id = local.parse::<u64>().ok()?;
+        Some((id, None))
+    }
+}
+
+/// Whether an email looks machine-local (UPN-like, e.g.
+/// `jeanpierre@My-Computer.local`). **Documented heuristic**: a domain
+/// ending with `.local` or `.lan` (mDNS/Windows workgroup conventions), or
+/// a single-label domain with no dot at all (`jeanpierre@mycomputer`).
+/// A dotful public-looking domain is never flagged, and a false positive
+/// only adds one candidate to the `local_identities` list.
+fn is_local_identity(email: &str) -> bool {
+    let Some((_, domain)) = email.rsplit_once('@') else {
+        return false;
+    };
+    let domain = domain.to_ascii_lowercase();
+    domain.ends_with(".local") || domain.ends_with(".lan") || !domain.contains('.')
+}
+
+/// ASCII-folds a name for email-variant generation: lowercased, and the
+/// accents stripped **only for the common Latin-1 range** (hand-rolled, no
+/// unicode crate), plus the Latin digraphs `ß`→`ss`, `æ`→`ae` and
+/// `œ`→`oe` and the stroke letters `ø`→`o`. Any other script (Cyrillic,
+/// CJK, …) is kept raw: the variants generated from it simply will not
+/// match ASCII emails, which is the honest behavior.
+fn fold_name(name: &str) -> String {
+    let mut folded = String::with_capacity(name.len());
+    for c in name.to_lowercase().chars() {
+        match c {
+            'à'..='å' => folded.push('a'),
+            'ç' => folded.push('c'),
+            'è'..='ë' => folded.push('e'),
+            'ì'..='ï' => folded.push('i'),
+            'ñ' => folded.push('n'),
+            'ò'..='ö' => folded.push('o'),
+            'ø' => folded.push('o'),
+            'ù'..='ü' => folded.push('u'),
+            'ý' | 'ÿ' => folded.push('y'),
+            'ß' => folded.push_str("ss"),
+            'æ' => folded.push_str("ae"),
+            'œ' => folded.push_str("oe"),
+            other => folded.extend(other.to_lowercase()),
+        }
+    }
+    folded
+}
+
 #[cfg(test)]
 mod tests {
     // Tests may unwrap, expect and panic freely: a failing assertion must
     // be loud, so the zero-panic lints do not apply to the test modules.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use serde_json::Value;
 
     // ---- noreply parsing: every shape ----
 
@@ -2119,6 +1219,7 @@ mod tests {
             "http://127.0.0.1:1",
             "octocat",
             &patterns,
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("custom variant patterns"));
@@ -2134,6 +1235,7 @@ mod tests {
             "http://127.0.0.1:1",
             "octocat",
             &["{first".to_string()],
+            false,
         )
         .unwrap_err();
         assert!(
@@ -2237,7 +1339,7 @@ mod tests {
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let error = investigate_at_with_patterns(&client, &address, "acme", &[])
+        let error = investigate_at_with_patterns(&client, &address, "acme", &[], false)
             .expect_err("an organization target must be rejected");
         server.join();
         assert!(
@@ -2394,8 +1496,8 @@ mod tests {
             serde_json::json!({ "message": "HTML error page" }),
             serde_json::json!("not a listing"),
         ] {
-            let error =
-                parse_repository_page(&json).expect_err("a non-array repositories body must fail");
+            let error = parse_user_repos_page(&json, false)
+                .expect_err("a non-array repositories body must fail");
             assert!(
                 matches!(&error, Error::InvalidProfile(details) if details.contains("array")),
                 "unexpected error: {error:?}"
@@ -2414,7 +1516,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_repository_page_warns_on_malformed_entries_and_keeps_the_rest() {
+    fn parse_user_repos_page_keeps_forks_when_the_caller_opted_in() {
+        // `--include-forks`: the forked entry is kept (no warning), the
+        // caller explicitly asked for the upstream-mirrored histories
+        let json: serde_json::Value = serde_json::json!([
+            { "full_name": "octocat/forked-repo", "fork": true },
+            { "full_name": "octocat/own-repo", "fork": false }
+        ]);
+        let (parsed, lines) = crate::test_logger::capture(|| parse_user_repos_page(&json, true));
+        assert_eq!(
+            parsed.expect("the opted-in parsing must succeed").0,
+            vec![
+                "octocat/forked-repo".to_string(),
+                "octocat/own-repo".to_string()
+            ]
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("forked")),
+            "nothing was skipped: no fork warning may fire: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn parse_user_repos_page_warns_on_malformed_entries_and_keeps_the_rest() {
         // the listing contract is completeness: an entry without its
         // `full_name` is skipped, but the skip is warned about (one line
         // per page, counts only — no untrusted content in the log line)
@@ -2424,7 +1548,7 @@ mod tests {
             { "full_name": null },
             { "other": 1 }
         ]);
-        let (parsed, lines) = crate::test_logger::capture(|| parse_repository_page(&json));
+        let (parsed, lines) = crate::test_logger::capture(|| parse_user_repos_page(&json, false));
         let (repositories, raw_count) = parsed.expect("parsing must succeed");
         assert_eq!(repositories, vec!["acme/lib".to_string()]);
         // the raw count stays the end-of-listing signal
@@ -2438,7 +1562,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_repository_page_skips_forks_with_a_warning() {
+    fn parse_user_repos_page_skips_forks_with_a_warning() {
         // a fork's default branch mirrors the upstream history the REST
         // commits API exposes: scanning it burns the commit budget on data
         // that is not the target's and its upstream authors would pollute
@@ -2448,7 +1572,7 @@ mod tests {
             { "full_name": "other/fork", "fork": true },
             { "full_name": "acme/own", "fork": false }
         ]);
-        let (parsed, lines) = crate::test_logger::capture(|| parse_repository_page(&json));
+        let (parsed, lines) = crate::test_logger::capture(|| parse_user_repos_page(&json, false));
         let (repositories, raw_count) = parsed.expect("parsing must succeed");
         assert_eq!(
             repositories,
@@ -2458,8 +1582,10 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("1 forked repository skipped")),
-            "the fork skip must be warned about: {lines:?}"
+                .any(|line| {
+                    line.contains("1 forked repository skipped (their history is upstream's): pass --include-forks to scan them")
+                }),
+            "the fork skip must be warned about with its remedy: {lines:?}"
         );
     }
 
@@ -2753,7 +1879,7 @@ mod tests {
     #[test]
     fn absorb_commit_applies_the_shared_is_usable_email_rule_to_the_user_path() {
         // the scan paths never report a domainless or garbage commit-email
-        // field as a found email (`keep_email` → `is_usable_email`): the
+        // field as a found email (`EmailList::keep` → `is_usable_email`): the
         // `user` investigation must enforce the same rule, or the report's
         // email list would contain entries the `email` subcommand itself
         // rejects as invalid addresses (live repro: `user <target>` reported
@@ -3395,7 +2521,7 @@ mod tests {
 
         let client = crate::github::Client::anonymous().expect("client must build");
         let (outcome, lines) = crate::test_logger::capture(|| {
-            investigate_at_with_patterns(&client, &address, "jane", &[])
+            investigate_at_with_patterns(&client, &address, "jane", &[], false)
         });
         let report = outcome.expect("the ceiling must cap the listing");
         // exactly the first 1000 search results, and page 11 never requested
@@ -3466,7 +2592,7 @@ mod tests {
 
         let client = crate::github::Client::anonymous().expect("client must build");
         let (outcome, lines) = crate::test_logger::capture(|| {
-            investigate_at_with_patterns(&client, &address, "jane", &[])
+            investigate_at_with_patterns(&client, &address, "jane", &[], false)
         });
         let report = outcome.expect("the ceiling must cap the listing");
         assert_eq!(report.external_contributions.len(), 999);
@@ -3480,17 +2606,16 @@ mod tests {
     }
 
     #[test]
-    fn the_user_commit_walk_is_capped_per_repository() {
+    fn the_user_commit_walk_reaches_the_end_of_the_history() {
         use crate::github::mock::serve_requests;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // the same per-repository commit budget as every other repository
-        // scan: the mock serves endless full commit pages, so an uncapped
-        // walk would request page after page forever (the test would hang
-        // instead of failing) — the commit-request counter makes the cut
-        // loud, and the missing budget would also abort the investigation
-        // before its SSH keys and external contributions
+        // no local commit budget: the walk must reach the end of the
+        // repository's history (11 full pages, then the short 12th page
+        // that ends the listing) instead of stopping early — a truncated
+        // walk would silently drop identities, and the missing pages would
+        // also weaken the noreply technique's histories
         let commit_requests = Arc::new(AtomicUsize::new(0));
         let (address, server) = {
             let commit_requests = Arc::clone(&commit_requests);
@@ -3514,10 +2639,11 @@ mod tests {
                 }
                 if path.contains("/repos/jane/huge/commits") {
                     commit_requests.fetch_add(1, Ordering::Relaxed);
-                    // every page holds 100 commits sharing the target's
-                    // noreply id, so the capped pages still feed the
-                    // noreply technique
-                    let items: Vec<String> = (0..100)
+                    // pages 1..=11 hold 100 commits sharing the target's
+                    // noreply id; the short 12th page (3 commits) ends the
+                    // listing the way a real history ends
+                    let count = if page <= 11 { 100 } else { 3 };
+                    let items: Vec<String> = (0..count)
                         .map(|i| {
                             format!(
                                 r#"{{"commit": {{"author": {{"name": "Dev {page}-{i}", "email": "42+dev@users.noreply.github.com"}}}}}}"#
@@ -3535,34 +2661,23 @@ mod tests {
         };
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let (report, lines) = crate::test_logger::capture(|| {
-            investigate_at_with_patterns(&client, &address, "jane", &[])
+        let (report, _lines) = crate::test_logger::capture(|| {
+            investigate_at_with_patterns(&client, &address, "jane", &[], false)
         });
-        let report = report.expect("the capped commit walk must still investigate");
+        let report = report.expect("the full commit walk must still investigate");
         server.join();
 
-        // exactly the MAX_COMMIT_PAGES full pages: no page 11, no empty page
-        // to wait for
-        assert_eq!(
-            commit_requests.load(Ordering::Relaxed),
-            crate::sources::MAX_COMMIT_PAGES
-        );
-        // the capped commits still feed the noreply technique
+        // the walk reaches the short 12th page: nothing truncated, no
+        // early stop on a full page
+        assert_eq!(commit_requests.load(Ordering::Relaxed), 12);
+        // the walked commits still feed the noreply technique
         assert!(
             report
                 .usernames_history
                 .iter()
                 .any(|sighting| sighting.username == "dev"),
-            "the capped pages must still feed the usernames history: {:?}",
+            "the walked pages must still feed the usernames history: {:?}",
             report.usernames_history
-        );
-        // the budget cut is warned about instead of the report silently
-        // pretending the repository history is complete
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("only the most recent 1000 commits")),
-            "the capped walk must warn about the incomplete history: {lines:?}"
         );
     }
 
@@ -3609,7 +2724,7 @@ mod tests {
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let report = investigate_at_with_patterns(&client, &address, "jane", &[])
+        let report = investigate_at_with_patterns(&client, &address, "jane", &[], false)
             .expect("a 422 must not abort the report");
         // the investigation completes; the hits collected before the cut
         // cannot be recovered from the paginated loop, so the section ends
@@ -3646,7 +2761,7 @@ mod tests {
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let error = investigate_at_with_patterns(&client, &address, "jane", &[])
+        let error = investigate_at_with_patterns(&client, &address, "jane", &[], false)
             .expect_err("a page-1 422 must fail the investigation");
         assert!(
             matches!(error, Error::SearchRejected),
@@ -3703,7 +2818,7 @@ mod tests {
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let report = investigate_at_with_patterns(&client, &address, "jane", &[])
+        let report = investigate_at_with_patterns(&client, &address, "jane", &[], false)
             .expect("a short final page must keep the contributions");
         // every contribution of both pages survived the listing
         assert_eq!(report.external_contributions.len(), 150);
@@ -3749,9 +2864,12 @@ mod tests {
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let error = investigate_at_with_patterns(&client, &address, "jane", &[])
-            .expect_err("a rate limit mid-scan must abort the investigation");
-        assert!(matches!(error, Error::RateLimitExhausted));
+        let error = investigate_at_with_patterns(&client, &address, "jane", &[], false)
+            .expect_err("a secondary rate limit mid-scan must abort the investigation");
+        // the pool drained on a secondary pause (the token is parked, its
+        // allowance is not spent): the dedicated paused error, not the
+        // hourly-exhausted one
+        assert!(matches!(error, Error::RateLimitPaused));
         server.join();
     }
 
@@ -3795,7 +2913,7 @@ mod tests {
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let report = investigate_at_with_patterns(&client, &address, "jane", &[])
+        let report = investigate_at_with_patterns(&client, &address, "jane", &[], false)
             .expect("a private repo must not abort");
         assert!(report.emails.is_empty());
         assert_eq!(report.external_contributions.len(), 1);
@@ -3855,7 +2973,7 @@ mod tests {
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let report = investigate_at_with_patterns(&client, &address, "jane", &[])
+        let report = investigate_at_with_patterns(&client, &address, "jane", &[], false)
             .expect("an empty repo must not abort");
         // the walk continued past the 409: the next repository's email is
         // in the report, and the skipped one contributed nothing
@@ -3906,7 +3024,7 @@ mod tests {
 
         let client = crate::github::Client::anonymous().expect("client must build");
         let (report, lines) = crate::test_logger::capture(|| {
-            investigate_at_with_patterns(&client, &address, "jane", &[])
+            investigate_at_with_patterns(&client, &address, "jane", &[], false)
         });
         let report = report.expect("the hostile name must be skipped, not fatal");
         server.join();
@@ -4015,7 +3133,7 @@ mod tests {
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let report = investigate_at_with_patterns(&client, &address, "oldname", &[])
+        let report = investigate_at_with_patterns(&client, &address, "oldname", &[], false)
             .expect("the investigation must succeed against the renamed target");
         server.join();
 
@@ -4078,11 +3196,13 @@ mod tests {
             vec![
                 "emails",
                 "external_contributions",
+                "generated_at",
                 "local_identities",
                 "names_history",
                 "profile",
                 "secondary_accounts",
                 "ssh_keys",
+                "tool_version",
                 "usernames_history",
                 "variants",
             ]

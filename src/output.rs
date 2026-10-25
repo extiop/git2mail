@@ -5,9 +5,11 @@
 //! original Cargo project root: `get_project_root()` is gone.
 
 use crate::errors::Error;
+use crate::sanitize::is_control_or_invisible;
+use crate::sanitize::log_safe;
 use log::info;
 use serde::Serialize;
-use serde_json::json;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -18,6 +20,136 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// below it leaves room for the sibling component and any consumer suffix.
 const MAX_FILE_NAME_BYTES: usize = 200;
 
+/// The when and what of a JSON report: the UTC generation timestamp and the
+/// tool version. Flattened into every report, so an archived report can
+/// always be traced back to the run that produced it (the report still does
+/// not know the command line that produced it: archive that next to it for
+/// full reproducibility).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Provenance {
+    /// RFC 3339 UTC timestamp of the moment the report was assembled
+    /// (`YYYY-MM-DDTHH:MM:SSZ`); the run's local time zone is deliberately
+    /// not applied, so two archived reports sort without ambiguity.
+    pub generated_at: String,
+    /// Version of git2mail that wrote the report (the same string
+    /// `git2mail --version` prints).
+    pub tool_version: &'static str,
+}
+
+impl Provenance {
+    /// Stamps the current instant from the system clock. A clock reporting
+    /// before the Unix epoch (a pathological system state) degrades to the
+    /// epoch itself instead of panicking: the timestamp would be wrong, but
+    /// the report must still be written.
+    pub fn now() -> Self {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        Self {
+            generated_at: rfc3339_utc(secs),
+            tool_version: env!("CARGO_PKG_VERSION"),
+        }
+    }
+}
+
+impl Default for Provenance {
+    fn default() -> Self {
+        Self::now()
+    }
+}
+
+/// Formats a Unix timestamp (seconds) as RFC 3339 UTC
+/// (`YYYY-MM-DDTHH:MM:SSZ`), hand-rolled so the crate keeps zero date
+/// dependencies: the civil-from-days algorithm (Howard Hinnant) maps the
+/// day count to a proleptic Gregorian calendar date.
+pub fn rfc3339_utc(timestamp_secs: u64) -> String {
+    let days = (timestamp_secs / 86_400) as i64;
+    let secs_of_day = timestamp_secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60
+    )
+}
+
+/// The civil-from-days algorithm (Howard Hinnant, "chrono-Compatible
+/// Low-Level Date Algorithms"): a day count since 1970-01-01 to a
+/// proleptic Gregorian `(year, month, day)`.
+fn civil_from_days(day_count: i64) -> (i64, u32, u32) {
+    let z = day_count + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = (z - era * 146_097) as u64; // [0, 146_096]
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365; // [0, 399]
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
+    let mp = (5 * day_of_year + 2) / 153; // [0, 11]
+    let day = (day_of_year - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if month <= 2 { year + 1 } else { year }, month as u32, day)
+}
+
+/// The search request a `search` JSON report records next to its findings:
+/// the query, the language filter and every advanced qualifier actually
+/// provided, so the report can be told apart from any other run's (the
+/// historical gap: two runs with different qualifiers wrote
+/// indistinguishable reports).
+#[derive(Debug, Serialize)]
+pub struct SearchRequest<'a> {
+    /// The keyword query, as typed.
+    pub query: &'a str,
+    /// The `--language` filter (empty string when not provided).
+    pub language: &'a str,
+    /// The advanced qualifiers actually provided (absent fields are
+    /// omitted from the report, not serialized as `null`).
+    pub qualifiers: &'a crate::sources::SearchQualifiers,
+}
+
+/// The scan/search JSON report: the findings plus the provenance of the run
+/// itself (see [`Provenance`]) and, for a keyword search, of the request
+/// (see [`SearchRequest`]). A struct writer instead of a `json!` literal:
+/// the field set is part of the documented report shape, so it must be
+/// checked by the compiler.
+#[derive(Debug, Serialize)]
+pub struct ScanJsonReport<'a> {
+    /// The scan target as given (URL, query, ...).
+    pub target: &'a str,
+    /// The scan mode (`repository`, `profile` or `search`).
+    pub mode: &'a str,
+    /// The search request provenance; `None` for a repository or profile
+    /// scan (the target URL is already the whole request).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<SearchRequest<'a>>,
+    /// The emails found, deduplicated and sorted.
+    pub emails: &'a [String],
+    /// The emails found per repository (a keyword search scans many
+    /// repositories); omitted when empty (a single-repository or profile
+    /// scan has no breakdown to report).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub per_repository: &'a BTreeMap<String, Vec<String>>,
+    /// The scan coverage.
+    pub scanned: ScannedCoverage,
+    /// The per-author correlation report.
+    pub correlation: &'a crate::correlate::Correlation,
+    /// The when/what of the report.
+    #[serde(flatten)]
+    pub provenance: Provenance,
+}
+
+/// The `scanned` object of a scan/search JSON report.
+#[derive(Debug, Serialize)]
+pub struct ScannedCoverage {
+    /// Repositories actually scanned.
+    pub repos: usize,
+    /// Successful API requests of the whole run.
+    pub pages: usize,
+    /// Whether whole listed repositories may have been left unscanned.
+    pub partial: bool,
+}
+
 /// Serializes the temporary staging names of concurrent publishers within
 /// one process (two threads publishing different targets in the same
 /// directory must never stage into the same temp file); the process id
@@ -26,14 +158,75 @@ static TMP_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// Builds one unique staging name for an atomic publish: a sibling of the
 /// target (same directory → same filesystem → [`fs::rename`] is atomic),
-/// dot-prefixed so a crash between the staging write and the rename leaves
-/// no file a consumer would mistake for a result.
-fn staging_path(directory: &Path, stem: &str) -> PathBuf {
+/// under the tool's own `.git2mail-stage.` namespace so a crash between the
+/// staging write and the rename leaves no file a consumer would mistake for
+/// a result, and so [`sweep_stale_staging`] can match its exact shape
+/// whatever the published file's own name.
+fn staging_path(directory: &Path) -> PathBuf {
     directory.join(format!(
-        ".{stem}.{}.{}.tmp",
+        ".git2mail-stage.{}.{}.tmp",
         std::process::id(),
         TMP_SERIAL.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+/// Age beyond which a staging file is an orphan: a live publisher stages
+/// for milliseconds, so any `.git2mail-stage.*.tmp` file older than a day
+/// was left by a crashed or killed run (power loss, `kill -9`, OOM) and is
+/// swept on the next publish of the same directory.
+const STAGING_ORPHAN_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Removes the stale staging files an interrupted run left in `directory`
+/// (`.git2mail-stage.<pid>.<serial>.tmp`, modification time older than
+/// [`STAGING_ORPHAN_AGE`]): best-effort housekeeping — a removal failure is
+/// silently ignored (the file may be swept on a later publish) and a live
+/// publisher's staging file (milliseconds old) can never match the age
+/// bound.
+fn sweep_stale_staging(directory: &Path) {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(_) => return, // the directory may not exist yet: nothing to sweep
+    };
+    let mut swept = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // the exact staging shape a crashed run can leave — only the
+        // tool's own `.git2mail-stage.<pid>.<serial>.tmp` files match
+        // (digit-checked counters), never a user file that happens to end
+        // in .tmp
+        let is_staging = name
+            .strip_prefix(".git2mail-stage.")
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+            .is_some_and(|counters| {
+                let mut parts = counters.split('.');
+                let digit = |part: Option<&str>| {
+                    part.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                };
+                digit(parts.next()) && digit(parts.next()) && parts.next().is_none()
+            });
+        if !is_staging {
+            continue;
+        }
+        let age = match entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+        {
+            Some(age) => age,
+            None => continue,
+        };
+        if age > STAGING_ORPHAN_AGE && fs::remove_file(entry.path()).is_ok() {
+            swept += 1;
+        }
+    }
+    if swept > 0 {
+        info!(
+            "[.] removed {swept} stale staging file{} left by an interrupted run",
+            if swept > 1 { "s" } else { "" }
+        );
+    }
 }
 
 /// Publishes `content` at `target` atomically: the body is staged into a
@@ -56,6 +249,14 @@ fn staging_path(directory: &Path, stem: &str) -> PathBuf {
 /// temporary file is removed and the error returned; the target itself is
 /// never left half-written.
 fn publish_atomically(target: &Path, staging: &Path, content: &str) -> Result<(), Error> {
+    // the housekeeping runs on every publish, before staging: the sweep
+    // only touches day-old files, so it can never race a live publisher
+    sweep_stale_staging(
+        target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    );
     // rename(2) replaces a symlink, it never follows one: a target that
     // happens to be a symlink (a user convenience link like
     // `latest.json -> run-2024.json`, or a system device link like
@@ -71,13 +272,35 @@ fn publish_atomically(target: &Path, staging: &Path, content: &str) -> Result<()
     {
         return Err(Error::OutputWrite(format!(
             "cannot write {}: the path is a symlink (remove the link or write to its target directly)",
-            sanitize_log_text(&target.display().to_string())
+            log_safe(&target.display().to_string())
         )));
     }
+    // the staging file is created OWNER-ONLY (0600 on Unix): the results
+    // hold personal data (harvested email addresses), so "safe by default"
+    // beats the umask's usual 0644 world-readable default — a user-tightened
+    // or relaxed mode on an EXISTING target is still preserved below
+    #[cfg(unix)]
+    let staged = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(staging)
+            .and_then(|mut file| file.write_all(content.as_bytes()))
+            .map_err(|err| {
+                Error::OutputWrite(format!(
+                    "cannot write {}: {err}",
+                    log_safe(&staging.display().to_string())
+                ))
+            })
+    };
+    #[cfg(not(unix))]
     let staged = fs::write(staging, content).map_err(|err| {
         Error::OutputWrite(format!(
             "cannot write {}: {err}",
-            sanitize_log_text(&staging.display().to_string())
+            log_safe(&staging.display().to_string())
         ))
     });
     if let Err(err) = staged {
@@ -94,14 +317,14 @@ fn publish_atomically(target: &Path, staging: &Path, content: &str) -> Result<()
         let _ = fs::remove_file(staging);
         return Err(Error::OutputWrite(format!(
             "cannot publish {}: cannot preserve the previous permissions: {err}",
-            sanitize_log_text(&target.display().to_string())
+            log_safe(&target.display().to_string())
         )));
     }
     if let Err(err) = fs::rename(staging, target) {
         let _ = fs::remove_file(staging);
         return Err(Error::OutputWrite(format!(
             "cannot publish {}: {err}",
-            sanitize_log_text(&target.display().to_string())
+            log_safe(&target.display().to_string())
         )));
     }
     Ok(())
@@ -113,12 +336,21 @@ fn publish_atomically(target: &Path, staging: &Path, content: &str) -> Result<()
 ///
 /// # Errors
 ///
-/// Returns [`Error::NoResults`] when there is nothing to write, or
+/// Returns `Ok(None)` when there is nothing to write (an empty result: no
+/// file is created, the caller decides what an empty run means), or
 /// [`Error::OutputWrite`] carrying the offending path when the results
-/// directory or the file itself cannot be created or written. Never panics.
-pub fn write_text(directory: &str, file_name: &str, emails: &[String]) -> Result<PathBuf, Error> {
+/// directory or the file itself cannot be created or written.
+pub fn write_text(
+    directory: &str,
+    file_name: &str,
+    emails: &[String],
+) -> Result<Option<PathBuf>, Error> {
+    // an empty result is `Ok(None)`, not an error: the caller keeps the
+    // written-path report (or its absence) and decides what an empty run
+    // means for its own exit code, instead of every call site re-matching
+    // a sentinel error variant
     if emails.is_empty() {
-        return Err(Error::NoResults);
+        return Ok(None);
     }
     // both path components are sanitized, not just the file name: the
     // sibling parameter is hardened, so a future caller passing a
@@ -139,7 +371,7 @@ pub fn write_text(directory: &str, file_name: &str, emails: &[String]) -> Result
     fs::create_dir_all(&dir_path).map_err(|err| {
         Error::OutputWrite(format!(
             "cannot create {}: {err}",
-            sanitize_log_text(&dir_path.display().to_string())
+            log_safe(&dir_path.display().to_string())
         ))
     })?;
     // the whole output is composed in memory and published atomically (see
@@ -149,77 +381,10 @@ pub fn write_text(directory: &str, file_name: &str, emails: &[String]) -> Result
         content.push_str(email);
         content.push('\n');
     }
-    let staging = staging_path(&dir_path, &file_name);
+    let staging = staging_path(&dir_path);
     publish_atomically(&file_path, &staging, &content)?;
     info!("[+] Result is available at {}", file_path.display());
-    Ok(file_path)
-}
-
-/// Replaces every character matching [`is_control_or_invisible`] with `_`:
-/// the shared sanitizer for terminal-printed strings and output file names.
-pub(crate) fn sanitize_log_text(text: &str) -> String {
-    text.chars()
-        .map(|c| if is_control_or_invisible(c) { '_' } else { c })
-        .collect()
-}
-
-/// Whether a character must never reach a terminal-printed string or an
-/// output file name raw: control characters (newlines, tabs, ESC and other
-/// ANSI escape openers…), the Unicode bidi/format characters (RTL override,
-/// isolates), the zero-width / invisible format characters and the
-/// remaining invisible-or-line-separating characters a terminal may honor
-/// (the LINE/PARAGRAPH SEPARATORs, the soft hyphen, the variation selectors
-/// — both the FE00..FE0F block and the E0100..E01EF supplement, whose 240
-/// invisible characters would otherwise splice into terminal lines and
-/// build two byte-distinct but visually identical file names —, the
-/// interlinear annotation characters and the invisible
-/// Unicode tag block, which can encode hidden ASCII in captured output).
-/// The shared log-safety rule for strings derived from untrusted metadata
-/// (commit author names/emails, profile fields, key titles…), so a hostile
-/// commit can never forge, recolor, visually reorder, invisibly splice or
-/// line-break report lines. The JSON *file* path needs no equivalent:
-/// `serde_json` escapes the C0 control range itself (U+0000..U+001F — but
-/// NOT the C1 range, DEL, or the bidi/format/invisible characters above,
-/// which pass through raw there — the JSON report must stay a lossless
-/// machine-readable view of the data, so escaping them is left to the JSON
-/// reader's rendering, not this file). The `--json -` stdout path is the
-/// exception: its output goes to a terminal, so each of its lines runs
-/// through [`sanitize_log_text`] first (the structural newlines of the
-/// pretty-printer are preserved by joining the sanitized lines, so the
-/// body stays valid JSON — only invisible/hostile characters become `_`).
-fn is_control_or_invisible(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            // bidi controls (RTL override, isolates, Arabic letter mark)
-            '\u{200E}' | '\u{200F}' | '\u{061C}'
-                | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-                // zero-width / invisible format characters: visually
-                // indistinguishable from nothing, so a hostile name
-                // like `alice\u{200B}admin` would splice report text
-                | '\u{200B}'..='\u{200D}' | '\u{2060}'..='\u{2064}'
-                | '\u{FEFF}'
-                // the remaining category-Cf format characters: equally
-                // invisible (invisible splices in captured output), found
-                // by a character-class sweep against the Unicode Cf table
-                | '\u{0600}'..='\u{0605}' | '\u{06DD}' | '\u{070F}'
-                | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180E}'
-                | '\u{206A}'..='\u{206F}'
-                | '\u{110BD}' | '\u{110CD}'
-                | '\u{13430}'..='\u{1343F}'
-                | '\u{1BCA0}'..='\u{1BCA3}'
-                | '\u{1D173}'..='\u{1D17A}'
-                // line/paragraph separators (categories Zl/Zp: not
-                // `is_control`, but a terminal or captured output can
-                // still honor them as line breaks) and the remaining
-                // invisible characters (soft hyphen, variation
-                // selectors, interlinear annotation, the Unicode tag
-                // block that encodes hidden ASCII)
-                | '\u{2028}' | '\u{2029}' | '\u{00AD}'
-                | '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}'
-                | '\u{FFF9}'..='\u{FFFB}'
-                | '\u{E0000}'..='\u{E007F}'
-        )
+    Ok(Some(file_path))
 }
 
 /// Windows reserves device names for itself, with or without extension and
@@ -271,20 +436,18 @@ fn sanitize_file_name(name: &str) -> String {
     // Sanitization is lossy: distinct raw names (`a/b`, `a:b`, `a\\b`, a
     // control-bearing name…) collapse onto the same sanitized file name, and
     // each run would silently overwrite the previous one's result file. A
-    // name the sanitizer changed therefore carries a hash of the raw name,
+    // name the sanitizer CHANGED therefore carries a hash of the raw name,
     // so the collapsed class is disambiguated — the same anti-clobber
     // suffix the length cap below uses. A byte-unchanged name keeps its
-    // exact file name (`hello` stays `hello`), and two runs of the same
-    // query still overwrite each other by design (a rerun refreshes the
-    // results) — but two names differing only by CASE (`rust lang` vs
-    // `Rust Lang`) collapse onto the same unchanged candidate while
-    // remaining distinct targets: on a case-insensitive filesystem (macOS
-    // APFS, Windows NTFS) the second run would silently clobber the
-    // first's file. Every name that lowercasing would change carries the
-    // hash suffix (the minimal deterministic rule: all-lowercase names keep
-    // their exact file name, mixed-case names like `Rust` are hashed even
-    // alone — documented in doc/src/OUTPUT.md).
-    if candidate != name || name.to_lowercase() != name {
+    // exact file name (`hello` stays `hello`, `Rust` stays `Rust`): the
+    // suffix only answers a real loss, it never decorates an untouched
+    // name. Two runs of the same query still overwrite each other by
+    // design (a rerun refreshes the results); note that on a
+    // case-insensitive filesystem (macOS APFS, Windows NTFS) two targets
+    // differing only by case (`rust lang` vs `Rust Lang`) share one file
+    // name — the target and its case are visible in every report line, and
+    // the JSON report carries the exact target.
+    if candidate != name {
         candidate = format!("{candidate}-{:016x}", stable_hash(name));
     }
     // A filesystem path component is limited to 255 bytes: a long multibyte
@@ -348,8 +511,20 @@ const STDOUT_PATH_MARKER: &str = "-";
 /// # Errors
 ///
 /// Returns [`Error::OutputWrite`] when the path exists and is a directory
-/// (the path is carried in the error, sanitized). Never panics.
+/// (the path is carried in the error, sanitized).
 pub fn ensure_report_target(path: &Path) -> Result<(), Error> {
+    ensure_report_target_named(path, "JSON report")
+}
+
+/// The same pre-flight, with the deliverable's user-facing name in the
+/// error messages (a rejected `--csv results` must not blame the "JSON
+/// report").
+///
+/// # Errors
+///
+/// Returns [`Error::OutputWrite`] describing the first blocking property of
+/// the path.
+pub fn ensure_report_target_named(path: &Path, deliverable: &str) -> Result<(), Error> {
     if path == Path::new(STDOUT_PATH_MARKER) {
         return Ok(());
     }
@@ -357,8 +532,8 @@ pub fn ensure_report_target(path: &Path) -> Result<(), Error> {
     // surfaces it now instead of after the run's API budget is spent
     if path.as_os_str().to_string_lossy().contains('\0') {
         return Err(Error::OutputWrite(format!(
-            "cannot write the JSON report to {}: the path contains a NUL byte",
-            sanitize_log_text(&path.to_string_lossy())
+            "cannot write the {deliverable} to {}: the path contains a NUL byte",
+            log_safe(&path.to_string_lossy())
         )));
     }
     // a regular file occupying the parent directory can never become the
@@ -369,14 +544,14 @@ pub fn ensure_report_target(path: &Path) -> Result<(), Error> {
         && parent.is_file()
     {
         return Err(Error::OutputWrite(format!(
-            "cannot write the JSON report to {}: its parent path is a file, not a directory",
-            sanitize_log_text(&path.to_string_lossy())
+            "cannot write the {deliverable} to {}: its parent path is a file, not a directory",
+            log_safe(&path.to_string_lossy())
         )));
     }
     if path.is_dir() {
         return Err(Error::OutputWrite(format!(
-            "cannot write the JSON report to {}: the path is a directory",
-            sanitize_log_text(&path.to_string_lossy())
+            "cannot write the {deliverable} to {}: the path is a directory",
+            log_safe(&path.to_string_lossy())
         )));
     }
     // a symlink target is rejected pre-flight (before the run's API budget
@@ -389,27 +564,28 @@ pub fn ensure_report_target(path: &Path) -> Result<(), Error> {
         && metadata.file_type().is_symlink()
     {
         return Err(Error::OutputWrite(format!(
-            "cannot write the JSON report to {}: the path is a symlink (remove the link or write to its target directly)",
-            sanitize_log_text(&path.to_string_lossy())
+            "cannot write the {deliverable} to {}: the path is a symlink (remove the link or write to its target directly)",
+            log_safe(&path.to_string_lossy())
         )));
     }
     Ok(())
 }
 
 /// Writes any serializable report as pretty JSON at `path` (creating parent
-/// directories when needed): the shared writing logic of the scan report
-/// ([`write_scan_report_json`]) and of the `user` investigation report. The path `-`
+/// directories when needed): the shared writing logic of every `--json`
+/// deliverable (scan/search reports, the `user` investigation report, the
+/// `org` and reverse-lookup reports). The path `-`
 /// means the standard output: the report is printed there instead of a
 /// literal file named `-` being created.
 ///
 /// Sanitizes a serialized JSON body for the terminal: every line runs
-/// through [`sanitize_log_text`] and the lines are rejoined with the
+/// through [`crate::sanitize::log_safe`] and the lines are rejoined with the
 /// original structural newlines, so the result still parses as JSON
 /// (in-string newlines are serde_json escape text, never raw) while
 /// hostile characters become `_`.
 fn sanitize_json_for_stdout(body: &str) -> String {
     body.split('\n')
-        .map(sanitize_log_text)
+        .map(log_safe)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -418,7 +594,7 @@ fn sanitize_json_for_stdout(body: &str) -> String {
 ///
 /// Returns [`Error::OutputWrite`] when the report cannot be written (the
 /// path is carried in the error) and [`Error::Json`] when the report cannot
-/// be serialized. Never panics.
+/// be serialized.
 pub fn write_report_json<T: Serialize>(path: &Path, report: &T) -> Result<(), Error> {
     let body = serde_json::to_string_pretty(report)?;
     if path == Path::new(STDOUT_PATH_MARKER) {
@@ -460,59 +636,92 @@ pub fn write_report_json<T: Serialize>(path: &Path, report: &T) -> Result<(), Er
     fs::create_dir_all(&parent_dir).map_err(|err| {
         Error::OutputWrite(format!(
             "cannot create {}: {err}",
-            sanitize_log_text(&parent_dir.display().to_string())
+            log_safe(&parent_dir.display().to_string())
         ))
     })?;
     // the report is published atomically (see [`publish_atomically`]): a
     // concurrent reader or a concurrent run targeting the same --json path
     // must observe one complete report, never a half-written one
     let staging_directory = parent_dir;
-    let staging = staging_path(&staging_directory, "git2mail-report");
+    let staging = staging_path(&staging_directory);
     publish_atomically(path, &staging, &body)?;
     info!(
         "[+] JSON report is available at {}",
-        sanitize_log_text(&path.display().to_string())
+        log_safe(&path.display().to_string())
     );
     Ok(())
 }
 
-/// Writes the opt-in JSON report to `path`:
-/// `{ "target", "mode": "repository|profile|search", "emails", "scanned": { "repos", "pages", "partial" }, "correlation" }`.
-/// The `correlation` object (issue #5) carries the per-author aggregated
-/// attributes: emails, repositories with their primary language, dominant
-/// languages, first seen repository and total commit counts. `partial` is
-/// `true` when the scan kept its findings although a dedicated token died
-/// mid-scan, so whole listed repositories may have been left unscanned (a
-/// machine-readable truncation marker: the JSON report must be honest even
-/// when the scan itself still exits 0). The JSON report is an addition that
-/// is written even when the scan found nothing (an empty
-/// scan reports [`Error::NoResults`] while skipping the text file: the
-/// opt-in report must not be taken down with it).
+/// Escapes one CSV field per RFC 4180: a field containing a comma, a
+/// double quote, or a line break is wrapped in double quotes with the
+/// embedded quotes doubled, so a hostile author name like
+/// `Alice,fake@x.com,"Rust` stays ONE spreadsheet cell instead of forging
+/// extra rows or columns. Like the JSON report, the file stays lossless:
+/// the escaping preserves every character, the reader renders the rest.
+fn csv_field(text: &str) -> String {
+    if text.contains([',', '"', '\n', '\r']) {
+        let escaped = text.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Writes the per-author correlation report as a CSV spreadsheet at `path`
+/// (one row per correlated author, sorted like the JSON report's
+/// `correlation.authors`): `author_name, emails, repositories,
+/// dominant_language, commits`. The multi-valued cells join their values
+/// with `;` (the separator a spreadsheet user can split on without
+/// renaming columns). No stdout mode: a spreadsheet export is a file.
+/// Written atomically like every report deliverable (staging file +
+/// rename, like the JSON reports).
 ///
 /// # Errors
 ///
-/// Returns [`Error::OutputWrite`] when the report cannot be written (the
-/// path is carried in the error) and [`Error::Json`] when the report cannot
-/// be serialized. Never panics.
-#[expect(clippy::too_many_arguments)]
-pub fn write_scan_report_json(
+/// Returns [`Error::OutputWrite`] when the file cannot be written (the
+/// path is carried in the error).
+pub fn write_correlation_csv(
     path: &Path,
-    target: &str,
-    mode: &str,
-    emails: &[String],
-    repos_scanned: usize,
-    pages_fetched: usize,
-    partial: bool,
     correlation: &crate::correlate::Correlation,
 ) -> Result<(), Error> {
-    let report = json!({
-        "target": target,
-        "mode": mode,
-        "emails": emails,
-        "scanned": { "repos": repos_scanned, "pages": pages_fetched, "partial": partial },
-        "correlation": correlation,
-    });
-    write_report_json(path, &report)
+    // the whole file is composed in memory and published atomically, like
+    // the JSON reports: a concurrent reader never observes a torn sheet
+    let mut body = String::from("author_name,emails,repositories,dominant_language,commits\n");
+    for author in &correlation.authors {
+        let dominant = author.languages.first().map(String::as_str).unwrap_or("");
+        let repositories = author
+            .repos
+            .iter()
+            .map(|repo| repo.name.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
+        let row = [
+            csv_field(&author.author),
+            csv_field(&author.emails.join(";")),
+            csv_field(&repositories),
+            csv_field(dominant),
+            author.total_hits.to_string(),
+        ];
+        body.push_str(&row.join(","));
+        body.push('\n');
+    }
+    let parent_dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    fs::create_dir_all(&parent_dir).map_err(|err| {
+        Error::OutputWrite(format!(
+            "cannot create {}: {err}",
+            log_safe(&parent_dir.display().to_string())
+        ))
+    })?;
+    let staging = staging_path(&parent_dir);
+    publish_atomically(path, &staging, &body)?;
+    info!(
+        "[+] CSV export is available at {}",
+        log_safe(&path.display().to_string())
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -521,166 +730,70 @@ mod tests {
     // be loud, so the zero-panic lints do not apply to the test modules.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use std::sync::Mutex;
+    use crate::test_logger::in_temp_cwd;
 
-    /// Serializes the tests that move the process working directory:
-    /// `set_current_dir` is process-wide, so concurrent tests would
-    /// otherwise observe each other's CWD.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Runs `f` inside a fresh per-process temp directory: the CWD-relative
-    /// `results/` outputs never depend on (nor pollute) the real working
-    /// directory, so a read-only CWD or leftover results from a previous run
-    /// cannot break the tests.
-    fn in_temp_cwd<T>(f: impl FnOnce() -> T) -> T {
-        // a panicking test releases (but poisons) the lock: keep going
-        let _cwd_serialization = CWD_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let original = std::env::current_dir().expect("test setup: current dir");
-        let temp =
-            std::env::temp_dir().join(format!("git2mail_output_cwd_test_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp);
-        fs::create_dir_all(&temp).expect("test setup: temp cwd");
-        std::env::set_current_dir(&temp).expect("test setup: enter temp cwd");
-        // panic-safe restore: a test panicking inside `f` must not leave the
-        // process CWD inside the temp directory that the teardown below
-        // deletes — every later `current_dir()` of the suite would then fail
-        // with NotFound (observed as a whole-cascade of setup failures)
-        struct RestoreCwd<'a>(&'a Path);
-        impl Drop for RestoreCwd<'_> {
-            fn drop(&mut self) {
-                let _ = std::env::set_current_dir(self.0);
-            }
-        }
-        let _restore = RestoreCwd(&original);
-        let result = f();
-        drop(_restore);
-        std::env::set_current_dir(&original).expect("test teardown: restore cwd");
-        let _ = fs::remove_dir_all(&temp);
-        drop(_cwd_serialization);
-        result
+    #[test]
+    fn rfc3339_utc_formats_known_timestamps() {
+        // the epoch, a leap day, and a "round" modern timestamp: pin the
+        // civil-from-days conversion on dates a reader can verify by hand
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(86_399), "1970-01-01T23:59:59Z");
+        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(rfc3339_utc(951_868_800), "2000-03-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_000_000_000), "2001-09-09T01:46:40Z");
+        assert_eq!(rfc3339_utc(1_700_000_000), "2023-11-14T22:13:20Z");
     }
 
     #[test]
-    fn sanitize_log_text_neuters_control_characters_and_ansi_escapes() {
-        // the terminal report prints commit-derived strings: newlines and
-        // ANSI escape openers must never forge or recolor a log line
-        assert_eq!(sanitize_log_text("jane\nDUPONT\r"), "jane_DUPONT_");
-        assert_eq!(sanitize_log_text("\x1b[31mevil\x1b[0m"), "_[31mevil_[0m");
+    fn the_search_request_is_recorded_in_the_report_and_qualifiers_omitted_when_unset() {
+        // the search-report provenance: two runs with different qualifiers
+        // must write distinguishable reports
+        let path = std::env::temp_dir().join(format!(
+            "git2mail_output_test_{}_search_request.json",
+            std::process::id()
+        ));
+        let correlation = crate::correlate::Correlation::default();
+        let emails = ["a@b.c".to_string()];
+        let per_repository =
+            BTreeMap::from([("octocat/hello-world".to_string(), vec!["a@b.c".to_string()])]);
+        let qualifiers = crate::sources::SearchQualifiers {
+            stars: Some(">100".to_string()),
+            ..Default::default()
+        };
+        let report = ScanJsonReport {
+            target: "nmap",
+            mode: "search",
+            request: Some(SearchRequest {
+                query: "nmap",
+                language: "rust",
+                qualifiers: &qualifiers,
+            }),
+            emails: &emails,
+            per_repository: &per_repository,
+            scanned: ScannedCoverage {
+                repos: 1,
+                pages: 2,
+                partial: false,
+            },
+            correlation: &correlation,
+            provenance: Provenance::now(),
+        };
+        write_report_json(&path, &report).expect("json output must write");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("report must be readable"))
+                .expect("report must be valid JSON");
+        assert_eq!(parsed["request"]["query"], "nmap");
+        assert_eq!(parsed["request"]["language"], "rust");
+        assert_eq!(parsed["request"]["qualifiers"]["stars"], ">100");
+        // the qualifiers that were not provided are omitted, not null
+        assert!(parsed["request"]["qualifiers"].get("created").is_none());
+        // the per-repository breakdown travels with a search report
         assert_eq!(
-            sanitize_log_text("plain@mail.example"),
-            "plain@mail.example"
+            parsed["per_repository"]["octocat/hello-world"],
+            serde_json::json!(["a@b.c"])
         );
-    }
-
-    #[test]
-    fn sanitize_log_text_neuters_the_unicode_bidi_and_format_characters() {
-        // unlike ESC, the Unicode bidi overrides and isolates are not
-        // control characters: a hostile commit author name carrying one
-        // would visually reorder the adjacent report content while passing
-        // the plain control-character filter
-        assert_eq!(sanitize_log_text("a\u{202E}b\u{202C}c"), "a_b_c");
-        assert_eq!(sanitize_log_text("a\u{2066}b\u{2069}c"), "a_b_c");
-        assert_eq!(sanitize_log_text("a\u{200F}b\u{200E}c"), "a_b_c");
-        // U+061C (Arabic Letter Mark) is the remaining Unicode bidi control:
-        // category Cf (not caught by `is_control`), so it must be listed too
-        assert_eq!(sanitize_log_text("a\u{061C}b"), "a_b");
-        // the zero-width / invisible format characters (ZWSP, ZWNJ, ZWJ,
-        // word joiner and friends, BOM) are equally invisible: a hostile
-        // name like `alice\u{200B}admin` would splice report content while
-        // printing as plain text
-        assert_eq!(sanitize_log_text("a\u{200B}b\u{200C}c\u{200D}d"), "a_b_c_d");
-        assert_eq!(sanitize_log_text("a\u{2060}b\u{2061}c\u{2064}d"), "a_b_c_d");
-        assert_eq!(sanitize_log_text("a\u{FEFF}b"), "a_b");
-        // the line/paragraph separators (categories Zl/Zp, not caught by
-        // `is_control`) would still break or split report lines in a
-        // terminal or captured output that honors them
-        assert_eq!(sanitize_log_text("a\u{2028}b\u{2029}c"), "a_b_c");
-        // and the remaining invisible characters: soft hyphen, variation
-        // selectors, interlinear annotation, the Unicode tag block (which
-        // can encode hidden ASCII in captured output)
-        assert_eq!(sanitize_log_text("a\u{00AD}b"), "a_b");
-        assert_eq!(sanitize_log_text("a\u{FE0F}b\u{FE00}c"), "a_b_c");
-        assert_eq!(sanitize_log_text("a\u{FFF9}b\u{FFFB}c"), "a_b_c");
-        assert_eq!(sanitize_log_text("a\u{E0041}b\u{E007F}c"), "a_b_c");
-        assert_eq!(
-            sanitize_log_text("a\u{00E9}b"),
-            "a\u{00E9}b",
-            "printable non-ASCII is kept"
-        );
-    }
-
-    #[test]
-    fn sanitize_log_text_neuters_every_remaining_invisible_format_character() {
-        // the remaining Unicode category-Cf format characters: visually
-        // indistinguishable from nothing (invisible splices in captured
-        // report lines), so the whole category must be neutralized, not just
-        // the bidi and zero-width members. One probe per documented range
-        // (full-list sweep of the Cf coverage gaps found by a character-class
-        // sweep against the Unicode Cf table).
-        for c in [
-            '\u{0600}',
-            '\u{0605}',
-            '\u{06DD}',
-            '\u{070F}',
-            '\u{0890}',
-            '\u{0891}',
-            '\u{08E2}',
-            '\u{180E}',
-            '\u{206A}',
-            '\u{206F}',
-            '\u{110BD}',
-            '\u{110CD}',
-            '\u{13430}',
-            '\u{1343F}',
-            '\u{1BCA0}',
-            '\u{1BCA3}',
-            '\u{1D173}',
-            '\u{1D17A}',
-        ] {
-            assert_eq!(
-                sanitize_log_text(&format!("a{c}b")),
-                "a_b",
-                "U+{:04X} must be neutralized",
-                c as u32
-            );
-        }
-    }
-
-    #[test]
-    fn the_variation_selector_supplement_is_neutered_like_the_base_block() {
-        // the sanitizer comment promises "the variation selectors", but only
-        // FE00..FE0F (VS1-16) was listed once: the 240 invisible characters
-        // of the Variation Selectors Supplement (U+E0100..U+E01EF, category
-        // Mn, neither `is_control` nor Cf) leaked raw into terminal lines
-        // and into two byte-distinct but visually identical file names
-        for cp in [
-            0xE0100usize, // first VS17
-            0xE01EF,      // last VS256
-            0xE0145,      // an interior value
-        ] {
-            let c = char::from_u32(cp as u32).expect("a valid scalar");
-            assert_eq!(
-                sanitize_log_text(&format!("a{c}b")),
-                "a_b",
-                "U+{cp:05X} must be neutralized in log text"
-            );
-            assert!(
-                sanitize_file_name(&format!("q{c}x")).starts_with("q_x"),
-                "U+{cp:05X} must be neutralized in file names"
-            );
-        }
-        // the rest of the supplement range: a sampled sweep keeps the whole
-        // 240-character block pinned without a 240-iteration loop's noise
-        for cp in (0xE0100..=0xE01EF).step_by(7) {
-            let c = char::from_u32(cp).expect("a valid scalar");
-            assert_eq!(
-                sanitize_log_text(&format!("a{c}")),
-                "a_",
-                "U+{cp:05X} must be neutralized"
-            );
-        }
+        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -697,6 +810,19 @@ mod tests {
                 sanitize_file_name(&format!("a{c}b")).starts_with("a_b"),
                 "U+{:04X} must be neutralized in file names",
                 c as u32
+            );
+        }
+        // sampled sweep over the same invisible ranges the log-safety tests
+        // pin exhaustively (file names share `is_control_or_invisible`)
+        for cp in [
+            0x202A, 0x202E, 0x2066, 0x2069, 0x200D, 0x2064, 0x06DD, 0x070F, 0x180E, 0x206F,
+            0x110BD, 0x110CD, 0x13430, 0x1343F, 0x1BCA0, 0x1BCA3, 0x1D173, 0x1D17A, 0xFE00, 0xFE0F,
+            0xE0100, 0xE01EF, 0xFFF9, 0xFFFB, 0xE0000, 0xE007F,
+        ] {
+            let c = char::from_u32(cp).expect("a valid scalar");
+            assert!(
+                sanitize_file_name(&format!("q{c}x")).starts_with("q_x"),
+                "U+{cp:05X} must be neutralized in file names"
             );
         }
     }
@@ -773,7 +899,8 @@ mod tests {
     fn ensure_report_target_rejects_a_file_as_parent_before_the_scan() {
         // a regular file occupying the parent path can never become the
         // report's directory: reject it pre-flight
-        let file = std::env::temp_dir().join("git2mail-parent-is-a-file");
+        let file =
+            std::env::temp_dir().join(format!("git2mail-parent-is-a-file-{}", std::process::id()));
         std::fs::write(&file, "not a directory").expect("the temp file must be writable");
         let target = file.join("report.json");
         let error = ensure_report_target(&target).expect_err("a file parent must be rejected");
@@ -789,7 +916,10 @@ mod tests {
         // `--json results` collides with the legacy results/ directory: the
         // check must reject it before the run's API budget is spent, not at
         // report-write time after the whole scan completed
-        let dir = std::env::temp_dir().join("git2mail-ensure-report-target-dir");
+        let dir = std::env::temp_dir().join(format!(
+            "git2mail-ensure-report-target-dir-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("the temp directory must be creatable");
         let error = ensure_report_target(&dir).expect_err("a directory target must be rejected");
         assert!(
@@ -799,10 +929,16 @@ mod tests {
         // the stdout marker, a non-existing path and a plain file are accepted
         assert!(ensure_report_target(Path::new("-")).is_ok());
         assert!(
-            ensure_report_target(&std::env::temp_dir().join("git2mail-no-such-report.json"))
-                .is_ok()
+            ensure_report_target(&std::env::temp_dir().join(format!(
+                "git2mail-no-such-report-{}.json",
+                std::process::id()
+            )))
+            .is_ok()
         );
-        let file = std::env::temp_dir().join("git2mail-ensure-report-target-file.json");
+        let file = std::env::temp_dir().join(format!(
+            "git2mail-ensure-report-target-file-{}.json",
+            std::process::id()
+        ));
         std::fs::write(&file, "{}").expect("the temp file must be writable");
         assert!(ensure_report_target(&file).is_ok());
         std::fs::remove_dir(&dir).ok();
@@ -924,11 +1060,13 @@ mod tests {
         in_temp_cwd(|| {
             use std::os::unix::fs::PermissionsExt;
             let first = write_text("keyword", "acme.txt", &["dev@acme.com".to_string()])
-                .expect("the first publish must succeed");
+                .expect("the first publish must succeed")
+                .expect("the file must be written");
             fs::set_permissions(&first, fs::Permissions::from_mode(0o600))
                 .expect("the mode must be settable");
             let second = write_text("keyword", "acme.txt", &["dev2@acme.com".to_string()])
-                .expect("the republish must succeed");
+                .expect("the republish must succeed")
+                .expect("the file must be written");
             assert_eq!(second, first, "the republish must target the same file");
             let mode = fs::metadata(&second)
                 .expect("the result file must exist")
@@ -938,6 +1076,30 @@ mod tests {
                 mode & 0o777,
                 0o600,
                 "the user-set 0600 mode must survive the republish"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_first_publish_creates_the_result_file_owner_only() {
+        // the results hold personal data: a FIRST publish (no previous
+        // target whose permissions could be inherited) must not fall back
+        // to the umask's world-readable 0644 default — the staging file is
+        // created 0600, so "safe by default" needs no user awareness
+        in_temp_cwd(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let first = write_text("keyword", "acme.txt", &["dev@acme.com".to_string()])
+                .expect("the first publish must succeed")
+                .expect("the file must be written");
+            let mode = fs::metadata(&first)
+                .expect("the result file must exist")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "a first publish must create the result file owner-only (0600)"
             );
         });
     }
@@ -988,7 +1150,9 @@ mod tests {
             let directory = format!("git2mail_output_test_one_line_{}", std::process::id());
             let emails = vec!["a@b.c".to_string(), "d@e.f".to_string()];
 
-            let path = write_text(&directory, "scan", &emails).expect("text output must write");
+            let path = write_text(&directory, "scan", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
 
             let content = fs::read_to_string(&path).expect("result must be readable");
             assert_eq!(content, "a@b.c\nd@e.f\n");
@@ -998,9 +1162,62 @@ mod tests {
     }
 
     #[test]
-    fn write_text_rejects_empty_results() {
-        let error = write_text("whatever", "empty", &[]).expect_err("empty results must fail");
-        assert!(matches!(error, Error::NoResults));
+    fn a_publish_sweeps_the_staging_files_an_interrupted_run_left_behind() {
+        in_temp_cwd(|| {
+            // write_text publishes into `results/<directory>`: the orphans
+            // must be planted there, next to the target
+            let directory = format!("git2mail_output_test_sweep_{}", std::process::id());
+            let planted = std::path::PathBuf::from("results").join(&directory);
+            fs::create_dir_all(&planted).expect("test setup: results dir");
+            // two orphans from a crashed run (24 h+ old) and one fresh
+            // staging file a concurrent run could legitimately own: only
+            // the orphans may be swept
+            let stale = planted.join(".git2mail-stage.99999.0.tmp");
+            let stale_csv = planted.join(".git2mail-stage.99999.1.tmp");
+            let fresh = planted.join(".git2mail-stage.99998.0.tmp");
+            let user_file = planted.join("sweep-99999.0.tmp");
+            for file in [&stale, &stale_csv, &fresh, &user_file] {
+                fs::write(file, "orphan").expect("test setup: staging file");
+            }
+            // age the two orphans beyond the sweep bound (std-only: no
+            // filetime dependency)
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 60 * 60);
+            for file in [&stale, &stale_csv] {
+                let handle = fs::OpenOptions::new()
+                    .append(true)
+                    .open(file)
+                    .expect("test setup: reopen staging file");
+                handle
+                    .set_times(std::fs::FileTimes::new().set_modified(old))
+                    .expect("test setup: backdate staging file");
+            }
+
+            write_text(directory.as_str(), "sweep", &["a@b.c".to_string()])
+                .expect("text output must write")
+                .expect("the file must be written");
+
+            assert!(!stale.exists(), "the stale staging file must be swept");
+            assert!(
+                !stale_csv.exists(),
+                "the stale csv staging file must be swept"
+            );
+            assert!(
+                fresh.exists(),
+                "a fresh staging file (a concurrent run's) must never be swept"
+            );
+            assert!(
+                user_file.exists(),
+                "a user file that happens to end in .tmp must never be swept"
+            );
+        });
+    }
+
+    #[test]
+    fn write_text_reports_an_empty_result_as_none() {
+        let written =
+            write_text("whatever", "empty", &[]).expect("an empty result is not an error");
+        assert!(written.is_none(), "an empty result must write no file");
+        assert!(!Path::new("results/whatever").exists());
     }
 
     #[test]
@@ -1013,13 +1230,17 @@ mod tests {
             // the lossy replacement disambiguates the collapsed class: two
             // distinct raw queries that sanitize to the same name must not
             // silently overwrite each other's result file
-            let path = write_text(&directory, "a/b", &emails).expect("text output must write");
+            let path = write_text(&directory, "a/b", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
             let slashed = path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .expect("a UTF-8 result file name");
             assert!(slashed.starts_with("a_b-"), "unexpected name: {slashed}");
-            let plain = write_text(&directory, "a_b", &emails).expect("text output must write");
+            let plain = write_text(&directory, "a_b", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
             assert_eq!(
                 plain.file_name().and_then(|name| name.to_str()),
                 Some("a_b"),
@@ -1028,8 +1249,9 @@ mod tests {
             assert_ne!(plain, path, "a/b and a_b must land in distinct files");
 
             // Windows-reserved characters are replaced, trailing dots/spaces trimmed
-            let path =
-                write_text(&directory, "language:rust ", &emails).expect("text output must write");
+            let path = write_text(&directory, "language:rust ", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -1040,7 +1262,9 @@ mod tests {
             );
 
             // a name entirely made of dots would be a directory: fall back to "_"
-            let path = write_text(&directory, "..", &emails).expect("text output must write");
+            let path = write_text(&directory, "..", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -1050,10 +1274,37 @@ mod tests {
             // the directory component is sanitized like the file name: a
             // traversal (`..\\x`) or a Windows reserved device name (`CON`)
             // must never escape `results/` or produce an unopenable path
-            let path = write_text("../escape", "scan", &emails).expect("text output must write");
-            assert!(path.to_string_lossy().starts_with("results/.._escape-"));
-            let path = write_text("CON", "scan", &emails).expect("text output must write");
-            assert!(path.to_string_lossy().starts_with("results/_CON-"));
+            let path = write_text("../escape", "scan", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
+            // compare components, not the lossy string: the separator is
+            // `/` on Unix and `\` on Windows; the sanitized DIRECTORY
+            // carries the `.._escape-` name, under `results/`
+            let dir = path.parent().expect("a parent directory");
+            assert!(
+                dir.file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("a UTF-8 directory name")
+                    .starts_with(".._escape-")
+            );
+            assert_eq!(
+                dir.parent().map(|parent| parent.to_string_lossy()),
+                Some(std::borrow::Cow::Borrowed("results"))
+            );
+            let path = write_text("CON", "scan", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
+            let dir = path.parent().expect("a parent directory");
+            assert!(
+                dir.file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("a UTF-8 directory name")
+                    .starts_with("_CON-")
+            );
+            assert_eq!(
+                dir.parent().map(|parent| parent.to_string_lossy()),
+                Some(std::borrow::Cow::Borrowed("results"))
+            );
         });
     }
 
@@ -1066,8 +1317,9 @@ mod tests {
             // Windows reserved device names are refused with or without
             // extension, case-insensitively: they are prefixed with "_"
             for reserved in ["CON", "nul", "Com1"] {
-                let path =
-                    write_text(&directory, reserved, &emails).expect("text output must write");
+                let path = write_text(&directory, reserved, &emails)
+                    .expect("text output must write")
+                    .expect("the file must be written");
                 let expected = format!("_{reserved}");
                 let actual = path
                     .file_name()
@@ -1078,8 +1330,9 @@ mod tests {
 
             // the reservation also holds for "name.extension" forms
             for reserved in ["CON.txt", "nul.json"] {
-                let path =
-                    write_text(&directory, reserved, &emails).expect("text output must write");
+                let path = write_text(&directory, reserved, &emails)
+                    .expect("text output must write")
+                    .expect("the file must be written");
                 let expected = format!("_{reserved}");
                 let actual = path
                     .file_name()
@@ -1089,7 +1342,9 @@ mod tests {
             }
 
             // control characters are replaced, like the other illegal characters
-            let path = write_text(&directory, "a\nb", &emails).expect("text output must write");
+            let path = write_text(&directory, "a\nb", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -1117,6 +1372,37 @@ mod tests {
         });
     }
 
+    /// Builds a scan report for the tests: one site per field, so a
+    /// shape change breaks the compile here instead of silently
+    /// dropping a field from the documented shape.
+    /// The empty per-repository map the non-search test reports carry.
+    static EMPTY_PER_REPOSITORY: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    fn test_report<'a>(
+        target: &'a str,
+        mode: &'a str,
+        emails: &'a [String],
+        repos: usize,
+        pages: usize,
+        partial: bool,
+        correlation: &'a crate::correlate::Correlation,
+    ) -> ScanJsonReport<'a> {
+        ScanJsonReport {
+            target,
+            mode,
+            request: None,
+            emails,
+            per_repository: &EMPTY_PER_REPOSITORY,
+            scanned: ScannedCoverage {
+                repos,
+                pages,
+                partial,
+            },
+            correlation,
+            provenance: Provenance::now(),
+        }
+    }
+
     #[test]
     fn write_json_maps_a_filesystem_failure_to_output_write_with_the_path() {
         // writing the report onto a directory path must surface as an
@@ -1127,17 +1413,10 @@ mod tests {
         ));
         fs::create_dir_all(&directory).expect("test setup: blocker directory");
 
-        let error = write_scan_report_json(
-            &directory,
-            "target",
-            "repository",
-            &["a@b.c".to_string()],
-            1,
-            1,
-            false,
-            &crate::correlate::Correlation::default(),
-        )
-        .expect_err("a directory path must fail");
+        let correlation = crate::correlate::Correlation::default();
+        let emails = ["a@b.c".to_string()];
+        let report = test_report("target", "repository", &emails, 1, 1, false, &correlation);
+        let error = write_report_json(&directory, &report).expect_err("a directory path must fail");
         assert!(
             matches!(error, Error::OutputWrite(details) if details.contains(&directory.display().to_string()))
         );
@@ -1197,27 +1476,26 @@ mod tests {
     }
 
     #[test]
-    fn case_only_variants_carry_the_hash_suffix() {
-        // lowercase names keep their exact file name; every mixed-case name
-        // is hashed so case-only variants (`rust lang` vs `Rust Lang`)
-        // cannot silently overwrite each other on a case-insensitive
-        // filesystem (macOS APFS, Windows NTFS)
+    fn the_hash_suffix_is_added_only_on_a_real_loss() {
+        // the anti-clobber suffix answers a real sanitization loss: a byte-
+        // unchanged name keeps its exact file name, whatever its case — the
+        // suffix never decorates an untouched name (the JSON report and the
+        // log lines carry the exact target, so nothing is silently hidden;
+        // on a case-insensitive filesystem two case-only variants share one
+        // file name, as documented)
         assert_eq!(sanitize_file_name("rust lang"), "rust lang");
         assert_eq!(sanitize_file_name("hello"), "hello");
-        let mixed = sanitize_file_name("Rust Lang");
+        assert_eq!(sanitize_file_name("Rust Lang"), "Rust Lang");
+        // a genuinely lossy name carries the 16-hex suffix of the RAW name
+        let lossy = sanitize_file_name("a/b");
         assert!(
-            mixed.starts_with("Rust Lang-") && mixed.len() == "Rust Lang-".len() + 16,
-            "a mixed-case name must carry the 16-hex anti-clobber suffix: {mixed}"
-        );
-        let other = sanitize_file_name("rust lang");
-        assert_eq!(
-            other, "rust lang",
-            "the lowercase twin keeps its exact name"
+            lossy.starts_with("a_b-") && lossy.len() == "a_b-".len() + 16,
+            "a collapsed name must carry the 16-hex anti-clobber suffix: {lossy}"
         );
         assert_ne!(
-            sanitize_file_name("Rust lang"),
-            sanitize_file_name("rust lang"),
-            "case variants must land in distinct files"
+            sanitize_file_name("a/b"),
+            sanitize_file_name("a:b"),
+            "two raw names collapsing onto the same sanitized name must stay distinct"
         );
     }
 
@@ -1276,15 +1554,19 @@ mod tests {
             "git2mail_output_test_{}_report.json",
             std::process::id()
         ));
-        write_scan_report_json(
+        let correlation = crate::correlate::Correlation::default();
+        let emails = ["a@b.c".to_string()];
+        write_report_json(
             &path,
-            "https://github.com/octocat/hello-world",
-            "repository",
-            &["a@b.c".to_string()],
-            1,
-            3,
-            false,
-            &crate::correlate::Correlation::default(),
+            &test_report(
+                "https://github.com/octocat/hello-world",
+                "repository",
+                &emails,
+                1,
+                3,
+                false,
+                &correlation,
+            ),
         )
         .expect("json output must write");
 
@@ -1299,6 +1581,18 @@ mod tests {
         assert_eq!(parsed["scanned"]["partial"], false);
         // the correlation object is always part of the opt-in report
         assert_eq!(parsed["correlation"]["authors"], serde_json::json!([]));
+        // the provenance is always part of the report: an archived report
+        // traces back to the run that produced it
+        assert_eq!(parsed["tool_version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            parsed["generated_at"]
+                .as_str()
+                .is_some_and(|stamp| stamp.len() == 20 && stamp.ends_with('Z')),
+        );
+        // a repository scan carries no request provenance and no
+        // per-repository breakdown (its one target is the whole report)
+        assert!(parsed.get("request").is_none());
+        assert!(parsed.get("per_repository").is_none());
         fs::remove_file(&path).ok();
     }
 
@@ -1312,15 +1606,19 @@ mod tests {
             "git2mail_output_test_{}_partial_report.json",
             std::process::id()
         ));
-        write_scan_report_json(
+        let correlation = crate::correlate::Correlation::default();
+        let emails = ["a@b.c".to_string()];
+        write_report_json(
             &path,
-            "https://github.com/octocat/hello-world",
-            "search",
-            &["a@b.c".to_string()],
-            3,
-            7,
-            true,
-            &crate::correlate::Correlation::default(),
+            &test_report(
+                "https://github.com/octocat/hello-world",
+                "search",
+                &emails,
+                3,
+                7,
+                true,
+                &correlation,
+            ),
         )
         .expect("json output must write");
 
@@ -1361,19 +1659,22 @@ mod tests {
                 name: "Alice".to_string(),
                 email: "a@b.c".to_string(),
                 hits: 2,
+                last_commit_date: None,
             }],
         });
         let correlation = builder.finish();
-
-        write_scan_report_json(
+        let emails = ["a@b.c".to_string()];
+        write_report_json(
             &path,
-            "https://github.com/octocat/hello-world",
-            "repository",
-            &["a@b.c".to_string()],
-            1,
-            1,
-            false,
-            &correlation,
+            &test_report(
+                "https://github.com/octocat/hello-world",
+                "repository",
+                &emails,
+                1,
+                1,
+                false,
+                &correlation,
+            ),
         )
         .expect("json output must write");
 
@@ -1399,7 +1700,9 @@ mod tests {
         in_temp_cwd(|| {
             let directory = format!("git2mail_output_test_atomic_{}", std::process::id());
             let emails: Vec<String> = (0..500).map(|i| format!("dev{i}@example.com")).collect();
-            let path = write_text(&directory, "atomic", &emails).expect("text output must write");
+            let path = write_text(&directory, "atomic", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
             let expected: String = emails.iter().map(|email| format!("{email}\n")).collect();
             assert_eq!(
                 fs::read_to_string(&path).expect("result must be readable"),
@@ -1408,7 +1711,9 @@ mod tests {
             // a rerun replaces the file completely (last complete publisher
             // wins), and no dot-prefixed staging file survives the publish
             let fewer: Vec<String> = emails[..10].to_vec();
-            let path = write_text(&directory, "atomic", &fewer).expect("rerun must write");
+            let path = write_text(&directory, "atomic", &fewer)
+                .expect("rerun must write")
+                .expect("the file must be written");
             let expected: String = fewer.iter().map(|email| format!("{email}\n")).collect();
             assert_eq!(
                 fs::read_to_string(&path).expect("result must be readable"),
@@ -1442,7 +1747,7 @@ mod tests {
         fs::write(&previous, "{ \"previous\": true }").expect("test setup: previous report");
         // a directory where the staging SIBLING file should be: the staging
         // write fails, so the previous report must survive untouched
-        let staging_blocker = base.join(".git2mail-report.tmp-blocker");
+        let staging_blocker = base.join(".git2mail-stage.tmp-blocker");
         fs::create_dir_all(&staging_blocker).expect("test setup: blocker dir");
         // publish_atomically derives its own unique staging name, so the
         // deterministic blocker is the target itself: make the rename fail
@@ -1463,7 +1768,7 @@ mod tests {
             .expect("directory must be readable")
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(".git2mail-report.") && name.ends_with(".tmp"))
+            .filter(|name| name.starts_with(".git2mail-stage.") && name.ends_with(".tmp"))
             .collect();
         assert!(
             leftovers.is_empty(),
@@ -1543,10 +1848,20 @@ mod tests {
         // staging rename: a concurrent reader observes one complete JSON
         // document, and two instances targeting the same --json path each
         // publish their own complete report instead of interleaving
-        let target = std::env::temp_dir().join(format!(
-            "git2mail_output_test_json_race_{}.json",
+        //
+        // the target lives in a private directory: the staging sibling of
+        // the target is `.git2mail-stage.<pid>.<serial>.tmp`, and other
+        // tests of this suite publish reports from the shared temp root
+        // with the same pid and stem — scanning the shared root for
+        // leftovers could observe a CONCURRENT test's in-flight staging
+        // file and fail spuriously (observed once in ~15 full-suite runs)
+        let directory = std::env::temp_dir().join(format!(
+            "git2mail_output_test_json_race_dir_{}",
             std::process::id()
         ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("test setup: private race directory");
+        let target = directory.join("report.json");
         let report_a = serde_json::json!({ "run": "a", "emails": ["a@x.example"] });
         let report_b = serde_json::json!({ "run": "b", "emails": ["b@x.example"] });
         let (path_a, path_b) = (target.clone(), target.clone());
@@ -1572,24 +1887,25 @@ mod tests {
                 || parsed == serde_json::json!({ "run": "b", "emails": ["b@x.example"] }),
             "the published report must be exactly one writer's document: {content}"
         );
-        // no staging file survives next to the report
-        let directory = target.parent().expect("temp dir parent");
-        let leftovers: Vec<_> = fs::read_dir(directory)
+        // no staging file survives next to the report (the scan is sound
+        // here: the private directory holds no other publisher)
+        let leftovers: Vec<_> = fs::read_dir(&directory)
             .expect("directory must be readable")
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(".git2mail-report.") && name.ends_with(".tmp"))
+            .filter(|name| name.starts_with(".git2mail-stage.") && name.ends_with(".tmp"))
             .collect();
         assert!(
             leftovers.is_empty(),
             "a staging file must never survive the publish: {leftovers:?}"
         );
         fs::remove_file(&target).ok();
+        fs::remove_dir_all(&directory).ok();
     }
 
     #[test]
     fn write_text_plain_output_stays_byte_identical_for_any_email_set() {
-        // property (issue #5 compatibility gate): whatever the scan found,
+        // property (byte-identity compatibility gate): whatever the scan found,
         // the legacy text file is exactly one email per line — the
         // correlation report changes nothing to the plain output
         let mut state = 0x1234_5678_u32;
@@ -1601,8 +1917,9 @@ mod tests {
             }
             in_temp_cwd(|| {
                 let directory = format!("git2mail_output_test_property_{}", std::process::id());
-                let path =
-                    write_text(&directory, "property", &emails).expect("text output must write");
+                let path = write_text(&directory, "property", &emails)
+                    .expect("text output must write")
+                    .expect("the file must be written");
                 let content = fs::read_to_string(&path).expect("result must be readable");
                 let expected: String = emails.iter().map(|email| format!("{email}\n")).collect();
                 assert_eq!(content, expected);
@@ -1659,10 +1976,141 @@ mod tests {
             let directory = format!("git2mail_output_test_cjk_{}", std::process::id());
             let emails = vec!["a@b.c".to_string()];
             let path = write_text(&directory, &"日".repeat(110), &emails)
-                .expect("a 330-byte multibyte name must still write");
+                .expect("a 330-byte multibyte name must still write")
+                .expect("the file must be written");
             assert!(path.exists());
             let content = fs::read_to_string(&path).expect("result must be readable");
             assert_eq!(content, "a@b.c\n");
+        });
+    }
+
+    fn correlation_with(
+        authors: Vec<crate::correlate::AuthorReport>,
+    ) -> crate::correlate::Correlation {
+        crate::correlate::Correlation { authors }
+    }
+
+    fn author_report(
+        name: &str,
+        emails: &[&str],
+        repos: &[&str],
+        languages: &[&str],
+        hits: usize,
+    ) -> crate::correlate::AuthorReport {
+        crate::correlate::AuthorReport {
+            author: name.to_string(),
+            emails: emails.iter().map(|email| email.to_string()).collect(),
+            repos: repos
+                .iter()
+                .map(|name| crate::correlate::RepoLanguage {
+                    name: name.to_string(),
+                    language: None,
+                })
+                .collect(),
+            languages: languages
+                .iter()
+                .map(|language| language.to_string())
+                .collect(),
+            first_seen_repo: repos.first().unwrap_or(&"").to_string(),
+            total_hits: hits,
+            last_commit_date: None,
+        }
+    }
+
+    #[test]
+    fn the_csv_export_writes_one_row_per_author_with_a_header() {
+        in_temp_cwd(|| {
+            let path = std::path::PathBuf::from("authors.csv");
+            let correlation = correlation_with(vec![
+                author_report(
+                    "Alice",
+                    &["a@x.com", "b@x.com"],
+                    &["acme/one", "acme/two"],
+                    &["Rust"],
+                    12,
+                ),
+                author_report("Bob", &["bob@x.com"], &["acme/one"], &["Go", "Rust"], 3),
+            ]);
+            write_correlation_csv(&path, &correlation).expect("the export must succeed");
+            let content = fs::read_to_string(&path).expect("the csv must be readable");
+            assert_eq!(
+                content,
+                "author_name,emails,repositories,dominant_language,commits\n\
+                 Alice,a@x.com;b@x.com,acme/one;acme/two,Rust,12\n\
+                 Bob,bob@x.com,acme/one,Go,3\n",
+                "the sheet shape (header, one row per author, semicolon-joined \
+                  multi-values) must be pinned"
+            );
+            let _ = fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn the_csv_export_quotes_hostile_fields_instead_of_forging_rows() {
+        in_temp_cwd(|| {
+            let path = std::path::PathBuf::from("hostile.csv");
+            // a commit-forged author name carrying RFC 4180 metacharacters:
+            // the field must stay ONE cell (quoted, quotes doubled), never
+            // extra rows or columns a spreadsheet would render as findings
+            let correlation = correlation_with(vec![author_report(
+                "Alice\",fake@x.com,\nEvil",
+                &["a@x.com"],
+                &["acme/one"],
+                &["Rust"],
+                1,
+            )]);
+            write_correlation_csv(&path, &correlation).expect("the export must succeed");
+            let content = fs::read_to_string(&path).expect("the csv must be readable");
+            assert_eq!(
+                content,
+                "author_name,emails,repositories,dominant_language,commits\n\
+                 \"Alice\"\",fake@x.com,\nEvil\",a@x.com,acme/one,Rust,1\n",
+                "the hostile name must be one quoted cell with doubled quotes"
+            );
+            // and the sheet still parses as exactly 2 rows x 5 columns (an
+            // RFC 4180 parser: quoted fields span embedded newlines)
+            let parse_csv = |content: &str| {
+                let mut rows: Vec<Vec<String>> = Vec::new();
+                let mut row: Vec<String> = Vec::new();
+                let mut cell = String::new();
+                let mut in_quotes = false;
+                let mut chars = content.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if in_quotes {
+                        if c == '"' {
+                            if chars.peek() == Some(&'"') {
+                                cell.push('"');
+                                chars.next();
+                            } else {
+                                in_quotes = false;
+                            }
+                        } else {
+                            cell.push(c);
+                        }
+                    } else {
+                        match c {
+                            '"' => in_quotes = true,
+                            ',' => row.push(std::mem::take(&mut cell)),
+                            '\n' => {
+                                row.push(std::mem::take(&mut cell));
+                                rows.push(std::mem::take(&mut row));
+                            }
+                            '\r' => {}
+                            other => cell.push(other),
+                        }
+                    }
+                }
+                if !cell.is_empty() || !row.is_empty() {
+                    row.push(cell);
+                    rows.push(row);
+                }
+                rows
+            };
+            let rows = parse_csv(&content);
+            assert_eq!(rows.len(), 2, "one header row plus one data row");
+            assert!(rows.iter().all(|row| row.len() == 5), "5 columns per row");
+            assert_eq!(rows[1][0], "Alice\",fake@x.com,\nEvil");
+            let _ = fs::remove_file(&path);
         });
     }
 }

@@ -1,4 +1,4 @@
-//! Per-author attribute correlation (issue #5): aggregates
+//! Per-author attribute correlation: aggregates
 //! the scan results per author with the attributes git2mail already
 //! collects — the repositories scanned, their primary language (when the
 //! search API metadata reports it) and the commit counts — into a
@@ -13,7 +13,7 @@
 //! and therefore defines no error variant (the crate philosophy: hand-made
 //! errors only where something can actually fail).
 
-use crate::output::sanitize_log_text as log_safe;
+use crate::sanitize::log_safe;
 use log::info;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -30,6 +30,16 @@ pub struct CommitAuthor {
     pub email: String,
     /// How many commits of the scan exposed this name/email pair.
     pub hits: usize,
+    /// The most recent commit author date seen for this pair (the raw
+    /// `commit.author.date` string of the API payload, GitHub's ISO 8601
+    /// UTC stamp). Self-declared, forgeable commit metadata exactly like
+    /// the name itself, reported for data-freshness assessment only — the
+    /// report must let a DPO judge how old an exposure is without re-scanning.
+    /// `None` when no page carried a date. Merged across pages and
+    /// repositories by lexicographic max (chronological on ISO 8601 UTC;
+    /// a malformed forged date only loses that race, it cannot corrupt
+    /// another author's field).
+    pub last_commit_date: Option<String>,
 }
 
 /// Result of scanning one repository: the legacy deduplicated email list
@@ -70,7 +80,7 @@ pub struct RepoLanguage {
     pub language: Option<String>,
 }
 
-/// The per-author correlation report (issue #5): the `correlation` object of
+/// The per-author correlation report: the `correlation` object of
 /// the opt-in `--json` output, on top of the unchanged legacy fields.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Correlation {
@@ -89,7 +99,7 @@ impl Correlation {
     /// correlated. Every interpolated string is sanitized first by the
     /// shared log sanitizer plus a summary-shape neutralization (see
     /// `summary_field`): a hostile commit author name or email can never
-    /// forge or spoof terminal-report lines. Never panics.
+    /// forge or spoof terminal-report lines.
     pub fn log_summary(&self) {
         if self.authors.is_empty() {
             return;
@@ -110,7 +120,7 @@ impl Correlation {
     /// format) are neutralized too, so a hostile author name like
     /// `Alice <a@x.com> — Rust, 999 commits; Fake Dev` renders as one
     /// visibly mangled field instead of extra plausible "top author"
-    /// entries. Never panics.
+    /// entries.
     fn summary_field(text: &str) -> String {
         log_safe(text).replace([';', '—', '<', '>'], "_")
     }
@@ -120,7 +130,7 @@ impl Correlation {
     /// straight from hostile commit metadata and the language from the
     /// search API payload, so all three go through [`Self::summary_field`]
     /// (shared log sanitizer plus summary-shape neutralization), like every
-    /// other terminal-report site of the crate. Never panics.
+    /// other terminal-report site of the crate.
     fn summary_entries(&self) -> Vec<String> {
         self.authors
             .iter()
@@ -172,6 +182,11 @@ pub struct AuthorReport {
     /// The total number of kept commits by this author across all the
     /// scanned repositories.
     pub total_hits: usize,
+    /// The most recent commit author date seen for this author (the raw
+    /// ISO 8601 UTC stamp of the API payload, self-declared forgeable
+    /// metadata: a freshness indicator, never a proof). `null` when no
+    /// commit carried a date.
+    pub last_commit_date: Option<String>,
 }
 
 /// The mutable per-author aggregate behind one [`AuthorReport`].
@@ -192,6 +207,9 @@ struct AuthorAggregate {
     repo_name_set: HashSet<String>,
     first_seen_repo: Option<String>,
     total_hits: usize,
+    /// The most recent commit date merged in (see
+    /// [`CommitAuthor::last_commit_date`]).
+    last_commit_date: Option<String>,
     /// Commit hits per repository language (languages only; repositories
     /// with an unknown language contribute nothing).
     language_hits: HashMap<String, usize>,
@@ -241,6 +259,18 @@ impl CorrelationBuilder {
             if aggregate.first_seen_repo.is_none() {
                 aggregate.first_seen_repo = Some(contribution.name.clone());
             }
+            // the most recent date wins the merge: GitHub stamps are ISO 8601
+            // UTC, whose lexicographic order is chronological (see
+            // [`CommitAuthor::last_commit_date`])
+            if let Some(date) = &author.last_commit_date {
+                let newer = match &aggregate.last_commit_date {
+                    Some(kept) => date > kept,
+                    None => true,
+                };
+                if newer {
+                    aggregate.last_commit_date = Some(date.clone());
+                }
+            }
             aggregate.total_hits += author.hits;
             if let Some(language) = &contribution.language {
                 // the language key clone is hoisted out of the dedup: the
@@ -280,6 +310,7 @@ impl CorrelationBuilder {
                         .collect(),
                     first_seen_repo: aggregate.first_seen_repo.unwrap_or_default(),
                     total_hits: aggregate.total_hits,
+                    last_commit_date: aggregate.last_commit_date,
                 }
             })
             .collect();
@@ -321,6 +352,7 @@ mod tests {
                     name: (*name).to_string(),
                     email: (*email).to_string(),
                     hits: *hits,
+                    last_commit_date: None,
                 })
                 .collect(),
         }
@@ -478,11 +510,9 @@ mod tests {
     #[test]
     fn the_report_serializes_the_documented_json_shape() {
         let mut builder = CorrelationBuilder::new();
-        builder.add_repo(contribution(
-            "a/one",
-            Some("Rust"),
-            &[("Alice", "alice@x.com", 2)],
-        ));
+        let mut contribution = contribution("a/one", Some("Rust"), &[("Alice", "alice@x.com", 2)]);
+        contribution.authors[0].last_commit_date = Some("2024-06-01T12:00:00Z".to_string());
+        builder.add_repo(contribution);
         let value = serde_json::to_value(builder.finish()).expect("report must serialize");
 
         let authors = value["authors"].as_array().expect("authors array");
@@ -497,6 +527,10 @@ mod tests {
         assert_eq!(alice["languages"], serde_json::json!(["Rust"]));
         assert_eq!(alice["first_seen_repo"], "a/one");
         assert_eq!(alice["total_hits"], 2);
+        assert_eq!(
+            alice["last_commit_date"], "2024-06-01T12:00:00Z",
+            "the data-freshness field must be part of the documented shape"
+        );
         // serde_json objects keep their keys alphabetically sorted (no
         // `preserve_order` feature): the documented shape is this key set
         let mut keys: Vec<&str> = alice
@@ -513,6 +547,7 @@ mod tests {
                 "emails",
                 "first_seen_repo",
                 "languages",
+                "last_commit_date",
                 "repos",
                 "total_hits"
             ]
@@ -640,6 +675,7 @@ mod tests {
                     name: "John Smith".to_string(),
                     email: format!("user{}@repo{repo}.example.com", repo * AUTHORS_PER_REPO + n),
                     hits: 1,
+                    last_commit_date: None,
                 })
                 .collect();
             builder.add_repo(RepoContribution {

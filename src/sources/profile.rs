@@ -4,9 +4,9 @@ use crate::consts::GITHUB_API_BASE;
 use crate::correlate::{CorrelationBuilder, RepoContribution};
 use crate::errors::Error;
 use crate::github::{fetch_paginated, fetch_paginated_with_page_size};
-use crate::output::sanitize_log_text as log_safe;
 use crate::parsers;
-use crate::sources::{PER_PAGE, Scanner, keep_email, merge_emails, sort_emails};
+use crate::sanitize::log_safe;
+use crate::sources::{EmailList, PER_PAGE, Scanner};
 use serde_json::Value;
 
 /// GitHub caps the events timeline at 300 events (REST activity/events
@@ -47,13 +47,13 @@ pub(crate) fn scan_profile(scanner: &Scanner, author: &str) -> Result<super::Sca
 /// empty — GitHub answers 409 on its commits listing) is skipped with a
 /// warning, but a rate-limit or transport failure is a scan-wide condition
 /// and aborts the scan instead of yielding a complete-looking partial
-/// result. Never panics.
+/// result.
 pub(crate) fn scan_profile_at(
     scanner: &Scanner,
     base: &str,
     author: &str,
 ) -> Result<super::ScanOutcome, Error> {
-    let mut found_emails: Vec<String> = Vec::new();
+    let mut found_emails = EmailList::new();
     let mut correlation = CorrelationBuilder::new();
 
     // the events walk ends at GitHub's documented timeline cap (see
@@ -105,6 +105,11 @@ pub(crate) fn scan_profile_at(
             }
             emails
         }
+        // deliberately NOT the shared
+        // `crate::sources::classify_search_window_422` (sources/mod.rs):
+        // this is a core-endpoint walk, so a page-1 422 stays a raw
+        // `Error::Http` (never `SearchRejected`) and a window 422 keeps
+        // the emails already collected
         Err(Error::Http(err))
             if err.status() == Some(reqwest::StatusCode::UNPROCESSABLE_ENTITY) =>
         {
@@ -119,7 +124,7 @@ pub(crate) fn scan_profile_at(
         }
         Err(err) => return Err(err),
     };
-    merge_emails(&mut found_emails, page_emails);
+    found_emails.merge(page_emails);
 
     // if no email found with profile events, check all user repositories commits
     let mut repos_scanned: usize = 0;
@@ -132,7 +137,7 @@ pub(crate) fn scan_profile_at(
                     crate::sources::percent_encode(author)
                 )
             },
-            parse_repository_page,
+            parse_profile_repos_page,
             None,
         )?;
         for repository_url in &repositories {
@@ -145,12 +150,12 @@ pub(crate) fn scan_profile_at(
                         &repository,
                     ) {
                         Ok(scan) => {
-                            merge_emails(&mut found_emails, scan.emails);
+                            found_emails.merge(scan.emails);
                             correlation.add_repo(RepoContribution {
                                 name: format!("{repository_author}/{repository}"),
                                 // the /repos listing metadata does not carry
                                 // the primary language: it would cost one
-                                // extra API call per repository (issue #5)
+                                // extra API call per repository
                                 language: None,
                                 authors: scan.authors,
                             });
@@ -181,9 +186,13 @@ pub(crate) fn scan_profile_at(
         }
     }
 
-    sort_emails(&mut found_emails);
+    found_emails.sort();
     Ok(super::ScanOutcome {
-        emails: found_emails,
+        emails: found_emails.into_vec(),
+        // the profile fallback scans the target's own repositories one by
+        // one for the target's own addresses: no per-repository breakdown
+        // to report (the user report keys exposures per email instead)
+        per_repository: std::collections::BTreeMap::new(),
         repos_scanned,
         correlation: correlation.finish(),
         // the profile scan is sequential: it aborts on any scan-wide failure,
@@ -195,9 +204,8 @@ pub(crate) fn scan_profile_at(
 /// Parses the author/repository parts of a fallback repository URL, as the
 /// building block of the profile repositories fallback.
 fn parse_repository_parts(repository_url: &str) -> Result<(String, String), Error> {
-    let repository_author = parsers::get_author(repository_url.to_string())?;
-    let repository = parsers::get_repository(repository_url.to_string())?;
-    Ok((repository_author, repository))
+    parsers::parse_github_url(repository_url)
+        .map(|(author, repository)| (author, repository.unwrap_or_default()))
 }
 
 /// Extracts the emails found in a `/users/{author}/events` page: at most one
@@ -212,7 +220,8 @@ fn parse_event_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
             "events payload: not an array".to_string(),
         ));
     };
-    let mut emails: Vec<String> = Vec::new();
+    // one email per event, kept through the O(1)-membership accumulator
+    let mut emails = crate::sources::EmailList::new();
     for event in items {
         let Some(commits) = event
             .get("payload")
@@ -229,20 +238,20 @@ fn parse_event_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
             else {
                 continue;
             };
-            keep_email(&mut emails, email);
+            emails.keep(email);
             break; // first email found per event, like the legacy scan
         }
     }
     // the raw event count is the end-of-listing signal: an events page whose
     // no event carries a usable email must not end the listing
-    Ok((emails, items.len()))
+    Ok((emails.into_vec(), items.len()))
 }
 
 /// Extracts the `html_url` of every repository of a `/repos` page. A 200
 /// body that is not a JSON array is an intermediary or a shape change, not
 /// an empty page, and fails explicitly instead of silently skipping the
 /// fallback scan as a complete-looking zero-repository result.
-fn parse_repository_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
+fn parse_profile_repos_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
     let Some(items) = json.as_array() else {
         return Err(Error::InvalidProfile(
             "repositories payload: not an array".to_string(),
@@ -284,12 +293,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_repository_page_extracts_html_urls() {
+    fn parse_profile_repos_page_extracts_html_urls() {
         let json: Value = serde_json::json!([
             { "html_url": "https://github.com/octocat/hello-world" },
             { "name": "no url here" }
         ]);
-        let repositories = parse_repository_page(&json).expect("parsing must succeed");
+        let repositories = parse_profile_repos_page(&json).expect("parsing must succeed");
         assert_eq!(
             repositories.0,
             vec!["https://github.com/octocat/hello-world".to_string()]
@@ -308,7 +317,7 @@ mod tests {
             serde_json::json!(null),
         ] {
             let event_error = parse_event_page(&body).expect_err("events must fail");
-            let repos_error = parse_repository_page(&body).expect_err("repos must fail");
+            let repos_error = parse_profile_repos_page(&body).expect_err("repos must fail");
             assert!(
                 matches!(&event_error, Error::InvalidProfile(details) if details.contains("array")),
                 "unexpected events error: {event_error:?}"
@@ -417,8 +426,8 @@ mod tests {
             .expect_err("a rate limit mid-fallback must abort the scan");
         server.join();
         assert!(
-            matches!(error, Error::RateLimitExhausted),
-            "unexpected error: {error:?}"
+            matches!(error, Error::RateLimitPaused),
+            "a secondary-park stop must surface the dedicated paused error: {error:?}"
         );
     }
 

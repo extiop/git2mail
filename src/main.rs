@@ -37,6 +37,11 @@ struct SharedArgs {
     /// `org`; the path `-` prints the report on screen instead
     #[arg(long, value_name = "PATH")]
     json: Option<PathBuf>,
+    /// Also write a CSV spreadsheet at this path: one row per correlated
+    /// author (name, emails, repositories, dominant language, commit
+    /// count) for `scan`/`search`/`org`, ready to open in a spreadsheet
+    #[arg(long, value_name = "PATH")]
+    csv: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -78,8 +83,12 @@ enum Command {
     },
     /// Trace one email address back to its GitHub account (best effort:
     /// GitHub has no email search, so matching repositories are guessed
-    /// from the address, then their commits are checked). One lookup can
-    /// spend up to 500 requests: a token is strongly recommended. The
+    /// from the address, then their commits are checked). One lookup runs
+    /// up to 3 candidate searches (duplicates collapse; a rejected query
+    /// costs its candidates, not the lookup) and walks the full history of
+    /// every candidate repository the search serves (until a
+    /// `commit-author` match ends the lookup early) — the cost is bounded
+    /// only by GitHub's own limits, so a token is strongly recommended. The
     /// result prints on screen; add `--json <path>` (or `--json -`) to
     /// save it
     Email {
@@ -120,6 +129,10 @@ enum Command {
         /// checked against GitHub like the built-in ones)
         #[arg(long, value_name = "PATTERN", value_parser = variant_pattern_value)]
         variant_pattern: Vec<String>,
+        /// Also scan the target's forked repositories (skipped by default:
+        /// their commit history mirrors the upstream project's)
+        #[arg(long)]
+        include_forks: bool,
         #[command(flatten)]
         shared: SharedArgs,
     },
@@ -140,6 +153,10 @@ enum Command {
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
         )]
         limit: Option<usize>,
+        /// Also scan the organization's forked repositories (skipped by
+        /// default: their commit history mirrors the upstream project's)
+        #[arg(long)]
+        include_forks: bool,
         #[command(flatten)]
         shared: SharedArgs,
     },
@@ -194,6 +211,10 @@ enum Command {
         /// (e.g. `--org acme`; mutually exclusive with `--user`)
         #[arg(long, value_name = "ORG")]
         org: Option<String>,
+        /// Also scan forked repositories (skipped by default: their commit
+        /// history mirrors the upstream project's)
+        #[arg(long)]
+        include_forks: bool,
         #[command(flatten)]
         shared: SharedArgs,
     },
@@ -237,7 +258,7 @@ fn write_json_best_effort<T: serde::Serialize>(path: Option<&PathBuf>, report: &
     }
 }
 
-/// Runs one single-report subcommand (`email`, `emails`, `user`): builds
+/// Runs one single-report subcommand (`email`, `emails`): builds
 /// the scanner from the shared `--token`/`--token-file` options, produces
 /// the report through `produce` and writes the JSON deliverable when
 /// `--json` was requested.
@@ -245,7 +266,7 @@ fn write_json_best_effort<T: serde::Serialize>(path: Option<&PathBuf>, report: &
 /// # Errors
 ///
 /// Returns the first failure of the scanner build, the report production
-/// or the JSON write. Never panics.
+/// or the JSON write.
 fn run_report_command<T: serde::Serialize>(
     shared: &SharedArgs,
     produce: impl FnOnce(&Scanner) -> Result<T, Error>,
@@ -264,19 +285,35 @@ fn run() -> Result<(), Error> {
     // `--version` exit above must print only what was asked for, never a
     // stray "Starting git2mail!" banner above the help text
     info!("Starting git2mail!");
-    // every subcommand carries the same shared `--json` option: reject a
-    // target that can never succeed (an existing directory) before spending
-    // the run's API budget on a report that cannot be written
-    let json: Option<&PathBuf> = match &cli.command {
+    // every subcommand carries the same shared `--json` and `--csv` options:
+    // reject a target that can never succeed (an existing directory) before
+    // spending the run's API budget on a report that cannot be written
+    let (json, csv): (Option<&PathBuf>, Option<&PathBuf>) = match &cli.command {
         Command::Scan { shared, .. }
         | Command::Email { shared, .. }
         | Command::Emails { shared, .. }
         | Command::User { shared, .. }
         | Command::Org { shared, .. }
-        | Command::Search { shared, .. } => shared.json.as_ref(),
+        | Command::Search { shared, .. } => (shared.json.as_ref(), shared.csv.as_ref()),
     };
     if let Some(path) = json {
         output::ensure_report_target(path)?;
+    }
+    if let Some(path) = csv {
+        output::ensure_report_target_named(path, "CSV export")?;
+    }
+    // `--csv` is a deliverable of scan/search/org only (those reports carry
+    // a per-author correlation): on the other subcommands the flag is
+    // pre-validated above but never written, so say so instead of a silent
+    // no-op
+    let csv_supported = matches!(
+        cli.command,
+        Command::Scan { .. } | Command::Search { .. } | Command::Org { .. }
+    );
+    if csv.is_some() && !csv_supported {
+        log::warn!(
+            "--csv has no effect here: the CSV export applies to scan, search and org only (use --json for this subcommand's report)"
+        );
     }
 
     match cli.command {
@@ -284,16 +321,27 @@ fn run() -> Result<(), Error> {
             let scanner = Scanner::new(shared.token.as_deref(), shared.token_file.as_deref())?;
             // parsed once: the author/repository names also build the output
             // file name
-            let author = parsers::get_author(url.clone())?;
-            let repository = parsers::get_repository(url.clone())?;
-            let outcome = scanner.scan_parts(&author, &repository)?;
+            let (author, repository) = parsers::parse_github_url(&url)?;
+            let outcome = scanner.scan_parts(&author, repository.as_deref().unwrap_or(""))?;
 
-            let (mode, file_name) = if repository.is_empty() {
-                ("profile", author)
-            } else {
-                ("repository", format!("{author}_{repository}"))
+            let (mode, file_name) = match &repository {
+                None => ("profile", author),
+                Some(repository) if repository.is_empty() => ("profile", author),
+                Some(repository) => ("repository", format!("{author}_{repository}")),
             };
-            write_outputs(&url, mode, mode, &file_name, outcome, shared.json, &scanner)
+            write_outputs(
+                OutputNaming {
+                    target: &url,
+                    mode,
+                    directory: mode,
+                    file_name,
+                    request: None,
+                },
+                outcome,
+                shared.json,
+                shared.csv,
+                &scanner,
+            )
         }
         Command::Email { address, shared } => {
             run_report_command(&shared, |scanner| email::reverse(scanner, &address))
@@ -311,7 +359,14 @@ fn run() -> Result<(), Error> {
             );
             if let Some(path) = shared.json.as_ref() {
                 if failure.is_some() {
-                    write_json_best_effort(Some(path), &report);
+                    // the partial report reaches the requested file only
+                    // when it carries something: a run stopped before its
+                    // FIRST lookup completed has nothing to preserve, and
+                    // overwriting a previous good report with an empty one
+                    // would destroy the user's earlier deliverable
+                    if !report.results.is_empty() || !report.skipped_addresses.is_empty() {
+                        write_json_best_effort(Some(path), &report);
+                    }
                 } else {
                     output::write_report_json(path, &report)?;
                 }
@@ -324,49 +379,28 @@ fn run() -> Result<(), Error> {
         Command::User {
             username,
             variant_pattern,
-            shared,
-        } => run_report_command(&shared, |scanner| {
-            user::investigate(scanner, &username, &variant_pattern)
-        }),
-        Command::Org {
-            org: org_login,
-            limit,
+            include_forks,
             shared,
         } => {
             let scanner = Scanner::new(shared.token.as_deref(), shared.token_file.as_deref())?;
-            let report = org::investigate(&scanner, &org_login, limit)?;
-            // the same one-email-per-line result file the scan subcommands
-            // write: the outreach workflow needs a paste-able list, not a
-            // terminal wall or a JSON file. An empty list is a successful
-            // run (user/email parity): log_summary already printed the
-            // org-scoped [-] no-results line, and NoResults' person-oriented
-            // advice does not apply to an org the user chose deliberately —
-            // only a real write failure surfaces. The JSON report is
-            // attempted in EVERY case: an explicit `--json` deliverable must
-            // not vanish on the empty run (the org scan spends the most API
-            // budget of any subcommand — scan-path parity). write_text logs
-            // the path itself: log nothing extra here
-            let org_text = output::write_text("org", &report.org.login, &report.emails.all);
-            if matches!(&org_text, Err(err) if !matches!(err, Error::NoResults)) {
-                // the text write failed: the user-requested JSON report must
-                // still be written (scan-path parity with `write_outputs` —
-                // the findings must not vanish from both outputs at once);
-                // a JSON failure on top is warned about, then the text
-                // error is surfaced
-                write_json_best_effort(shared.json.as_ref(), &report);
-                org_text.map(|_| ())?;
-            } else {
-                // text written (or nothing found): the JSON deliverable is
-                // propagated like on the scan path — a requested report that
-                // could not be written must fail the run, not vanish
-                if let Some(path) = shared.json.as_ref() {
-                    output::write_report_json(path, &report)?;
-                }
-                // `NoResults` is success here (see the comment above): the
-                // enclosing `if` already filtered out every other `Err`
-            }
-            Ok(())
+            let report = user::investigate(&scanner, &username, &variant_pattern, include_forks)?;
+            // the paste-able one-email-per-line file, the same deliverable
+            // the `org` subcommand writes (org parity: the raw observed
+            // addresses, ready for a spreadsheet or an outreach tool)
+            let addresses: Vec<String> = report
+                .emails
+                .iter()
+                .map(|sighting| sighting.email.clone())
+                .collect();
+            let user_text = output::write_text("user", &report.profile.login, &addresses);
+            write_report_deliverable(user_text, shared.json.as_ref(), &report)
         }
+        Command::Org {
+            org: org_login,
+            limit,
+            include_forks,
+            shared,
+        } => run_org(&shared, &org_login, limit, include_forks),
         Command::Search {
             query,
             language,
@@ -380,6 +414,7 @@ fn run() -> Result<(), Error> {
             topic,
             user,
             org,
+            include_forks,
             shared,
         } => {
             let language = language.unwrap_or_default();
@@ -395,7 +430,7 @@ fn run() -> Result<(), Error> {
                 org,
             };
             let scanner = Scanner::new(shared.token.as_deref(), shared.token_file.as_deref())?;
-            let outcome = scanner.search(&query, &language, &qualifiers, limit)?;
+            let outcome = scanner.search(&query, &language, &qualifiers, limit, include_forks)?;
 
             let file_name = if language.is_empty() {
                 query.clone()
@@ -403,72 +438,189 @@ fn run() -> Result<(), Error> {
                 format!("{query}_{language}")
             };
             write_outputs(
-                &query,
-                "search",
-                "keyword",
-                &file_name,
+                OutputNaming {
+                    target: &query,
+                    mode: "search",
+                    directory: "keyword",
+                    file_name,
+                    request: Some(output::SearchRequest {
+                        query: &query,
+                        language: &language,
+                        qualifiers: &qualifiers,
+                    }),
+                },
                 outcome,
                 shared.json,
+                shared.csv,
                 &scanner,
             )
         }
     }
 }
 
+/// The identity of one scan's outputs: where the report fields come from
+/// and where the text file lands. One struct instead of a four-argument
+/// group of per-call naming arguments so the writer keeps a small
+/// signature.
+struct OutputNaming<'a> {
+    /// The scan target as given (URL, query, ...).
+    target: &'a str,
+    /// The scan mode (`repository`, `profile` or `search`).
+    mode: &'a str,
+    /// The legacy text output directory (relative to the CWD).
+    directory: &'a str,
+    /// The legacy text output file name.
+    file_name: String,
+    /// The search request provenance, `None` outside `search`.
+    request: Option<output::SearchRequest<'a>>,
+}
+
+/// Writes one report deliverable next to its legacy text file, ONCE: the
+/// canonical route for the crate's text/JSON dual-write policy (new report
+/// shapes route here; the two deliberate inline copies are named below).
+///
+/// - a real text-write failure must not make the findings vanish from both
+///   outputs at once: the JSON report is attempted best-effort (warned, not
+///   propagated), then the text error is surfaced;
+/// - otherwise (text written, or `Ok(None)` for an empty result) the JSON
+///   report is propagated like on the scan path: a
+///   requested `--json` deliverable that could not be written must fail the
+///   run, not vanish.
+///
+/// `run_org` and the `user` arm route through this helper. `write_outputs` (the scan path)
+/// deliberately does NOT: it must print the correlation summary before any
+/// text failure early-return, and it builds the scan report lazily from
+/// borrowed outputs, so it keeps an inline copy of this same policy (the
+/// warn line text is shared verbatim). The bulk `emails` abort path
+/// mirrors the best-effort half inline because it has no text file to
+/// fail. THREE statements of the policy, kept in sync by this comment:
+/// route new report shapes through the helper unless they carry the same
+/// pre-return obligations as `write_outputs`.
+fn write_report_deliverable<T: serde::Serialize>(
+    // `write_text` returns `Ok(None)` on an empty result (no file written)
+    // and only ever fails on a real write failure, so the Ok payload is
+    // meaningless here and the error handling is a plain branch
+    text: Result<Option<PathBuf>, Error>,
+    json: Option<&PathBuf>,
+    report: &T,
+) -> Result<(), Error> {
+    if text.is_err() {
+        if let Some(json_err) = json.and_then(|path| output::write_report_json(path, report).err())
+        {
+            log::warn!("the JSON report could not be written either: {json_err}");
+        }
+        return text.map(|_| ());
+    }
+    if let Some(path) = json {
+        output::write_report_json(path, report)?;
+    }
+    Ok(())
+}
+
+/// Runs the `org` subcommand: the investigation, the paste-able
+/// `results/org/<org>` text file, and the JSON deliverable.
+///
+/// An empty result is a successful run (user/email parity): `log_summary`
+/// already printed the org-scoped `[-]` no-results line, and `NoResults`'
+/// person-oriented advice does not apply to an org the user chose
+/// deliberately — only a real write failure surfaces (handled by
+/// [`write_report_deliverable`]). The JSON report is attempted in EVERY
+/// case: the org scan spends the most API budget of any subcommand, so an
+/// explicit `--json` deliverable must not vanish on the empty run.
+/// `write_text` logs the path itself: log nothing extra here.
+fn run_org(
+    shared: &SharedArgs,
+    org_login: &str,
+    limit: Option<usize>,
+    include_forks: bool,
+) -> Result<(), Error> {
+    let scanner = Scanner::new(shared.token.as_deref(), shared.token_file.as_deref())?;
+    let report = org::investigate(&scanner, org_login, limit, include_forks)?;
+    let org_text = output::write_text("org", &report.org.login, &report.emails.all);
+    write_report_deliverable(org_text, shared.json.as_ref(), &report)?;
+    // the opt-in CSV deliverable, like the scan path's (propagated: an
+    // export that cannot be written must fail the run, not vanish)
+    if let Some(path) = shared.csv.as_ref() {
+        output::write_correlation_csv(path, &report.correlation)?;
+    }
+    Ok(())
+}
+
 /// Writes the scan results: the legacy text file (unchanged format), plus the
-/// opt-in JSON report when `--json` is provided.
+/// opt-in JSON report when `--json` is provided, and the opt-in CSV export
+/// when `--csv` is provided.
 ///
 /// The JSON report is written even when the scan found nothing (with empty
 /// `emails`): the user opted into it, and the text output being skipped for
-/// lack of results must not take it down. The scan still ends with
+/// lack of results must not take it down. The CSV export follows the same
+/// rule (header-only on an empty correlation). The scan still ends with
 /// [`Error::NoResults`] in that case.
 fn write_outputs(
-    target: &str,
-    mode: &str,
-    directory: &str,
-    file_name: &str,
+    naming: OutputNaming<'_>,
     outcome: ScanOutcome,
     json: Option<PathBuf>,
+    csv: Option<PathBuf>,
     scanner: &Scanner,
 ) -> Result<(), Error> {
     // one JSON report writer for both paths below: the report is written
     // either propagated (`?`) or best-effort (warn-only), per the caller
     let write_scan_report_json = |path: &PathBuf| {
-        output::write_scan_report_json(
+        output::write_report_json(
             path,
-            target,
-            mode,
-            &outcome.emails,
-            outcome.repos_scanned,
-            scanner.requests_made(),
-            outcome.partial,
-            &outcome.correlation,
+            &output::ScanJsonReport {
+                target: naming.target,
+                mode: naming.mode,
+                request: naming.request,
+                emails: &outcome.emails,
+                per_repository: &outcome.per_repository,
+                scanned: output::ScannedCoverage {
+                    repos: outcome.repos_scanned,
+                    pages: scanner.requests_made(),
+                    partial: outcome.partial,
+                },
+                correlation: &outcome.correlation,
+                provenance: output::Provenance::now(),
+            },
         )
     };
-    let text_result = output::write_text(directory, file_name, &outcome.emails);
-    if matches!(&text_result, Err(err) if !matches!(err, Error::NoResults)) {
-        // the legacy text write failed: the user-requested JSON report must
-        // still be written, so a successful scan's findings do not vanish
-        // from both outputs at once (the JSON write itself would have
-        // succeeded — e.g. a stray file blocking the `results/` layout, or
-        // a read-only CWD). The text failure stays the surfaced error; if
-        // the JSON write fails too, it is warned about on top of it
-        if let Some(path) = json
-            && let Err(json_err) = write_scan_report_json(&path)
-        {
-            log::warn!("the JSON report could not be written either: {json_err}");
-        }
-        // the terminal summary carries the correlation findings the failed
-        // text file no longer does: print it before the early return
-        outcome.correlation.log_summary();
-        return text_result.map(|_| ());
-    }
-    // every non-`NoResults` error early-returned above, so `is_ok()` is
-    // exactly "the legacy text file was written" — without a panicking
-    // fallback arm that a future condition widening would turn live
-    let text_written = text_result.is_ok();
+    // `Ok(Some(path))`: the legacy text file was written; `Ok(None)`: an
+    // empty result (no file, the run ends with `NoResults`); `Err`: a real
+    // write failure that must not take the other deliverables down
+    let text_written =
+        match output::write_text(naming.directory, &naming.file_name, &outcome.emails) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(text_err) => {
+                // the legacy text write failed: the user-requested JSON report
+                // must still be written, so a successful scan's findings do not
+                // vanish from both outputs at once (the JSON write itself would
+                // have succeeded — e.g. a stray file blocking the `results/`
+                // layout, or a read-only CWD). The text failure stays the
+                // surfaced error; if the JSON write fails too, it is warned
+                // about on top of it
+                if let Some(path) = json
+                    && let Err(json_err) = write_scan_report_json(&path)
+                {
+                    log::warn!("the JSON report could not be written either: {json_err}");
+                }
+                if let Some(path) = csv
+                    && let Err(csv_err) =
+                        output::write_correlation_csv(path.as_path(), &outcome.correlation)
+                {
+                    log::warn!("the CSV export could not be written either: {csv_err}");
+                }
+                // the terminal summary carries the correlation findings the
+                // failed text file no longer does: print it before the early
+                // return
+                outcome.correlation.log_summary();
+                return Err(text_err);
+            }
+        };
     if let Some(path) = json {
         write_scan_report_json(&path)?;
+    }
+    if let Some(path) = csv {
+        output::write_correlation_csv(path.as_path(), &outcome.correlation)?;
     }
     // terminal-only summary of the correlated attributes (top authors with
     // their dominant language): the plain-text files stay unchanged
@@ -540,7 +692,16 @@ fn main() {
         // one terminal line only: the logger would repeat the same failure
         // under the default `info` level (visible as a second ERROR line)
         eprintln!("[-] {err}");
-        std::process::exit(1);
+        // exit code 3 is the "completed but found nothing" code (an empty
+        // scan/search result): scripting branches on it to tell a live but
+        // email-less target apart from a real failure (documented in the
+        // README's scripting notes)
+        let code = if matches!(err, Error::NoResults) {
+            3
+        } else {
+            1
+        };
+        std::process::exit(code);
     }
 }
 
@@ -811,6 +972,7 @@ mod tests {
             username,
             shared,
             variant_pattern: _,
+            include_forks: _,
         } = cli.command
         else {
             panic!("expected the user subcommand");
@@ -868,7 +1030,13 @@ mod tests {
             "report.json",
         ])
         .expect("the org subcommand must parse");
-        let Command::Org { org, limit, shared } = cli.command else {
+        let Command::Org {
+            org,
+            limit,
+            shared,
+            include_forks: _,
+        } = cli.command
+        else {
             panic!("expected the org subcommand");
         };
         assert_eq!(org, "acme");
@@ -1068,12 +1236,16 @@ mod tests {
         ));
 
         let error = write_outputs(
-            "target",
-            "search",
-            "keyword",
-            "query",
+            OutputNaming {
+                target: "target",
+                mode: "search",
+                directory: "keyword",
+                file_name: "query".to_string(),
+                request: None,
+            },
             outcome,
             Some(json_path.clone()),
+            None,
             &scanner,
         )
         .expect_err("an empty scan must still report no result");
@@ -1090,10 +1262,12 @@ mod tests {
     /// A CWD-isolated body for the tests that exercise the legacy
     /// `results/` layout: the text writer writes relative to the current
     /// directory, so the blocker-file scenarios must not touch the real
-    /// workspace (the lock keeps parallel tests from racing the chdir).
-    /// Same idea as `output.rs`'s `in_temp_cwd`, kept local: the two
-    /// fixtures isolate different output layouts and must not share a lock
-    /// (their chdirs are orthogonal).
+    /// workspace. Local copy, not a shared fixture: the bin tests run in
+    /// their own process (cargo test builds one test binary per target),
+    /// so the lib's test fixture and its lock never coexist with this one —
+    /// the chdir is process-wide but the two fixtures never coexist in a
+    /// process. The lock still serializes the parallel tests of this
+    /// module, which share the process.
     fn in_temp_cwd<T>(f: impl FnOnce() -> T) -> T {
         use std::path::Path;
         use std::sync::{Mutex, OnceLock};
@@ -1132,7 +1306,7 @@ mod tests {
         // results` run, or a read-only CWD) blocks the legacy text layout:
         // the scan itself succeeded, so the user-requested JSON report must
         // still be written — a hard text-write failure used to abort before
-        // `write_scan_report_json`, discarding the successful scan's findings from both
+        // `write_report_json`, discarding the successful scan's findings from both
         // outputs at once. The text failure stays the surfaced error
         in_temp_cwd(|| {
             std::fs::write("results", "not a directory").expect("test setup: blocker file");
@@ -1149,12 +1323,16 @@ mod tests {
             let _ = std::fs::remove_file(&json_path);
 
             let error = write_outputs(
-                "target",
-                "repository",
-                "repository",
-                "acme_lib",
+                OutputNaming {
+                    target: "target",
+                    mode: "repository",
+                    directory: "repository",
+                    file_name: "acme_lib".to_string(),
+                    request: None,
+                },
                 outcome,
                 Some(json_path.clone()),
+                None,
                 &scanner,
             )
             .expect_err("the blocked text write must surface");

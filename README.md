@@ -15,6 +15,17 @@ history, using only what GitHub's public API already exposes: for
 recruitment and sourcing, journalism and fact-checking, security and
 compliance investigations, and open-source research.
 
+**Contents:** [Quickstart](#quickstart) · [Examples](#examples) ·
+[Performance](#performance) · [Data quality](#data-quality) ·
+[Prevention](#prevention) · [Limitations](#limitations) ·
+[Reverse email lookup](#reverse-email-lookup-heuristic-api-only) ·
+[Full profile investigation](#full-profile-investigation-api-only) ·
+[Organization investigation](#organization-investigation-api-only) ·
+[Metadata as a keyword](#metadata-as-a-keyword) ·
+[Developer correlation](#developer-correlation) ·
+[How it works](#how-it-works) · [Contributing](#contributing) ·
+[License](#license)
+
 # Introduction
 
 git2mail is an OSINT tool (OSINT, open-source intelligence, means
@@ -31,9 +42,10 @@ through the GitHub REST API. Use it solely for lawful, authorized OSINT
 research, in accordance with the
 [GitHub Terms of Service](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)
 and applicable laws. Email addresses are personal data in many
-jurisdictions: check the rules that apply to how you store and use them,
-and record the exact command, the run date and the `git2mail --version`
-output alongside any report you keep as evidence. If you investigate a
+jurisdictions: check the rules that apply to how you store and use them.
+Every JSON report already stamps its run date and version (`generated_at`,
+`tool_version`), so keep the exact command alongside any report you
+preserve as evidence. If you investigate a
 person, remember they have the same rights over their data: expect
 access, correction or erasure requests, and handle the files this tool
 writes accordingly. You are solely responsible for your use.
@@ -44,16 +56,18 @@ writes accordingly. You are solely responsible for your use.
 
 The easiest way: download the ready-made program from the
 [releases page](https://github.com/extiop/git2mail/releases). The builds
-are signed and logged by GitHub's artifact attestation (verify them with
-`gh attestation verify --repo extiop/git2mail <file>`, as described in
-each release notes). Pick the file
+are signed and logged by GitHub's artifact attestation (a receipt GitHub
+generates at build time, proving this exact file came from this
+repository's official build pipeline; verifying requires the GitHub CLI
+`gh`: `gh attestation verify --repo extiop/git2mail <file>`, as described
+in each release's notes). Pick the file
 for your computer:
 
 | Your computer | File to download |
 |---|---|
-| Windows | `git2mail-windows-<version>.exe` |
-| Mac (Apple Silicon M1/M2/M3/M4) | `git2mail-macos-<version>` |
-| Linux | `git2mail-linux-static-<version>` ("static" means one single file, nothing else to install) |
+| Windows | `git2mail-windows-v<version>.exe` |
+| Mac (Apple Silicon M1/M2/M3/M4) | `git2mail-macos-v<version>` |
+| Linux | `git2mail-linux-static-v<version>` ("static" means one single file, nothing else to install) |
 
 Then open a terminal (the text window on your computer: Terminal on Mac
 and Linux, PowerShell on Windows) in your Downloads folder and run the
@@ -62,13 +76,17 @@ program from there:
 * **Windows:** open the Downloads folder in File Explorer, type
   `powershell` in the address bar and press Enter, then run the program
   with its real file name, for example
-  `.\git2mail-windows-0.7.0.exe scan --url <repository-url>` (replace
-  `<version>` in the file names below with the version you downloaded). If Windows shows a "Windows protected your
-  PC" screen, click *More info* then *Run anyway* (the program is not
-  digitally signed).
+  `.\git2mail-windows-v0.7.0.exe scan --url https://github.com/octocat/Hello-World` (a small repository: the anonymous quickstart below completes on it; replace
+  `<version>` in the file names below with the version you downloaded,
+  without the leading `v`). If Windows shows a "Windows protected your
+  PC" screen, first verify the file's attestation (`gh attestation verify
+  --repo extiop/git2mail <file>`, with the GitHub CLI `gh` installed), then
+  click *More info* and *Run anyway* (the program is not digitally
+  signed).
 * **Mac:** in Terminal, type `cd ~/Downloads` then
-  `chmod +x git2mail-macos-*` (make it executable) and run
-  `./git2mail-macos-<version>`. If the terminal instead prints
+  `chmod +x git2mail-macos-*` (make it executable) and run a first scan,
+  for example `./git2mail-macos-v<version> scan --url https://github.com/octocat/Hello-World` (a small repository: the anonymous quickstart below completes on it).
+  Running the file bare prints the help and exits. If the terminal instead prints
   `zsh: killed` with no dialog, macOS silently refused the quarantined
   file: clear the block with
   `xattr -d com.apple.quarantine git2mail-macos-*` and run it again. If
@@ -77,8 +95,9 @@ program from there:
   clear the block with the same `xattr` command. The downloaded program
   is built for Apple Silicon Macs; on an Intel Mac, build from source
   instead (below).
-* **Linux:** `chmod +x git2mail-linux-static-*` then run
-  `./git2mail-linux-static-<version>`.
+* **Linux:** `chmod +x git2mail-linux-static-*` then run a first scan, for
+  example `./git2mail-linux-static-v<version> scan --url https://github.com/octocat/Hello-World`
+  (a small repository: the anonymous quickstart below completes on it).
 
 The tool is not on Homebrew: get the release binary (above) or build from
 source with Cargo.
@@ -99,31 +118,52 @@ cargo install --path .    # or, from crates.io: cargo install git2mail --locked
 ### 2. Try it now, without any account
 
 ```bash
-git2mail scan --url https://github.com/denoland/deno
+git2mail scan --url https://github.com/octocat/Hello-World
 ```
 
 (In the commands below, `git2mail` means the program downloaded in step 1
 unless you installed it on your PATH.)
 
-Without a token, GitHub allows about 60 lookups per hour, enough for a
-first try. You should see something like:
+Without a token, GitHub allows about 60 lookups per hour. That is enough
+for a first try on a small repository like this one (a handful of
+commits): the commit walk covers the target's full history, so a big one
+(a code base the size of deno or ripgrep) spends the whole anonymous
+allowance and stops with a rate-limit error before writing anything. On a
+big target, create a token (step 3) first. A successful scan prints
+something like:
 
 ```text
 Starting git2mail!
 [!] no token provided: running anonymously, limited to 60 requests/hour — create one at github.com/settings/tokens and use --token or --token-file <tokens.json> for 5000 requests/hour each
 --------------------------------
-[+] Found 12 emails
-[+] Result is available at results/repository/denoland_deno
+[+] Found 3 emails
+[+] Result is available at results/repository/octocat_Hello-World
+[+] Top author 1: John Doe <john@doe.example> — unknown language, 1 commits
+```
+
+One thing to know before going further anonymous: without a token,
+GitHub attributes every query to your IP address, fine for a first look,
+but a journalist working on a sensitive target should consider that
+visibility. The HTTP client honors the standard `HTTPS_PROXY` and
+`ALL_PROXY` environment variables, so runs can be routed through an HTTP
+proxy or a SOCKS5 proxy (Tor's `socks5h://127.0.0.1:9050` works) without
+any flag, and the tool announces a proxy in use at startup. Two things
+are honored silently by the HTTP stack, though: a malformed or
+unsupported proxy value (a typo'd scheme) is ignored and the run goes
+direct, and a `NO_PROXY` rule can bypass the proxy for some hosts; the
+tool warns about both at startup, but before a sensitive run, verify your
+exit IP. The
+[Data quality](#data-quality) section covers what the reports themselves
+reveal.
 
 > **These files hold personal data.** The `results/` files are plain-text
-> lists of real people's email addresses. Store and share them with the
+> lists of real people's email addresses, created readable by you only
+> (0600 on Unix) rather than world-readable. Store and share them with the
 > same care as the data itself, delete them when you are done, and add
 > `results/` to your `.gitignore` if you run this tool inside a git
 > repository. The result files have no file extension: if double-clicking
 > one does nothing, right-click it, choose *Open with* and pick a text
 > editor (Notepad, TextEdit, VS Code).
-[+] Top author 1: John Doe <john@doe.example> — unknown language, 42 commits
-```
 
 The result file is a plain list of email addresses, one per line: open it
 in any text editor, or copy the addresses into a spreadsheet, an email
@@ -134,7 +174,18 @@ the screen also names the top developers behind the repository (the names
 they type in their commits, which is self-declared information exactly
 like the addresses); add `--json report.json` to your command to save the
 full per-author report (or `--json -` to print it to stdout instead, for
-pipes).
+pipes), or `--csv authors.csv` to save it as a spreadsheet: one row per
+developer (name, emails, repositories, dominant language, commit count).
+
+**Scripting notes:** exit code `0` means the run completed, `1` that it
+failed, `2` that the command line itself was invalid, and `3` that the run
+completed but found nothing (an empty `scan`/`search` result): branch on
+`3` to tell "the target is live but carries no email" apart from a real
+failure. Only warnings and the report lines reach the terminal, and
+warnings go to stderr: a pipeline can detect a partial run by merging the
+streams and matching the `[!]` marker warnings carry, for example
+`git2mail … 2>&1 | grep '^\[!\]'` (PowerShell:
+`git2mail … 2>&1 | Select-String '^\[!\]'`).
 
 ### 3. Create a token for real scans
 
@@ -152,7 +203,8 @@ To save several tokens (each adds 5,000 lookups per hour), open the
 and save the result as `tokens.json` in the folder you run git2mail from
 (on Windows, choose "All files" in the save dialog so it does not become
 `tokens.json.txt`). One token per account you own, within what GitHub's
-Terms of Service allow.
+Terms of Service allow. The file is used with `--token-file tokens.json`:
+the examples below show it in place.
 
 ### 4. Adjust the verbosity (optional)
 
@@ -172,9 +224,9 @@ Windows PowerShell, set it first with `$env:RUST_LOG='debug'`.
 As implemented today (synchronous requests, multi-token round-robin with
 automatic rotation on rate limits and skipping of exhausted tokens),
 git2mail scans a large repository such as https://github.com/denoland/deno
-in under a minute to find the emails of its most active authors: the commit walk is capped at
-10 pages of 100 commits (**1000 commits per repository**), which keeps one
-repository from burning the whole hourly token pool.
+in under a minute to find the emails of its most active authors: the commit
+walk covers the repository's full default-branch history, bounded only by
+the GitHub API itself (nothing is truncated on our side).
 
 The `search` subcommand scans the found repositories in parallel with one
 worker per *live* token: each worker owns a dedicated token and pulls
@@ -214,13 +266,14 @@ The repository URL must follow the following format:
 git://github.com/some-user/my-repo[.git]
 git@github.com:some-user/my-repo[.git]
 https://github.com/some-user/my-repo[.git]
-ssh://git@domain.com/group/app[.git]
+ssh://git@github.com/group/app[.git]
 ```
 
-Web URLs (`http(s)://`, `git://`) must point at `github.com` (or
-`www.github.com`); any other host is rejected as an invalid URL before the
-scan runs. The `ssh://git@domain.com/…` form is kept for self-hosted Git
-remotes.
+Every URL must point at `github.com` (or `www.github.com`); any other
+host is rejected as an invalid URL before the scan runs; the API base is
+GitHub's, so a URL pointing at another server (a GitLab or Gitea remote,
+for instance) would otherwise be silently scanned against the github.com
+namesake.
 
 A trailing `.git` suffix is kept verbatim as part of the repository name: it is passed through to the GitHub API request and included in the output file name (`results/repository/some-user_my-repo.git`). Since the GitHub API only resolves repository names without the suffix (`GET /repos/some-user/my-repo.git` answers 404, verified live), a scan with a `.git` URL always fails with "GitHub resource not found": the suffix documents a passthrough guarantee, not a usable input form: drop it before scanning.
 
@@ -232,7 +285,7 @@ The profile URL must follow the following format:
 git://github.com/some-user
 git@github.com:some-user
 https://github.com/some-user
-ssh://git@domain.com/group
+ssh://git@github.com/some-user
 ```
 
 And if you have several tokens, you can make your own copy of `tokens.example.json` with your tokens in it, to look through many more commits:
@@ -241,7 +294,7 @@ And if you have several tokens, you can make your own copy of `tokens.example.js
 git2mail scan --url "$TARGET_URL" --token-file "$YOUR_TOKEN_FILE"
 ```
 
-Note that GitHub caps the profile events timeline at 300 events (its documented API ceiling): the scan never walks past the cap and a warning says so when the cap cuts a prolific profile's listing, instead of the events stage failing on the out-of-window request. When the events hold no email, the scan falls back to the target's repositories' commits, as always.
+GitHub caps the profile events timeline at 300 events (its documented API ceiling): the scan never walks past the cap and a warning says so when the cap cuts a prolific profile's listing, instead of the events stage failing on the out-of-window request. When the events hold no email, the scan falls back to the target's repositories' commits, as always.
 
 With dummy values:
 
@@ -274,8 +327,14 @@ Result files and JSON reports are written to a temporary file first, then rename
 }
 ```
 
-In this mode, your results will be stored per profile with the following relative path, from your current working directory: `results/profile/$author`. If a repository is defined, it will be at `results/repository/$author_$repository`. A name the tool had to change (sanitized, or containing an uppercase letter) carries a 16-character suffix made of the original name (the language you pass to `--language` is reflected in the file name verbatim: `Rust` and `rust` produce different files); the run always prints the real path of every file it writes. The JSON report does not record when it ran or which qualifiers were
-used: archive the exact command line next to the report.
+In this mode, your results will be stored per profile with the following relative path, from your current working directory: `results/profile/$author`. If a repository is defined, it will be at `results/repository/$author_$repository`. A name the tool had to change (sanitized) carries a 16-hex-digit suffix derived from the original name, so two different targets whose names collapse onto the same sanitized file name cannot silently overwrite each other on a case-sensitive filesystem; on a case-insensitive one (macOS, Windows), two targets differing only by case share a file name. An unchanged name keeps its exact file name, and the exact target is always printed with every report. The run always prints the real path of every file it writes. The JSON report records when it ran (`generated_at`), which version
+produced it (`tool_version`) and, on a keyword search, the exact query,
+language filter and qualifiers used (`request`); qualifiers are GitHub's
+`key:value` search filters such as `stars:>100`, so two runs with
+different qualifiers never write indistinguishable reports. Archive the
+full command line next to the report for complete reproducibility
+(`--variant-pattern` templates and file paths are not part of the
+report).
 
 ### Full profile investigation (API-only)
 
@@ -287,23 +346,25 @@ The `user` subcommand investigates one GitHub profile end to end, 100% API (no c
 git2mail user "jane-doe" --token "$YOUR_TOKEN"
 ```
 
-It accepts the shared `--token`/`--token-file`/`--json` flags and reports, both in the terminal log and in the opt-in JSON report:
+It accepts the shared `--token`/`--token-file`/`--json` flags and reports, both in the terminal log and in the opt-in JSON report. The observed email addresses are also saved to `results/user/<username>`, one per line, the same paste-able file the scan and `org` subcommands write:
 
 - **Profile**: the account fields that carry OSINT value (name, company, blog, location, public email, bio, creation date, account type, Twitter/X handle and public repository count). An organization target is rejected with a clear error pointing at the `org` subcommand.
 - **Usernames/names history**: the *noreply technique*: GitHub hides users' real email in commits behind an alias like `12345+jane@users.noreply.github.com`, and the number in that alias is the account's ID, so matching it exposes usernames the account used in the past. The username in the alias is written by the commit author's Git configuration, not by GitHub: treat it as strong evidence, not as a verified fact. The target's own repositories' commits are scanned, and every author/committer email shaped `<id>+<username>@users.noreply.github.com` whose numeric `id` equals the target's reveals a username the account used in the past (with the commit names seen with it and the repositories where it appeared). The older pre-2017 form `<id>@users.noreply.github.com` attributes the current username only.
-- **Emails**: every email used on the target's repositories, with the names and repositories where each was seen. Noreply addresses are excluded: they feed the histories instead, and a malformed noreply payload (a non-numeric id…) is dropped entirely. Forked repositories are skipped with a warning: their commit history mirrors the upstream project's, so scanning them would report other projects' developers.
-- **Variants**: the likely email spellings `{first}.{last}`, `{first}{last}`, `{initial}{last}`, `{first}_{last}`, `{initial}_{last}`, `{first}`, `{last}`, `{initial}.{last}` applied to the first/last names extracted from the profile name and the commit names seen with the target's noreply id (a name that appears only with a real, non-noreply email does not feed the guessing), combined with the domains deduced from the emails already found (noreply excluded). Variants actually observed in the commits are reported as `matched` (deduplicated by email); the others as `generated` (candidates to check elsewhere, not findings). Names are lowercased and accents removed (`é`→`e`, plus `ß`→`ss`, `æ`→`ae`, `œ`→`oe`, `ø`→`o`); names in other alphabets are kept as written. The candidate names and domains are ranked by raw sighting weight and capped (at most 64 name pairs and 64 domains are expanded, the generated list at 1000 candidates, with warnings), so commit-forged metadata cannot drown the real ones. Beyond the eight built-in patterns, `--variant-pattern <PATTERN>` (repeatable, at most 64 patterns) probes your own conventions, e.g. `git2mail user janedoe --variant-pattern '{last}{first}'`; the placeholders are `{first}`, `{last}` and `{initial}` (the domain is not part of the pattern), only printable ASCII is allowed (whitespace, `@`, control and zero-width characters are rejected client-side), the expansion is lowercased so the literal part matches observed emails case-insensitively like the built-ins, the custom patterns are applied after the built-ins (deduplicated against them) and are checked against the commit data fetched from the API like every other candidate. On a broad target the built-ins alone can fill the 1000-candidate generated list; a warning then names the custom patterns as possibly under-listed (matched custom candidates are always reported). To check a generated candidate, run `git2mail email <candidate>` (mind the 50-candidate budget per lookup).
+- **Emails**: every email used on the target's repositories, with the names and repositories where each was seen. Noreply addresses are excluded: they feed the histories instead, and a malformed noreply payload (a non-numeric id…) is dropped entirely. Forked repositories are skipped with a warning: their commit history mirrors the upstream project's, so scanning them would report other projects' developers. Pass `--include-forks` to scan them too when the forks themselves are your subject.
+- **Variants**: the likely email spellings `{first}.{last}`, `{first}{last}`, `{initial}{last}`, `{first}_{last}`, `{initial}_{last}`, `{first}`, `{last}`, `{initial}.{last}` applied to the first/last names extracted from the profile name and the commit names seen with the target's noreply id (a name that appears only with a real, non-noreply email does not feed the guessing), combined with the domains deduced from the emails already found (noreply excluded). Variants actually observed in the commits are reported as `matched` (deduplicated by email); the others as `generated` (candidates to check elsewhere, not findings). Names are lowercased and accents removed (`é`→`e`, plus `ß`→`ss`, `æ`→`ae`, `œ`→`oe`, `ø`→`o`); names in other alphabets are kept as written. The candidate names and domains are ranked by raw sighting weight and capped (at most 64 name pairs and 64 domains are expanded, the generated list at 1000 candidates, with warnings), so commit-forged metadata cannot drown the real ones. Beyond the eight built-in patterns, `--variant-pattern <PATTERN>` (repeatable, at most 64 patterns) probes your own conventions, e.g. `git2mail user janedoe --variant-pattern '{last}{first}'`; the placeholders are `{first}`, `{last}` and `{initial}` (the domain is not part of the pattern), only printable ASCII is allowed (whitespace, `@`, control and zero-width characters are rejected client-side), the expansion is lowercased so the literal part matches observed emails case-insensitively like the built-ins, the custom patterns are applied after the built-ins (deduplicated against them) and are checked against the commit data fetched from the API like every other candidate. On a broad target the built-ins alone can fill the 1000-candidate generated list; a warning then names the custom patterns as possibly under-listed (matched custom candidates are always reported). To check a generated candidate, run `git2mail email <candidate>`.
 - **Local identities (machine-local addresses)**: emails like `jeanpierre@My-Computer.local`, `jeanpierre@box.lan` or a single-label domain like `jeanpierre@mycomputer`. This is a **heuristic**: it flags the documented mDNS/workgroup conventions and dot-less domains only, and a false positive merely adds one candidate to the `local_identities` list.
 - **Potential secondary accounts** (heuristics, reported with their evidence): an email recurring across two or more of the target's repositories whose names never overlap the target's own names (`co-author`), and noreply pairs (`id+username` or legacy `<id>` form) whose id differs from the target's but whose username matches a known target username (`noreply-username`) or whose commit names match a known target name (`noreply-name`). The web-flow identity GitHub stamps on commits made through its UI (name `github`, address `noreply@github.com`) is never reported as a secondary account: it is automation, not a person (the email itself stays in the emails list).
 - **SSH keys**: the account's public keys (`GET /users/{u}/keys`, paginated). The public endpoint exposes the key id and material only: the user-set title and creation date exist on the authenticated self listing, not here.
 - **External contributions**: commits authored by the target outside their own repositories (`search/commits q=author:<user> -user:<user>`, paginated, capped at GitHub's documented 1000-result search ceiling), attributed to the repositories found.
 
-Like every repository scan, each target repository's commit walk is capped at 10 pages of 100 commits (the shared per-repository budget): when the budget cuts a history, a warning says it may be incomplete instead of the report silently pretending it saw all of it.
+Like every repository scan, each target repository's commit walk covers the full default-branch history with no local budget: the walk ends when GitHub's listing ends, so the report never silently pretends it saw only part of a history.
 
 With `--json`, the enriched report carries the documented shape:
 
 ```json
 {
+  "generated_at": "2026-02-14T18:22:33Z",
+  "tool_version": "0.7.0",
   "profile": { "login": "jane-doe", "id": 42, "name": "Jane Dupont", "...": null },
   "usernames_history": [{ "username": "oldname", "names": ["jane d."], "repos": ["jane/old"] }],
   "names_history": [{ "name": "jane dupont", "repos": ["jane/old"] }],
@@ -319,16 +380,18 @@ With `--json`, the enriched report carries the documented shape:
 }
 ```
 
+(`generated_at` and `tool_version` open the block: every report carries them.)
+
 Two **API-only deltas** are assumed and documented (the clone-based tools iterate all branches):
 
-1. the REST commits API exposes the default branch only, so the histories and emails are the ones visible on the default branches;
+1. the commit walk covers the default branch only: the API *can* address other branches and tags (a `sha` parameter), but a per-branch walk multiplies the request cost by the branch count and is not attempted, so the histories and emails are the ones visible on the default branches;
 2. the noreply history only reveals usernames for targets that committed at least once with the `id+username@users.noreply.github.com` form, and only usernames matching GitHub's full username shape (1-39 ASCII letters, digits or hyphens, without a leading/trailing hyphen or consecutive hyphens): a commit email carrying a free-form or impossible-shape username payload falls back to the legacy id-only handling.
 
 A rate-limit or transport failure aborts the investigation; only a repository that is private, deleted or empty is skipped with a warning, so the report can never silently miss whole repositories.
 
 ### Organization investigation (API-only)
 
-As with the user investigation, a token is strongly recommended: an org scan walks every listed repository and aborts on a spent anonymous allowance. Forked repositories are skipped with a warning (like the `user` investigation): their commit history mirrors the upstream project's, so scanning them would report other projects' developers.
+As with the user investigation, a token is strongly recommended: an org scan walks every listed repository and aborts on a spent anonymous allowance. Forked repositories are skipped with a warning (like the `user` investigation): their commit history mirrors the upstream project's, so scanning them would report other projects' developers. Pass `--include-forks` to scan them too when the forks themselves are your subject.
 
 The `org` subcommand investigates one GitHub organization:
 
@@ -349,6 +412,8 @@ With `--json`, the report carries the documented shape:
 
 ```json
 {
+  "generated_at": "2026-02-14T18:40:12Z",
+  "tool_version": "0.7.0",
   "org": { "login": "acme", "name": "Acme Corp", "blog": "https://acme.example" },
   "members": ["alice", "bob"],
   "repositories": ["one", "two"],
@@ -361,7 +426,8 @@ With `--json`, the report carries the documented shape:
       {
         "author": "Alice", "emails": ["alice@acme.com"], "total_hits": 1,
         "repos": [{ "name": "acme/one", "language": null }],
-        "first_seen_repo": "acme/one"
+        "first_seen_repo": "acme/one",
+        "last_commit_date": "2024-06-01T12:00:00Z"
       }
     ]
   },
@@ -369,11 +435,11 @@ With `--json`, the report carries the documented shape:
 }
 ```
 
-`per_repository` is keyed by the `owner/name` full names the scan reports, and only lists the repositories where at least one email showed up; `scanned.pages` counts the successful API requests of the whole investigation (org info, members, repositories listing and the workers' commit pages). The `correlation` object follows the same shape as the scan and search reports, aggregating the developers found across the organization's repositories. A repository that is private, deleted or empty is skipped with a warning; a rate-limit or transport failure aborts the investigation.
+`per_repository` is keyed by the `owner/name` full names the scan reports, and only lists the repositories where at least one email showed up; `scanned.pages` counts the successful API requests of the whole investigation (org info, members, repositories listing and the workers' commit pages). The `correlation` object follows the same shape as the scan and search reports, aggregating the developers found across the organization's repositories. A repository that is private, deleted or empty is skipped with a warning; a rate-limit or transport failure aborts the investigation, and so does a dedicated token dying mid-scan (a revoked token is not a spent allowance: the run aborts with the token's real error instead of writing a complete-looking report).
 
 ### Reverse email lookup (heuristic, API-only)
 
-A token is strongly recommended here too: one lookup can spend up to 50 candidate-repository walks (10 pages each), far beyond the anonymous 60-requests-per-hour budget.
+A token is strongly recommended here too: one lookup walks the full default-branch history of every candidate repository (until a `commit-author` match ends the lookup early), far beyond the anonymous 60-requests-per-hour budget.
 
 The `email` subcommand traces one email address back to its GitHub account:
 
@@ -383,7 +449,7 @@ git2mail email "jane.dupont@acme.com" --token "$YOUR_TOKEN"
 
 GitHub exposes no email search API, so this subcommand is a **documented heuristic**, 100% API (no clone, no scraping):
 
-1. **Candidate repositories**: the repository search endpoint is queried with the tokens of the local part (split on `.`, `_`, `-` and `+`, so `jane.dupont` → `jane dupont`), with the raw local part when it differs (so `janedupont` is searched too) and with the domain itself (`acme.com`); at most three queries. The repositories whose name, description or topics mention these tokens become candidates, capped at 50 distinct repositories. The heuristic budget bounds the API cost of one address: at most 3 candidate queries, 50 candidates, each verified over at most its 10 most recent default-branch commit pages (every commit counts toward the cap).
+1. **Candidate repositories**: the repository search endpoint is queried with the tokens of the local part (split on `.`, `_`, `-` and `+`, so `jane.dupont` → `jane dupont`), with the raw local part when it differs (so `janedupont` is searched too) and with the domain itself (`acme.com`); at most three queries. The repositories whose name, description or topics mention these tokens become candidates: every candidate the search serves is verified, with no local cap.
 2. **Commit verification**: each candidate repository's (default-branch) commits are scanned for a commit whose author email is exactly the target: the local part case-insensitively, the domain matched exactly (no subdomain look-alike), and the lookup stops early once the strongest attribution is found. The commits listing is never narrowed by the API `author` parameter: the commit author login is not necessarily the email local part, and a narrowing would silently drop the target's own commits.
 3. **Account attribution**: a matching commit whose API payload embeds a GitHub author object resolves the account with the `commit-author` confidence (login, numeric id, repository and commit sha as evidence). When the author object is absent (deleted account), the repository owner is only a **weak** candidate, reported with the `repo-owner-weak` confidence and a `null` id: a presumption, never overstated.
 
@@ -402,10 +468,9 @@ With `--json`, the report carries the documented shape:
 
 **Limitations of the heuristic** (documented API-only deltas):
 
-1. the candidate search can only surface repositories whose name, description or topics mention the local-part tokens or the domain, capped at 50: an email never used in a public commit of one of those candidates cannot be found;
-2. the REST commits API exposes the default branch only;
-3. the `repo-owner-weak` attribution presumes the repository owner is the login behind the matching commit: the commit carries no GitHub author object, so nothing in the payload actually proves it, and a repository owner may be an organization rather than a user, so resolve the account type before acting on a weak attribution;
-4. only the most recent 10 commit pages (1000 commits) of each candidate's default branch are scanned: a matching commit deeper in the repository history cannot be found.
+1. the candidate search can only surface repositories whose name, description or topics mention the local-part tokens or the domain (forked candidates are kept: the lookup wants any repository carrying the address): an email never used in a public commit of one of those candidates cannot be found;
+2. the commit walk covers the default branch only (per-branch walking multiplies the request cost and is not attempted);
+3. the `repo-owner-weak` attribution presumes the repository owner is the login behind the matching commit: the commit carries no GitHub author object, so nothing in the payload actually proves it, and a repository owner may be an organization rather than a user, so resolve the account type before acting on a weak attribution.
 
 The `emails` subcommand runs the same lookup in bulk over the token pool:
 
@@ -417,14 +482,23 @@ The file holds one address per line (`#` comments and blank lines ignored; a lea
 
 ```json
 {
+  "generated_at": "2026-02-14T18:22:33Z",
+  "tool_version": "0.7.0",
   "results": [
-    { "email": "jane.dupont@acme.com", "account": null, "evidence": null, "candidates": [] }
+    {
+      "generated_at": "2026-02-14T18:22:41Z",
+      "tool_version": "0.7.0",
+      "email": "jane.dupont@acme.com", "account": null, "evidence": null, "candidates": []
+    }
   ],
+  "skipped_addresses": [],
   "summary": { "total": 1, "matched": 0, "unmatched": 1, "skipped": 0 }
 }
 ```
 
-A worker whose dedicated token died (spent quota or rejected token) stops pulling work while the other tokens keep draining the queue; any other worker failure aborts the bulk run. The addresses a stopped worker never reached are never counted as a verified no-match: they are absent from `results`, counted in `summary.skipped` and warned about in the log. Note that "skipped" names two different things: the read-time skips (noreply/malformed lines, warned about when the file is read) never enter the pipeline and are **not** counted in `summary.skipped`, which counts only the work a stopped worker never reached.
+Every report also carries `generated_at` (the UTC timestamp of the run) and `tool_version` (shown here); the one-address report of `git2mail email` carries them too, and so does every entry of the bulk `results` list (the moment its own lookup finished).
+
+A worker whose dedicated token died (spent quota or rejected token) stops pulling work while the other tokens keep draining the queue; any other worker failure aborts the bulk run. The addresses a stopped worker never reached are never counted as a verified no-match: they are absent from `results`, listed in `skipped_addresses` (file order, so re-running the interrupted lookups needs no diff of two files), counted in `summary.skipped` and warned about in the log. "Skipped" names two different things: the read-time skips (noreply/malformed lines, warned about when the file is read) never enter the pipeline and are **not** counted in `summary.skipped`, which counts only the work a stopped worker never reached.
 
 ### Metadata as a keyword
 
@@ -442,7 +516,11 @@ git2mail search --query nmap --language rust --token-file tokens.json --limit 5
 
 Without `--limit`, the search defaults to scanning 5 repositories.
 
-In this mode, your results will be stored per query with the following relative path, from your current working directory: `results/keyword/$query`. If a language is defined, it will be at `results/keyword/$query_$language`. As everywhere else, a name the tool had to change (sanitized, or containing an uppercase letter) carries a 16-character suffix made of the original name; the run always prints the real path of every file it writes.
+In this mode, your results will be stored per query with the following relative path, from your current working directory: `results/keyword/$query`. If a language is defined, it will be at `results/keyword/$query_$language`. As everywhere else, a name the tool had to change (sanitized) carries a 16-hex-digit suffix derived from the original name; the run always prints the real path of every file it writes.
+
+GitHub's repository search includes forks: like the profile and organization investigations, forked repositories are skipped with a warning (their commit history mirrors the upstream project's, so scanning them would report other projects' developers under the fork's name). Pass `--include-forks` to scan them too when the forks themselves are your subject.
+
+A keyword search scans several repositories, so its JSON report also breaks the findings down per project: `per_repository` maps each repository's `owner/name` to the emails its commits exposed (only the repositories where at least one email showed up are listed, and the key is omitted entirely when no repository produced one), and the `request` object records the exact query, language filter and qualifiers that produced the report (with `generated_at` and `tool_version`, two runs with different qualifiers never write indistinguishable reports).
 
 ### Advanced search qualifiers
 
@@ -474,15 +552,17 @@ To target one user's repositories on a topic:
 git2mail search --query nmap --topic osint --user octocat --token-file tokens.json
 ```
 
-`--user` and `--org` are mutually exclusive (the GitHub search API accepts only one owner filter). Values are validated client-side before any request: an obviously malformed range or date (say `--stars abc` or `--created 2020-13-01`) fails fast with a clear `invalid search filter` error instead of silently returning no result from the API. Count and date ranges follow the GitHub search range syntax (`>`, `>=`, `<`, `<=`, `start..end`, with `*` for an open end); dates accept the `YYYY`, `YYYY-MM` and `YYYY-MM-DD` granularities. An inverted range (`--stars 50..10`, `--created 2020-01-01..2019-01-01`) is well-formed but rejected client-side like every other malformed value; for dates this matters because GitHub itself does not reject an inverted range: it silently swaps the sides and quietly covers the opposite window. The stricter name rules are validated client-side too: a `--user`/`--org` value must be a valid GitHub login (ASCII letters, digits or hyphens; a login with `.` or `_` would silently match nothing) and a `--license`/`--topic` value must hold at least one alphanumeric character (a separator-only `...` or `--` would silently match nothing). Only one `--topic` value is accepted per run; to combine topics, pass them in the query itself (`--query "topic:osint topic:recon"`). Note that the repository listing itself is capped at GitHub's documented 1000-result search ceiling: the over-ceiling page is never requested (the API answers it with a raw 422), so a query matching more than 1000 repositories scans at most the first 1000. Note also that the qualifiers are not part of the output file name: results are stored per query/language, so two runs differing only by their qualifiers write to the same `results/keyword/$query_$language` file, and the last run overwrites the previous one.
+`--user` and `--org` are mutually exclusive (the GitHub search API accepts only one owner filter). Values are validated client-side before any request: an obviously malformed range or date (say `--stars abc` or `--created 2020-13-01`) fails fast with a clear `invalid search filter` error instead of silently returning no result from the API. Count and date ranges follow the GitHub search range syntax (`>`, `>=`, `<`, `<=`, `start..end`, with `*` for an open end); dates accept the `YYYY`, `YYYY-MM` and `YYYY-MM-DD` granularities. An inverted range (`--stars 50..10`, `--created 2020-01-01..2019-01-01`) is well-formed but rejected client-side like every other malformed value; for dates this matters because GitHub itself does not reject an inverted range: it silently swaps the sides and quietly covers the opposite window. The stricter name rules are validated client-side too: a `--user`/`--org` value must be a valid GitHub login (ASCII letters, digits or hyphens; a login with `.` or `_` would silently match nothing) and a `--license`/`--topic` value must hold at least one alphanumeric character (a separator-only `...` or `--` would silently match nothing). Only one `--topic` value is accepted per run; to combine topics, pass them in the query itself (`--query "topic:osint topic:recon"`). The repository listing itself is capped at GitHub's documented 1000-result search ceiling: the over-ceiling page is never requested (the API answers it with a raw 422), so a query matching more than 1000 repositories scans at most the first 1000. The qualifiers are not part of the output file name: results are stored per query/language, so two runs differing only by their qualifiers write to the same `results/keyword/$query_$language` file, and the last run overwrites the previous one. For a systematic sweep over qualifiers, give each run its own `--json report-<qualifier>.json` path: the text file is the working list, the JSON reports are the archive.
 
 ### Developer correlation
 
-Every scan also aggregates its results per author (issue #5): for each author found in the scanned commits, it correlates the attributes git2mail already collects: the emails they used, the repositories they were seen in with their primary language, the first repository where they appeared and their total commit count. Authors are sorted by commit count and each author's languages are ordered dominant first, so the report answers "who are the main developers behind this topic, and what do they write in?". With a parallel multi-token scan, the repository order (and the "first seen" field) follows worker completion and may vary between runs; the email sets and counts do not.
+Every scan also aggregates its results per author: for each author found in the scanned commits, it correlates the attributes git2mail already collects: the emails they used, the repositories they were seen in with their primary language, the first repository where they appeared and their total commit count. Authors are sorted by commit count and each author's languages are ordered dominant first, so the report answers "who are the main developers behind this topic, and what do they write in?". With a parallel multi-token scan, the repository order (and the "first seen" field) follows worker completion and may vary between runs; the email sets and counts do not.
 
 For a copy-paste list of addresses, use the plain-text `results/` file (one
 email per line, ready for a spreadsheet); the names, languages and
-per-repository counts live in the JSON report only.
+per-repository counts live in the JSON report, or as a `--csv` spreadsheet
+(one row per developer: name, emails, repositories, dominant language,
+commit count).
 
 The report lives in the opt-in `--json` output, as a `correlation` object added on top of the unchanged legacy fields (the roadmap originally sketched a `results/$language/$author` output layout; the delivered feature is this JSON report, and the plain-text result files stay unchanged):
 
@@ -507,7 +587,8 @@ git2mail search --query nmap --language rust --token-file tokens.json --json rep
         ],
         "languages": ["Rust", "Go"],
         "first_seen_repo": "a/one",
-        "total_hits": 3
+        "total_hits": 3,
+        "last_commit_date": "2024-06-01T12:00:00Z"
       }
     ]
   }
@@ -524,11 +605,22 @@ git2mail reads the commit history of a GitHub repository and collects the email 
 
 This process extends to multiple repositories: you can search with custom queries and filter by GitHub metadata such as the repository language. You can also cap the number of repositories scanned with `--limit N`.
 
-The GitHub API rate limit for non authenticated users is 60 requests per hour. Because busy repositories such as [ripgrep](https://github.com/BurntSushi/ripgrep) have thousands of commits, use a GitHub account (or a GitHub App) and generate one token **per account**, as described in this [GitHub API documentation](https://docs.github.com/en/rest/overview/resources-in-the-rest-api#rate-limiting). Your token does not need any access to any of your repositories. Anonymous access is supported (`--token ""`), but non authenticated requests are very limited, so tokens remain the practical way to run a real scan. Bear in mind that the rate limit is defined as the number of requests per hour **per account**.
+The GitHub API rate limit for non authenticated users is 60 requests per hour. Because busy repositories such as [ripgrep](https://github.com/BurntSushi/ripgrep) have thousands of commits, use a GitHub account and generate one personal-access token **per account**, as described in this [GitHub API documentation](https://docs.github.com/en/rest/overview/resources-in-the-rest-api#rate-limiting). Your token does not need any access to any of your repositories. Anonymous access is supported (`--token ""`), but non authenticated requests are very limited, so tokens remain the practical way to run a real scan. Bear in mind that the rate limit is defined as the number of requests per hour **per account**.
 
-Note that with one token, you can make 5,000 requests to the GitHub API per hour. Within a single repository, though, the commit walk is capped at 10 pages of 100 commits (1000 commits per repository, the same per-repository budget as every scan: `email` reverse lookup, `scan`/`search`/`org` and `user` repository walks): a larger token pool does not deepen one repository's history; extra tokens help **across** many repositories (org scans, bulk `search`/`emails` runs), where each repository spends its own slice of the pooled budget. To grow the pool, add tokens from additional accounts you own, within what GitHub's Terms of Service allow; one legitimate account already buys 5,000 requests per hour. For unattended jobs (CI, cron), write the token to a `0600` file at
-runtime and pass it with `--token-file` (`printf '{"0": "%s"}' "$GH_TOKEN" >
-tokens.json`), rather than leaking it through a process list.
+With one token, you can make 5,000 requests to the GitHub API per hour, and nothing on our side caps a history: every repository's commit walk covers its full default-branch history, so the token pool (not a local budget) is what bounds one run. A larger pool therefore deepens individual histories too; extra tokens especially help **across** many repositories (org scans, bulk `search`/`emails` runs), where each repository spends its own slice of the pooled budget. To grow the pool, add tokens from additional accounts you own, within what GitHub's Terms of Service allow; one legitimate account already buys 5,000 requests per hour. For unattended jobs (CI, cron), write the token to a `0600` file at
+runtime and pass it with `--token-file`
+(`( umask 077; printf '{"0": "%s"}' "$GH_TOKEN" > tokens.json )`; the
+umask is what makes the file `0600` when it is created; if `tokens.json`
+already exists, `chmod 600 tokens.json` instead), rather than leaking it
+through a process list.
+
+Every API request identifies itself to GitHub with a fixed user-agent
+header and the GitHub API `Accept` header, nothing else; the HTTP client
+honors the standard `HTTPS_PROXY` and `ALL_PROXY` environment variables
+(HTTP and SOCKS5 proxies both work, Tor included) and announces a proxy
+in use at startup; a malformed proxy value, however, is silently ignored
+by the HTTP stack (the run goes direct), so verify your exit IP on a
+sensitive target.
 
 This project can be combined with other OSINT tools. For instance, you can use git2mail to retrieve Gmail addresses, then investigate some of them further with [GHunt](https://github.com/mxrch/ghunt) (for lawful research only, as above).
 
@@ -537,9 +629,13 @@ This project can be combined with other OSINT tools. For instance, you can use g
 One's email can be spoofed in commits: an address read in a commit proves
 nothing about who owns the mailbox. Cross-check the confidence grades of the `email` reports and the
 per-author summary of the correlation report (`--json`) before drawing
-conclusions. To open a cited piece of evidence, build the commit URL from
-the report's repository and sha:
-`https://github.com/<owner>/<repo>/commit/<sha>`.
+conclusions. To open a cited piece of evidence, run
+`git2mail email <address>`: its report carries the repository and the
+commit `sha` (the long identifier after `/commit/` in a GitHub URL) that
+proves the attribution: build the commit URL as
+`https://github.com/<owner>/<repo>/commit/<sha>`. The `scan` and `search`
+reports carry repositories and counts but no commit sha, so the reverse
+lookup is the evidence step.
 
 A note on pull requests: when a contributor's pull request was squash-merged
 through GitHub's web interface, the commit is authored by GitHub's
@@ -565,18 +661,19 @@ with `git filter-repo`) if you need it gone.
 
 ## Limitations
 
-This project is limited to GitHub repositories. Both the commit **author**
-and **committer** emails are read when they differ (the committer is a
-real second channel, rarely different but sometimes the only one that
-leaks).
+This project is limited to GitHub repositories. The `user` investigation
+reads both the commit **author** and **committer** emails when they
+differ (the committer is a real second channel, rarely different but
+sometimes the only one that leaks); the repository and keyword scans read
+the commit **author** email.
 
 ## Roadmap
 
 - [x] From a GitHub repository, search for commits and email of authors with GitHub metadata and parsing
 - [x] From a GitHub keyword search, retrieve GitHub repositories URLs
 - [x] Handle properly errors and limit, or even remove, panics
-- [x] Correlate emails, language and project preferences: per-author correlation report (emails, repositories with their primary language, first seen repository, commit counts) in the `--json` output, plus a top-authors terminal summary (see the [correlation section](#developer-correlation); issue #5)
-- [x] Support more advanced parameters (see <https://github.com/search/advanced>): `--stars`, `--forks`, `--size`, `--created`, `--pushed`, `--license`, `--topic`, `--user`/`--org` on the `search` subcommand (issue #6)
+- [x] Correlate emails, language and project preferences: per-author correlation report (emails, repositories with their primary language, first seen repository, commit counts) in the `--json` output, plus a top-authors terminal summary (see the [correlation section](#developer-correlation))
+- [x] Support more advanced parameters (see <https://github.com/search/advanced>): `--stars`, `--forks`, `--size`, `--created`, `--pushed`, `--license`, `--topic`, `--user`/`--org` on the `search` subcommand
 - [x] Full profile investigation, API-only: `git2mail user <username>` (usernames/names history via the noreply technique, email variants, local identities, potential secondary accounts, SSH keys, external contributions) (see the [investigation section](#full-profile-investigation-api-only))
 - [x] Reverse email lookup, API-only heuristic: `git2mail email <address>` / `git2mail emails <file>` (candidate repositories from the address tokens, verified by commits, `commit-author`/`repo-owner-weak` confidences) (see the [reverse email lookup section](#reverse-email-lookup-heuristic-api-only))
 - [x] Organization investigation, API-only: `git2mail org <org>` (public members, public repositories and the emails found scanning them) (see the [organization section](#organization-investigation-api-only))
@@ -598,7 +695,7 @@ This repository contains:
 Ideas the maintainer keeps in view for future releases:
 
 - Fuzzing to find my code vulnerabilities
-- ~~Async queries~~ **resolved by design** (issue #4): parallel requests run on std threads with one dedicated token per worker (the v0.5.0 refactor); async was considered and rejected, as per-token parallelism is enough for network I/O at this scale and adds no dependency
+- ~~Async queries~~ **resolved by design**: parallel requests run on std threads with one dedicated token per worker (the v0.5.0 refactor); async was considered and rejected, as per-token parallelism is enough for network I/O at this scale and adds no dependency
 
 ## Contributing
 

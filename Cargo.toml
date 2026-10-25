@@ -28,11 +28,10 @@ missing_docs = "deny"
 # allow-by-default: the runtime path must never unwrap, expect, panic,
 # hit an `unreachable!` fallback, or stub out code. The only allowances are the two static regex `LazyLock`
 # inits of `src/parsers.rs` (a static regex failing to compile is a
-# programming error), the two justified production-code expects
+# programming error) and the one justified production-code expect
 # (`#[expect(clippy::large_enum_variant)]` on the CLI `Command` enum in
-# `src/main.rs` and `#[expect(clippy::too_many_arguments)]` on the
-# `output::write_scan_report_json` report writer — `expect` instead of `allow`, so the
-# build fails when they stop applying), and the test modules,
+# `src/main.rs` — `expect` instead of `allow`, so the
+# build fails when it stops applying), and the test modules,
 # where failing loudly is the point.
 unwrap_used = "deny"
 expect_used = "deny"
@@ -44,7 +43,7 @@ unimplemented = "deny"
 [dependencies]
 clap = { version = "4.6", default-features = false, features = ["wrap_help", "derive", "std", "usage", "error-context"] }
 regex = { version = "1.13", default-features = false, features = ["std"] }
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "socks"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 # logging

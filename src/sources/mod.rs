@@ -1,6 +1,6 @@
 //! High-level scans: turn a user request into GitHub API calls.
 //!
-//! The three scans live in private modules of their own, all built on the
+//! The scans live in private modules of their own, all built on the
 //! single [`crate::github::fetch_paginated`] loop of the [`crate::github`]
 //! module:
 //!
@@ -8,13 +8,20 @@
 //!   other scans;
 //! - `profile`: a profile's events, falling back to its repositories'
 //!   commits when no email shows up in the events;
-//! - `search`: the repositories matching a query, scanned in parallel
+//! - `parallel`: the token-dedicated worker pool shared by every
+//!   multi-repository scan;
+//! - `search`: the repositories matching a query, scanned through the
+//!   shared parallel layer.
 //!
 //! The found emails are handed to the `output` writers by `main`.
 
+mod parallel;
 mod profile;
 mod repository;
 mod search;
+// the parallel scan layer shared by the search, the `org` investigation and
+// the reverse-email candidates
+pub(crate) use parallel::{ParallelScan, RepoHit};
 
 pub(crate) use search::percent_encode;
 
@@ -29,22 +36,25 @@ pub use search::SearchQualifiers;
 // internals shared with the reverse-email lookup (`src/email.rs`): the
 // repository-search listing and the worker-pool sizing glue, reused as-is
 // instead of duplicated
-pub(crate) use search::{
-    SEARCH_RESULT_CEILING, SearchHit, parse_search_page, search_q, worker_count,
-};
+pub(crate) use search::{SEARCH_RESULT_CEILING, parse_search_page, search_q};
 // internals shared with the `user` investigation: the per-repository commit
 // budget reused as-is instead of duplicated
-pub(crate) use repository::MAX_COMMIT_PAGES;
 
 /// Listings are fetched 100 items per page, the GitHub API maximum.
 pub(crate) const PER_PAGE: u16 = 100;
 
 /// Outcome of a scan: the emails found, how many repositories were scanned
-/// and the per-author correlation report built along the way (issue #5).
+/// and the per-author correlation report built along the way.
 #[derive(Debug, Default)]
 pub struct ScanOutcome {
     /// Emails found during the scan, deduplicated and sorted.
     pub emails: Vec<String>,
+    /// The emails found per repository, keyed by the `owner/name` full name
+    /// the scan reports; only repositories where at least one email showed
+    /// up are listed. Filled by the parallel scans (a keyword search scans
+    /// many repositories); a single-repository or profile scan reports no
+    /// breakdown (its one target is already the whole report).
+    pub per_repository: std::collections::BTreeMap<String, Vec<String>>,
     /// Number of repositories whose commits were scanned.
     pub repos_scanned: usize,
     /// Per-author correlation report: authors, emails, repositories with
@@ -81,7 +91,7 @@ impl Scanner {
     ///
     /// Returns [`Error::InvalidTokenFormat`] when `token` or a token of the
     /// file does not follow the expected format, and [`Error::Http`] when
-    /// the HTTP client cannot be built. Never panics.
+    /// the HTTP client cannot be built.
     pub fn new(token: Option<&str>, token_file: Option<&Path>) -> Result<Self, Error> {
         // the same paste-artifact rule as `TokenPool::from_token`: a
         // whitespace-only --token is no token at all, so it must fall
@@ -140,7 +150,7 @@ impl Scanner {
     /// [`Error::EmptyRepository`] when the repository itself has no commits
     /// (GitHub answers 409 on its commits listing),
     /// [`Error::RateLimitExhausted`] once no token of the pool is usable, or
-    /// an [`Error::Http`] transport failure. Never panics.
+    /// an [`Error::Http`] transport failure.
     pub fn scan_parts(&self, author: &str, repository: &str) -> Result<ScanOutcome, Error> {
         // scan profile case, as there is no repository
         if repository.is_empty() {
@@ -150,7 +160,8 @@ impl Scanner {
         let scan = repository::scan_repository(self.client(), GITHUB_API_BASE, author, repository)?;
         // single-repository scan: the primary language would cost one extra
         // API call on the repository metadata, so the correlation reports it
-        // as unknown (documented delta, issue #5)
+        // as unknown (documented delta: a repository scan does not spend an
+        // extra API call on the repository metadata)
         let mut correlation = CorrelationBuilder::new();
         correlation.add_repo(RepoContribution {
             name: format!("{author}/{repository}"),
@@ -159,6 +170,9 @@ impl Scanner {
         });
         Ok(ScanOutcome {
             emails: scan.emails,
+            // a single-repository scan has no per-repository breakdown to
+            // report: its one target is already the whole report
+            per_repository: std::collections::BTreeMap::new(),
             repos_scanned: 1,
             correlation: correlation.finish(),
             partial: false,
@@ -176,16 +190,65 @@ impl Scanner {
     /// request). Otherwise the same failures as [`Scanner::scan_parts`]: a
     /// scan-wide failure aborts the scan, while a dead dedicated token
     /// alone does not (the parallel scan keeps the emails found so far).
-    /// Never panics.
     pub fn search(
         &self,
         query: &str,
         language: &str,
         qualifiers: &SearchQualifiers,
         limit: usize,
+        include_forks: bool,
     ) -> Result<ScanOutcome, Error> {
-        search::aggregate_search(self, query, language, qualifiers, limit)
+        search::aggregate_search(self, query, language, qualifiers, limit, include_forks)
     }
+}
+
+/// The shared classification of a 422 raised by a search-driven paginated
+/// walk: a page-1 422 (nothing collected) is the API rejecting the query
+/// itself — surfaced as [`Error::SearchRejected`]; a window 422 past the
+/// 1000-result search ceiling is a documented truncation, not a failure.
+/// Returns `None` when `err` is not a 422 at all (the caller propagates it).
+///
+/// The four sites of the crate that can observe a 422, and which one uses
+/// this classifier:
+///
+/// 1. the keyword-search listing (`sources::search::fetch_search_hits`) —
+///    shared, Reject/Cut semantics;
+/// 2. the `user` investigation's external-contributions walk
+///    (`user::fetch_external_hits`) — shared, Reject/Cut semantics;
+/// 3. the profile events walk (`sources::profile`) — deliberately
+///    specialized: it keeps the emails already collected, and its page-1
+///    422 stays a raw `Error::Http` (`/users/{u}/events` is a core
+///    endpoint, not the search API this classifier describes);
+/// 4. the reverse-lookup candidate search (`email::reverse_at`) —
+///    deliberately specialized: query-scoped, a 422 skips only the one
+///    faulty query.
+///
+/// Callers must pass the RAW item count, not the parsed hits: a fully
+/// malformed page followed by a window 422 must not be misclassified as a
+/// page-1 rejection (see `fetch_external_hits`).
+pub(crate) enum SearchWindow422 {
+    /// Nothing was collected: the query itself is bad (`SearchRejected`).
+    Reject,
+    /// The 1000-result search window cut the walk: the caller warns and
+    /// discards the collected items (unrecoverable from the paginated
+    /// loop's error path).
+    Cut,
+}
+
+/// Classifies one [`Error`] against the search-window 422 seam (see
+/// [`SearchWindow422`]).
+pub(crate) fn classify_search_window_422(err: &Error, collected: usize) -> Option<SearchWindow422> {
+    let Error::Http(http) = err else {
+        return None;
+    };
+    if http.status() != Some(reqwest::StatusCode::UNPROCESSABLE_ENTITY) {
+        return None;
+    }
+    Some(if collected == 0 {
+        SearchWindow422::Reject
+    } else {
+        SearchWindow422::Cut
+    })
 }
 
 /// Whether an email sits on the GitHub noreply domain (`users.noreply.github.com`):
@@ -209,8 +272,9 @@ pub(crate) fn is_noreply_email(email: &str) -> bool {
 /// never report as a found email a bare username or garbage string that the
 /// `email` subcommand itself would reject as invalid — git permits
 /// arbitrary author-email fields, and a domainless value like `jdoe` is
-/// not a mailbox). The shared acceptance rule of the plain output and of
-/// the correlation report, so both always stay consistent. A commit email
+/// not a mailbox). The shared acceptance rule of the plain output, of the
+/// correlation report and of the `user` investigation's commit emails, so
+/// all of them always stay consistent. A commit email
 /// that merely contains `noreply` in its local part
 /// (`john.noreply@acme.com`) is a real mailbox and must be kept: only the
 /// exact noreply domain is excluded.
@@ -228,30 +292,79 @@ pub(crate) fn is_usable_email(email: &str) -> bool {
     }
 }
 
-/// Keeps a found email when it is usable: non-empty, shaped like an
-/// address, not a GitHub `noreply` address and not already found — the
-/// dedup is case-insensitive (the same mailbox seen as `dev@example.com`
-/// and `Dev@example.com` is one entry), matching the `user` investigation
-/// and the bulk `emails` reverse lookup, which both key emails lowercased.
-pub(crate) fn keep_email(emails: &mut Vec<String>, email: &str) {
-    let email = email.trim_matches('"');
-    if is_usable_email(email) && !emails.iter().any(|found| found.eq_ignore_ascii_case(email)) {
-        emails.push(email.to_string());
+/// The accumulating email list of a scan: insertion order preserved, with
+/// an O(1) case-insensitive membership mirror (the same design
+/// `correlate.rs` adopted when its linear scan measured ~4x wall time per
+/// doubling — the scan accumulators face the same adversarial worst case:
+/// a large parallel search planting thousands of distinct addresses). All
+/// the dedup rules the scan accumulators share, one owner.
+pub(crate) struct EmailList {
+    emails: Vec<String>,
+    seen: std::collections::HashSet<String>,
+}
+
+impl EmailList {
+    pub(crate) fn new() -> Self {
+        Self {
+            emails: Vec::new(),
+            seen: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Keeps the email when it is usable and not already present
+    /// (case-insensitively): the acceptance rule is
+    /// [`is_usable_email`]'s.
+    pub(crate) fn keep(&mut self, email: &str) {
+        let email = email.trim_matches('"');
+        if is_usable_email(email) && self.seen.insert(email.to_lowercase()) {
+            self.emails.push(email.to_string());
+        }
+    }
+
+    /// Merges new emails into the list, deduplicated case-insensitively
+    /// (one mailbox can never be counted twice because two pages disagree
+    /// on its casing). The acceptance rule applies HERE too, not only in
+    /// [`EmailList::keep`]: the type owns the whole admission policy, so a
+    /// future caller feeding raw payloads cannot reintroduce the
+    /// control-character garbage `is_usable_email` exists to stop. Today's
+    /// callers all feed pre-filtered data; the re-check is a no-op for
+    /// them.
+    pub(crate) fn merge(&mut self, new_emails: Vec<String>) {
+        for email in new_emails {
+            if is_usable_email(&email) && self.seen.insert(email.to_lowercase()) {
+                self.emails.push(email);
+            }
+        }
+    }
+
+    /// Sorts the list alphabetically, case-insensitively (legacy order).
+    pub(crate) fn sort(&mut self) {
+        sort_emails(&mut self.emails);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.emails.is_empty()
+    }
+
+    // test-only accessors: the production code consumes `into_vec`
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.emails.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_slice(&self) -> &[String] {
+        &self.emails
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<String> {
+        self.emails
     }
 }
 
-/// Merges newly found emails into the accumulated list, preventing
-/// duplicates from different pages or repositories — case-insensitively
-/// (the same dedup rule as [`keep_email`], so one mailbox can never be
-/// counted twice because two pages disagree on its casing).
-pub(crate) fn merge_emails(found_emails: &mut Vec<String>, new_emails: Vec<String>) {
-    for email in new_emails {
-        if !found_emails
-            .iter()
-            .any(|found| found.eq_ignore_ascii_case(&email))
-        {
-            found_emails.push(email);
-        }
+impl Default for EmailList {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -308,37 +421,50 @@ mod tests {
 
     #[test]
     fn keep_email_filters_noreply_and_duplicates() {
-        let mut emails: Vec<String> = Vec::new();
-        keep_email(&mut emails, "dev@example.com");
-        keep_email(&mut emails, "dev@example.com");
-        keep_email(&mut emails, "12345+dev@users.noreply.github.com");
-        keep_email(&mut emails, "");
-        assert_eq!(emails, vec!["dev@example.com".to_string()]);
+        let mut emails = EmailList::new();
+        emails.keep("dev@example.com");
+        emails.keep("dev@example.com");
+        emails.keep("12345+dev@users.noreply.github.com");
+        emails.keep("");
+        assert_eq!(emails.into_vec(), vec!["dev@example.com".to_string()]);
     }
 
     #[test]
-    fn keep_email_and_merge_emails_deduplicate_case_variants_like_the_user_path() {
+    fn the_email_list_deduplicates_case_variants_like_the_user_path() {
         // the user investigation and the bulk emails lookup key emails
         // lowercased: one mailbox seen through two casings must count once
         // everywhere, not twice on the scan paths and once on the user path
-        let mut emails: Vec<String> = Vec::new();
-        keep_email(&mut emails, "arwin.tio@adroll.com");
-        keep_email(&mut emails, "Arwin.tio@adroll.com");
-        assert_eq!(emails, vec!["arwin.tio@adroll.com".to_string()]);
+        let mut emails = EmailList::new();
+        emails.keep("arwin.tio@adroll.com");
+        emails.keep("Arwin.tio@adroll.com");
+        assert_eq!(emails.as_slice(), vec!["arwin.tio@adroll.com".to_string()]);
         // the first spelling seen wins: the plain output keeps what the
         // commits carried first, sorted case-insensitively afterwards
-        merge_emails(&mut emails, vec!["ARWIN.TIO@ADROLL.COM".to_string()]);
-        assert_eq!(emails, vec!["arwin.tio@adroll.com".to_string()]);
+        emails.merge(vec!["ARWIN.TIO@ADROLL.COM".to_string()]);
+        assert_eq!(emails.as_slice(), vec!["arwin.tio@adroll.com".to_string()]);
         // a genuinely different mailbox is still kept, whatever its casing
-        keep_email(&mut emails, "dev@ADROLL.com");
+        emails.keep("dev@ADROLL.com");
         assert_eq!(emails.len(), 2);
     }
 
     #[test]
-    fn merge_emails_deduplicates_across_pages() {
-        let mut emails = vec!["b@b.b".to_string()];
-        merge_emails(&mut emails, vec!["a@a.a".to_string(), "b@b.b".to_string()]);
-        assert_eq!(emails, vec!["b@b.b".to_string(), "a@a.a".to_string()]);
+    fn the_email_list_merges_deduplicates_across_pages_case_insensitively() {
+        // the two merge shapes share one dedup rule: same mailbox in
+        // different casings across pages or repositories is one entry, in
+        // insertion order (the mirror makes it O(1) per email)
+        let mut emails = EmailList::new();
+        emails.keep("b@b.b");
+        emails.merge(vec!["a@a.a".to_string(), "B@B.B".to_string()]);
+        emails.keep("dev@ADROLL.com");
+        emails.keep("dev@adroll.com");
+        assert_eq!(
+            emails.into_vec(),
+            vec![
+                "b@b.b".to_string(),
+                "a@a.a".to_string(),
+                "dev@ADROLL.com".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -425,4 +551,10 @@ mod tests {
         let scanner = Scanner::new(None, None).expect("anonymous scanner must build");
         assert!(scanner.client().tokens().is_empty());
     }
+
+    // the 422 classifier ([`classify_search_window_422`]) is pinned end to
+    // end by the loopback mock tests: the user investigation's page-1 422
+    // (a page-1 422 must fail the investigation) and the parallel search's
+    // window-422 walk exercise both arms against a real HTTP exchange, and
+    // `reqwest::Error` has no public constructor to unit-test it directly.
 }

@@ -5,34 +5,66 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.0] - 2026-10-25
+## [0.7.0] - 2026-10-26
+
+git2mail grows from 2 to 6 subcommands: the tool now investigates whole
+profiles, organizations and individual email addresses, not just
+repositories, and every long run is warned and provably honest in
+its reports (the commit walks cover full histories: the only caps left are
+GitHub's own).
 
 ### Added
 
-- `user` subcommand: a full GitHub profile investigation. It recovers the usernames and real names the account exposed through its commit history (the `users.noreply.github.com` technique), lists its external contributions, generates the email variants a person named that way would plausibly use (built-in first/last/initial patterns plus repeatable custom `--variant-pattern` templates), looks for potential secondary accounts sharing the recovered names and usernames, and reports the public SSH keys
-- `email` and `emails` subcommands: the reverse lookup, from one or many email addresses to the GitHub accounts likely behind them. The technique is heuristic and reports a confidence grade: candidate accounts come with a `commit-author` or `repo-owner-weak` confidence, candidates beyond the 50-repository budget cap are skipped with a warning, and the bulk mode fans out over the token pool (`#` comment lines and blank lines allowed in the input file)
-- `org` subcommand: a GitHub organization investigation covering members, repositories, and a parallel email scan of the repositories' commits, with a per-repository and global email report and the same one-email-per-line result file as the scan subcommands (`results/org/<org>`)
-- `--json -`: the JSON report printed to stdout instead of written to a file (usable in pipelines: `git2mail scan --url https://github.com/owner/repo --json -` emits only the JSON document on stdout, the log goes to stderr)
-- Caps on every long-running path, each announced in the log when it triggers: repository commit listings stop at 10 pages of 100 commits, profile event scans at 300 events, search results at GitHub's 1000-result ceiling, reverse-lookup candidate repositories at 50, variant generation at 64 name pairs × 64 domains (1000 generated addresses), custom `--variant-pattern` templates validated client-side (syntax and a 64-pattern cap, rejected before any request)
-- `scanned.partial` in the JSON report: `true` when a parallel scan kept its findings although a dedicated token retired mid-scan, so listed repositories may have been left unscanned: the report must never be mistaken for a complete one (a scan that scanned every listed repository always reports `partial: false`: the other truncations, namely the commit page cap, the search ceiling and a discarded search window, are announced as log warnings); the `scan`/`search` and `org` reports carry `scanned` counters
-- `AGENTS.md`: the contributor and agent onboarding guide (repository conventions, review regime, release process)
+- result files publish atomically through staging files, and the staging files an interrupted run leaves behind (a crash or a `kill -9` between the staging write and the rename) are swept on the next publish of the same folder
+- `--csv <PATH>` on `scan`, `search` and `org`: a spreadsheet export of the per-author correlation report, one row per author (name, emails, repositories, dominant language, commit count), RFC 4180-escaped so a hostile commit name can never forge spreadsheet rows
+- `last_commit_date` on every `correlation.authors` entry (scan/search/org JSON reports): the most recent commit author date seen for the author (raw ISO 8601 UTC from the API payload), so an exposure's age can be judged without re-scanning (self-declared forgeable metadata, like the author name)
+- `user` also writes the paste-able `results/user/<username>` file (one observed email per line, the same deliverable as `scan`/`search`/`org`)
+- exit code `3` when `scan`/`search` complete without finding any email: scripting can tell "a live target that carries no email" apart from a real failure (exit `1`)
+- a spent hourly quota parks the token until the `x-ratelimit-reset` instant instead of retiring it for the run, and a run stopped by secondary pauses (per-minute search quota, abuse windows) fails with the dedicated paused error naming the minutes-long wait; a parked token rejoins the pool on its own
+- a startup egress-proxy check: the proxy environment variables are resolved exactly the way the HTTP stack resolves them (scope precedence with the `ALL_PROXY` fallback, case-sensitive `socks` schemes, a set-but-empty variable shadowing its lowercase twin, full URI validation), the proxy actually used is announced, and a set-but-unusable one (a typo'd scheme, a stray character, an empty value) is named with a loud warning instead of the stack's silent fallback to a direct connection, so a privacy-sensitive run never believes it is behind Tor while leaving from the real IP; a set `REQUEST_METHOD` (the stack's CGI marker, which discards every proxy variable, warned when any proxy variable is set) and a set `NO_PROXY` (which can bypass the proxy for some hosts, warned when a proxy is in use) are warned about too, and proxy values are never logged (a proxy URL can carry embedded credentials)
+- every degrading event (a skipped repository, a parked or dead token, a truncated listing) logs at `warn`, so the terminal never shows a green-looking run that silently lost coverage
+
+- `user` subcommand: a full GitHub profile investigation.
+  - recovers the usernames and real names the account exposed through its commit history (the `users.noreply.github.com` technique);
+  - lists its external contributions and its public SSH keys;
+  - generates the email variants a person named that way would plausibly use (built-in first/last/initial patterns, plus repeatable custom `--variant-pattern` templates), and looks for potential secondary accounts sharing the recovered names and usernames.
+- `email` and `emails` subcommands: the reverse lookup, from one or many email addresses to the GitHub accounts likely behind them.
+  - heuristic technique with an honest confidence grade per candidate (`commit-author` or `repo-owner-weak`);
+  - the bulk mode fans out over the token pool (`#` comment lines and blank lines allowed in the input file), and an interrupted run keeps the lookups already paid for: the partial report reaches the requested `--json` file and the never-processed addresses are listed in `skipped_addresses`.
+- `org` subcommand: a GitHub organization investigation covering members, repositories, and a parallel email scan of the repositories' commits, with a per-repository and global email report and the same one-email-per-line result file as the scan subcommands (`results/org/<org>`).
+- `--json -`: the JSON report printed to stdout instead of written to a file (usable in pipelines: `git2mail scan --url https://github.com/owner/repo --json -` emits only the JSON document on stdout, the log goes to stderr).
+- Caps on the long-running paths the GitHub API itself bounds, each announced in the log when it triggers:
+  - profile event scans at 300 events;
+  - search results at GitHub's 1000-result ceiling;
+  - variant generation at 64 name pairs × 64 domains (1000 generated addresses);
+  - custom `--variant-pattern` templates validated client-side (syntax and a 64-pattern cap, rejected before any request).
+- No local caps on the commit walks: every repository listing (scan, search, org, user, reverse-lookup candidates) covers its full default-branch history and ends when GitHub's listing ends
+- `scanned.partial` in the JSON report: `true` when a parallel scan kept its findings although a dedicated token died mid-scan (a spent quota parked until its reset, a parked window expired or a token was rejected), so listed repositories may have been left unscanned: the report must never be mistaken for a complete one (a scan that scanned every listed repository always reports `partial: false`: the other truncations, namely the search ceiling and a discarded search window, are announced as log warnings); the `scan`/`search` and `org` reports carry `scanned` counters
+- Report provenance: every JSON report carries `generated_at` (the UTC timestamp of the run, `YYYY-MM-DDTHH:MM:SSZ`, no new dependency: a hand-rolled RFC 3339 formatter) and `tool_version` (the version that wrote it); a `search` report additionally records the request that produced it (`request.query`, `request.language` and every advanced qualifier actually provided), so two runs with different qualifiers never write indistinguishable reports
+- `per_repository` in the `search` JSON report: a keyword search breaks its findings down per repository (`owner/name` → emails), so a multi-repository run can be read per project without re-running it
+- `skipped_addresses` in the bulk `emails` JSON report: the file-order list of the addresses a stopped worker never reached (the inventory behind `summary.skipped`), so re-running the interrupted lookups needs no diff of two files
+- `--include-forks` on `user`, `org` and `search`: forked repositories are skipped by default on those subcommands (the keyword search previously scanned forks, reporting upstream developers under the fork's name and spending requests on another project's history); the flag scans them too when the forks themselves are the subject. The reverse-email candidate search keeps forks: it wants any repository carrying the address
 
 ### Changed
 
-- The noreply filter matches the exact `users.noreply.github.com` domain instead of any address containing the substring `noreply`, which wrongly excluded legitimate third-party addresses
 - Rate-limit classification: a `429 Too Many Requests` parks the token (never retires it), a spent search quota parks instead of retiring, and an HTTP 401 explicitly retires the rejected token and reports it as a credentials problem rather than a raw HTTP error
 - A transport-level failure (a connection refused or dropped, a timeout) in the parallel search fan-out now skips the one repository with a warning instead of aborting the whole scan, so a one-second network hiccup no longer throws away every finding; the `org` investigation keeps its complete-report contract and still aborts
-- Result file names are anti-clobber: sanitized names (and every name containing an uppercase letter, so case-only variants like `rust lang` and `Rust Lang` cannot silently overwrite each other on a case-insensitive filesystem) carry a 16-hex name-derived suffix (a hash of the raw name), and are capped at 200 bytes with the hash taken over the full raw name, so two distinct targets can no longer silently overwrite each other
+- Result file names are anti-clobber: a name the sanitizer changed carries a 16-hex name-derived suffix (a hash of the raw name), so distinct targets whose names collapse onto the same sanitized file name can no longer silently overwrite each other; an unchanged name keeps its exact file name. Result file names are also capped at 200 bytes with the hash taken over the full raw name
 - Every user-facing string (`--help` texts, error messages, terminal warnings) was rewritten in plain English for non-developers (recruiters, journalists, investigators): internal jargon (pool, qualifier, retired, capped, heuristic) is replaced or explained in place, every error carries a next step
 - Terminal warnings carry their own `[!]` marker (success is `[+]`, errors `[-]`): a partial-scan warning stays scannable once terminal colors are stripped (redirects, screen readers, plain terminals), instead of looking like progress chatter
 - The startup banner no longer prints above `--help` output, and the "Top authors" summary prints one line per author instead of a single wrapped line
-- A missing token or addresses file now reads `cannot read the file "tokens.json": … — check the path …` instead of `I/O error: … (os error 2)`, and an intercepted or captive-portal connection gets its own "could not read GitHub's response" guidance instead of "check your internet connection"
-- Tokens pasted with a leading or trailing space no longer fail every request with a misleading "rejected token" error: paste artifacts are trimmed at load time
 - Result files are published atomically (written to a temporary file then renamed), so an interrupted run can no longer leave a half-written result file, and a symlink at the result path is refused instead of being written through
 - URLs targeting another host than github.com (or a port other than the default one) are rejected upfront with a named error instead of being silently scanned against the github.com namesake
 - A repository whose commits listing answers `409 Conflict` (an empty repository) is skipped with a warning as a resource-scoped condition instead of surfacing as a raw HTTP error (`Error::EmptyRepository` in the library API), and a scan of an empty repository answers with a plain "GitHub repository is empty" error instead of a raw HTTP failure
 - Token-file handling hardened: duplicate tokens are detected and deduplicated with a warning at load time, a UTF-8 BOM is tolerated (Windows editors prepend it), control characters and internal whitespace are rejected at load time instead of failing every request with a misleading "rejected token" error, and reads are size-capped (1 MiB for a token file, 64 MiB for a GitHub response body) so a hostile or broken input can never exhaust memory
 - Repository and profile URLs are normalized and hardened before any request: `..` path segments and scheme-less foreign hosts (`gitlab.com/owner/repo` typed without a scheme) are rejected with a named error, URLs are capped at 2048 bytes, trailing slashes and `?`/`#` paste artifacts are stripped, and a hostile listing entry whose name could corrupt a composed URL (a dot segment, a path separator) is skipped with a warning instead of being scanned
+- Internal refactors and CI hardening with no user-visible behavior change: one shared token-pool runner, struct-shaped scan results, shared budget/422 helpers, and CI runner images pinned to explicit versions (ubuntu-26.04, macos-26 arm64, windows-2025-vs2026); details in `AGENTS.md` and the code docs
+
+### Fixed
+
+- The noreply filter matches the exact `users.noreply.github.com` domain instead of any address containing the substring `noreply`, which wrongly excluded legitimate third-party addresses (a data-quality regression: old releases silently discarded real, reachable addresses)
+- A missing token or addresses file now reads `cannot read the file "tokens.json": … — check the path …` instead of a bare `I/O error: … (os error 2)`, and an intercepted or captive-portal connection gets its own "could not read GitHub's response" guidance instead of "check your internet connection"
+- Tokens pasted with a leading or trailing space no longer fail every request with a misleading "rejected token" error: paste artifacts are trimmed at load time
 
 ## [0.6.0] - 2026-10-25
 

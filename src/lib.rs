@@ -16,8 +16,8 @@
 //!
 //! The public doors are [`sources::Scanner`] (build it from tokens, then
 //! call `scan_parts` for one repository/profile or `search` for a keyword
-//! query) and the investigation entry points of the [`email`] and [`org`]
-//! modules. Every fallible call returns [`errors::Error`]; the reports
+//! query) and the investigation entry points of the [`email`], [`user`] and
+//! [`org`] modules. Every fallible call returns [`errors::Error`]; the reports
 //! serialize to the documented JSON shapes. The `Error` display strings
 //! are written for a terminal user (they carry next steps), not for
 //! programmatic matching — match on the variant, not the text.
@@ -35,7 +35,7 @@
 //!
 //!
 
-/// Per-author attribute correlation (issue #5): aggregates the scan results
+/// Per-author attribute correlation: aggregates the scan results
 /// per author with the repositories scanned, their primary language and the
 /// commit counts, for the opt-in JSON report and the terminal summary.
 pub mod correlate;
@@ -78,6 +78,7 @@ pub mod user;
 /// The `parsers` module exists to handle some strings and returns requested parts of it
 /// For instance, it gets, from a given repository URL, its author and project name.
 pub mod parsers;
+mod sanitize;
 
 /// Test-only capturing logger (compiled into the crate's own test binary
 /// only): pins the terminal-report sanitization at the wiring level.

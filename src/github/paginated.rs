@@ -1016,7 +1016,7 @@ mod tests {
         )
         .expect_err("the single parked token must end the fetch");
 
-        assert!(matches!(error, Error::RateLimitExhausted));
+        assert!(matches!(error, Error::RateLimitPaused));
         let handled = server.join();
         assert_eq!(handled, 1, "no doomed retry when nothing can rotate");
     }
@@ -1173,7 +1173,7 @@ mod tests {
         )
         .expect_err("a sole parked token must end the fetch promptly");
 
-        assert!(matches!(error, Error::RateLimitExhausted));
+        assert!(matches!(error, Error::RateLimitPaused));
         assert_eq!(server.join(), 1, "no doomed retry when nothing can rotate");
         // parked, not retired: the pool recovers once the window passes
         assert!(
@@ -1215,6 +1215,41 @@ mod tests {
         // the retried page 1 plus the empty page 2 that ends the listing
         let handled = server.join();
         assert_eq!(handled, 3);
+    }
+
+    #[test]
+    fn a_plain_429_without_any_header_parks_never_refuses_permanently() {
+        // GitHub's plain secondary-limit 429s carry no `Retry-After` and no
+        // quota headers: the status alone must classify as TRANSIENT (a
+        // park), never as a permanent refusal. Two headerless 429s drain a
+        // two-token pool into the dedicated `RateLimitPaused` error (the
+        // honest "every token is parked for a minutes-long window" failure);
+        // the regression this pins is the classification flip to a
+        // permanent 403-shaped `PrivateOrUnavailable`, which would abort
+        // single-token scans on GitHub's ordinary headerless 429s.
+        let (address, server) =
+            serve_requests(move |_index, _request| (429, vec![], String::new()));
+
+        let path = temp_token_file(r#"{"0": "ghp_a", "1": "ghp_b"}"#, 11);
+        let pool = TokenPool::from_token_file(&path).expect("token file must load");
+        std::fs::remove_file(&path).ok();
+        let client = Client::new(pool).expect("client must build");
+        let error = fetch_paginated(
+            &client,
+            |page| format!("{address}/items?page={page}"),
+            parse_str_page,
+            None,
+        )
+        .expect_err("a fully-parked pool fails with the paused error, not a refusal");
+
+        assert!(
+            matches!(error, Error::RateLimitPaused),
+            "a headerless 429 must park (RateLimitPaused), never classify as a \
+             permanent refusal: {error}"
+        );
+        // both tokens were parked by plain 429s, no page was ever served
+        let handled = server.join();
+        assert_eq!(handled, 2);
     }
 
     #[test]

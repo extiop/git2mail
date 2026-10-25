@@ -54,14 +54,43 @@ const WEB_URL_HOSTS: [&str; 2] = ["github.com", "www.github.com"];
 /// and the scan reported "GitHub resource not found" after a guaranteed-404
 /// run — telling the user a *GitHub* resource was missing when the actual
 /// problem is that the URL was never a GitHub one (live repro). The
-/// documented `ssh://git@domain.com/group/app` passthrough is untouched:
-/// self-hosted Git SSH remotes are a legitimate input, and scheme-less
-/// (`git@github.com:…`) and other-scheme URLs keep the current behavior.
+/// documented `ssh://git@github.com/...` form keeps parsing; any other
+/// `ssh://` host is rejected with the same named error (the API base is
+/// hardcoded to api.github.com, so a self-hosted remote would be scanned
+/// against the github.com namesake), and scheme-less (`git@github.com:…`)
+/// and other-scheme URLs keep the current behavior.
 fn check_url_host(github_url: &str) -> Result<(), Error> {
     let Some((scheme, rest)) = github_url.split_once("://") else {
         // no scheme (`git@github.com:octocat/hello-world`): nothing to judge here
         return Ok(());
     };
+    // an `ssh://` remote to a NON-GitHub host is the same wrong-target scan
+    // the scheme-less rejection exists for: the API base is hardcoded to
+    // api.github.com, so scanning a GitLab/Gitea remote's ssh:// URL would
+    // silently hit the github.com NAMESAKE with the user's own token. The
+    // documented `ssh://git@github.com/...` passthrough keeps parsing
+    // (github.com passes the host check below); any other ssh:// host gets
+    // the same named error
+    if scheme.eq_ignore_ascii_case("ssh") {
+        let authority = rest.split('/').next().unwrap_or("");
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host)
+            .to_ascii_lowercase();
+        // a port on an ssh:// authority gets the same dedicated message as
+        // the http(s) branch (github.com:22 is github.com on the WRONG
+        // port, not a non-GitHub host)
+        if host.contains(':') {
+            return Err(Error::InvalidUrl(format!(
+                "unsupported port in {host}: git2mail talks to the GitHub API on the standard port only"
+            )));
+        }
+        if !WEB_URL_HOSTS.contains(&host.as_str()) {
+            return Err(Error::InvalidUrl(format!(
+                "unsupported host {host}: an ssh:// remote to a non-GitHub host would be scanned against the github.com namesake"
+            )));
+        }
+    }
     if !matches!(
         scheme.to_ascii_lowercase().as_str(),
         "http" | "https" | "git" | "ftp" | "ftps"
@@ -114,9 +143,10 @@ fn is_dot_segment(part: &str) -> bool {
 /// is built, silently re-targeting the authenticated request. The
 /// documented `git@github.com:owner/repo` SCP form (github.com host, no
 /// dot segment) and a bare `owner/repository` (no dot in the host slot)
-/// still parse. The `ssh://git@domain.com/…` self-hosted passthrough is
-/// untouched: this helper only fires on scheme-less URLs, and `ssh://` is
-/// a scheme [`check_url_host`] deliberately lets through.
+/// still parse. The `ssh://git@github.com/…` passthrough is
+/// untouched: this helper only fires on scheme-less URLs, and the `ssh://`
+/// host judgment lives entirely in [`check_url_host`] (GitHub remotes
+/// only).
 fn check_url_target(github_url: &str, captures: &regex::Captures<'_>) -> Result<(), Error> {
     let host = captures.get(5).map_or("", |item| item.as_str());
     if !github_url.contains("://")
@@ -132,7 +162,7 @@ fn check_url_target(github_url: &str, captures: &regex::Captures<'_>) -> Result<
         .is_some_and(|item| is_dot_segment(item.as_str()))
         || captures
             .get(7)
-            .is_some_and(|item| is_dot_segment(item.as_str()));
+            .is_some_and(|item| item.as_str().split('/').any(is_dot_segment));
     if dot_segment {
         return Err(Error::InvalidUrl(
             "a dot segment is not a valid GitHub owner or repository name".to_string(),
@@ -183,20 +213,25 @@ static GITHUB_URL_PROFILE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("static GitHub profile URL regex must compile")
 });
 
-/// From a project URL, retrieves its author with regex processing.
+/// Parses a GitHub URL once into its `(author, repository)` parts: the
+/// shared normalize-validate-match pass behind [`get_author`] and
+/// [`get_repository`]. `repository` is `Some` only for a repository URL
+/// (a profile URL yields `None`); a trailing `/` paste artifact on the
+/// repository part is trimmed, while the `.git` suffix is kept verbatim
+/// (documented behavior).
 ///
 /// # Errors
 ///
 /// Returns [`Error::InvalidUrl`] when the URL matches neither a repository
 /// nor a profile shape (or is empty). Never panics.
-pub fn get_author(github_url: String) -> Result<String, Error> {
-    let github_url = normalize_pasted_url(&github_url);
+pub fn parse_github_url(github_url: &str) -> Result<(String, Option<String>), Error> {
+    let github_url = normalize_pasted_url(github_url);
     check_url_len(github_url)?;
     check_url_host(github_url)?;
     if let Some(captures) = GITHUB_URL.captures(github_url) {
         check_url_target(github_url, &captures)?;
-        // we know that it is in group 6 that the author is
-        return captures
+        // the author is group 6, the repository group 7
+        let author = captures
             .get(6)
             .map(|item| item.as_str().to_string())
             .ok_or_else(|| {
@@ -205,15 +240,40 @@ pub fn get_author(github_url: String) -> Result<String, Error> {
                      https://github.com/owner/repository or https://github.com/owner"
                         .to_string(),
                 )
-            });
+            })?;
+        let repository = captures
+            .get(7)
+            .map(|item| {
+                // a trailing `/` is a trivially common paste artifact
+                // (`https://github.com/octocat/hello-world/`), never part of a
+                // repository name: left in, it would be percent-encoded
+                // into an unresolvable `/repos/octocat/hello-world%2F/commits`
+                // request (a guaranteed 404 on an existing repository).
+                // Unlike the `.git` suffix, which is kept verbatim
+                // (documented behavior), it can never be part of a name.
+                item.as_str().trim_end_matches('/')
+            })
+            .filter(|name| !name.is_empty())
+            .map(String::from)
+            // a URL that matched the repository shape but carries no
+            // repository after trimming (`…/octocat//`) is a malformed
+            // paste, not a profile: the author is right there but the target
+            // is still unusable
+            .ok_or_else(|| {
+                Error::InvalidUrl(
+                    "this URL does not point to a GitHub repository or profile — use a URL like https://github.com/owner/repository".to_string(),
+                )
+            })?;
+        return Ok((author, Some(repository)));
     }
     match GITHUB_URL_PROFILE.captures(github_url) {
         Some(captures) => {
             check_url_target(github_url, &captures)?;
-            captures
+            let author = captures
                 .get(6)
                 .map(|item| item.as_str().to_string())
-                .ok_or_else(|| Error::InvalidUrl("author could not be found".to_string()))
+                .ok_or_else(|| Error::InvalidUrl("author could not be found".to_string()))?;
+            Ok((author, None))
         }
         // a profile URL pasted with a trailing `/` fails the regex while the
         // identical paste artifact on a repository URL is trimmed elsewhere:
@@ -231,6 +291,16 @@ pub fn get_author(github_url: String) -> Result<String, Error> {
     }
 }
 
+/// From a project URL, retrieves its author with regex processing.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidUrl`] when the URL matches neither a repository
+/// nor a profile shape (or is empty). Never panics.
+pub fn get_author(github_url: String) -> Result<String, Error> {
+    parse_github_url(&github_url).map(|(author, _)| author)
+}
+
 /// From a project URL, retrieves its repository with regex processing.
 ///
 /// A profile URL has no repository part: an empty string is returned in that
@@ -241,42 +311,10 @@ pub fn get_author(github_url: String) -> Result<String, Error> {
 /// Returns [`Error::InvalidUrl`] when the URL matches neither a repository
 /// nor a profile shape (or is empty). Never panics.
 pub fn get_repository(github_url: String) -> Result<String, Error> {
-    // the paste artifacts are cut from the whole URL before matching (see
-    // [`normalize_pasted_url`]): a profile URL pasted with its
-    // `?tab=repositories` suffix must resolve to the profile, not to a
-    // repository named after the artifact-stripped author
-    let github_url = normalize_pasted_url(&github_url);
-    check_url_len(github_url)?;
-    check_url_host(github_url)?;
-    if let Some(captures) = GITHUB_URL.captures(github_url) {
-        check_url_target(github_url, &captures)?;
-        // we know that it is in group 7 that the repository is
-        let repository = captures
-            .get(7)
-            .map(|item| {
-                // a trailing `/` is a trivially common paste artifact
-                // (`https://github.com/octocat/hello-world/`), never part of a
-                // repository name: left in, it would be percent-encoded
-                // into an unresolvable `/repos/octocat/hello-world%2F/commits`
-                // request (a guaranteed 404 on an existing repository).
-                // Unlike the `.git` suffix, which is kept verbatim
-                // (documented behavior), it can never be part of a name.
-                item.as_str().trim_end_matches('/')
-            })
-            .filter(|name| !name.is_empty())
-            .map(String::from)
-            .ok_or_else(|| {
-                Error::InvalidUrl(
-                    "this URL does not point to a GitHub repository or profile — use a URL like https://github.com/owner/repository".to_string(),
-                )
-            })?;
-        return Ok(repository);
-    }
-    // only author case, URL targets an user profile: there is no repository
-    match get_author(github_url.to_string()) {
-        Ok(_) => Ok(String::new()),
-        Err(err) => Err(err),
-    }
+    // a profile URL has no repository part: an empty string is returned in
+    // that case (this is how callers distinguish a profile scan from a
+    // repository scan)
+    parse_github_url(&github_url).map(|(_, repository)| repository.unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -385,6 +423,45 @@ mod tests {
             get_author("ssh://github.com/octocat/hello-world".to_string()).expect("must parse"),
             "octocat"
         );
+    }
+
+    #[test]
+    fn get_author_rejects_an_ssh_port_with_the_dedicated_message() {
+        // github.com:22 is github.com on the WRONG port, not a non-GitHub
+        // host: the ssh branch must name the port, not accuse the host
+        let error = get_author("ssh://github.com:22/octocat/hello-world".to_string())
+            .expect_err("a port-bearing ssh URL must be rejected");
+        assert!(
+            matches!(&error, Error::InvalidUrl(details) if details.contains("port")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn get_author_rejects_a_trailing_dot_host() {
+        // DNS resolves github.com. to github.com: the host allowlist must
+        // not, so the trailing-dot form cannot smuggle past the guard
+        for url in [
+            "https://github.com./octocat/hello-world",
+            "github.com./octocat/hello-world",
+        ] {
+            let error =
+                get_author(url.to_string()).expect_err("a trailing-dot host must be rejected");
+            assert!(
+                matches!(&error, Error::InvalidUrl(details) if details.contains("unsupported host")),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_author_rejects_a_protocol_relative_url() {
+        // no scheme and no user@host shape: rejected by URL shape (fails
+        // closed even though the host is GitHub's)
+        assert!(matches!(
+            get_author("//github.com/octocat/hello-world".to_string()),
+            Err(Error::InvalidUrl(_))
+        ));
     }
 
     #[test]
@@ -519,6 +596,13 @@ mod tests {
             "https://github.com/./repo",
             "https://github.com/owner/..",
             "git@github.com:../octocat/hello-world",
+            // EMBEDDED dot segments: the repository capture is `(.+)`, so a
+            // hostile `a/../b` rides inside a shape-valid name — and
+            // percent_encode leaves `.` untouched (RFC 3986 unreserved), so
+            // the url crate still collapses it at request-build time
+            "https://github.com/octocat/a/../b",
+            "https://github.com/octocat/a/../..",
+            "https://github.com/octocat/../a/b",
         ] {
             let error =
                 get_author(url.to_string()).expect_err("a dot-segment part must be rejected");
@@ -592,11 +676,19 @@ mod tests {
                 .expect("must parse"),
             "octocat"
         );
-        // the documented ssh:// passthrough is untouched: self-hosted Git
-        // SSH remotes are a legitimate input
+        // the documented ssh:// passthrough covers GitHub remotes only
         assert_eq!(
-            get_author("ssh://git@domain.com/group/app".to_string()).expect("must parse"),
-            "group"
+            get_author("ssh://git@github.com/octocat/hello-world".to_string()).expect("must parse"),
+            "octocat"
+        );
+        // an ssh:// remote to a NON-GitHub host is rejected: the API base is
+        // hardcoded to api.github.com, so scanning it would silently hit the
+        // github.com NAMESAKE with the user's own token attached
+        let error = get_author("ssh://git@domain.com/group/app".to_string())
+            .expect_err("a non-GitHub ssh:// host must be rejected");
+        assert!(
+            error.to_string().contains("domain.com"),
+            "the error must name the host: {error}"
         );
         // and so is the scheme-less documented form
         assert_eq!(
@@ -663,16 +755,6 @@ mod tests {
             get_repository("https://github.com/octocat/".to_string()),
             Err(Error::InvalidUrl(_))
         ));
-    }
-
-    #[test]
-    fn get_repository_too_long() {
-        // repository is not retrieved as expected
-        assert_eq!(
-            get_repository("https://github.com/github/octocat/hello-world".to_string())
-                .expect("must parse"),
-            "octocat/hello-world"
-        );
     }
 
     #[test]

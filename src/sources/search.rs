@@ -1,64 +1,17 @@
-//! Search scan: the repositories matching a query, scanned in parallel.
+//! Search scan: the repositories matching a query, fed to the shared
+//! parallel worker pool ([`super::parallel`]).
 
 use crate::consts::GITHUB_API_BASE;
-use crate::correlate::{Correlation, CorrelationBuilder, RepoContribution, RepoScan};
 use crate::errors::Error;
 use crate::github::fetch_paginated_with_page_size;
-use crate::output::sanitize_log_text as log_safe;
-use crate::parsers;
-use crate::sources::{PER_PAGE, ScanOutcome, Scanner, merge_emails, sort_emails};
+use crate::sources::{PER_PAGE, RepoHit, ScanOutcome, Scanner, sort_emails};
+use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 
 /// Comparison prefixes accepted in front of a qualifier value (count or
 /// date), following the github.com/search/advanced semantics. `>=` and
 /// `<=` must be tried before `>` and `<`.
 const COMPARISON_PREFIXES: [&str; 4] = [">=", "<=", ">", "<"];
-
-/// What a parallel repository scan returns: the deduplicated emails found,
-/// the emails found per repository (`owner/name` full name → sorted
-/// emails, only the repositories where at least one email showed up), the
-/// number of repositories actually scanned, the per-author correlation
-/// report (issue #5) and the partial-token-death flag: `true` when the scan
-/// returned its result although a dedicated token died with progress, so
-/// whole repositories may have been left unscanned (`false` when the
-/// surviving workers covered every listed repository). Callers with a
-/// complete-report contract (the `org` investigation) use the flag to abort
-/// instead of silently missing repositories.
-pub(crate) type ParallelScan = Result<
-    (
-        Vec<String>,
-        BTreeMap<String, Vec<String>>,
-        usize,
-        usize,
-        Correlation,
-        bool,
-        // the real death error behind the partial flag (a token death, not
-        // necessarily a spent allowance): callers re-raising the flag abort
-        // with this cause instead of a misattributed rate-limit error
-        Option<Error>,
-    ),
-    Error,
->;
-
-/// What [`reduce_worker_reports`] folds the workers' reports into: the scan
-/// result ([`ParallelScan`]'s payload plus the total number of successful
-/// worker requests, reported in the JSON output) and the
-/// partial-token-death flag (see [`ParallelScan`]).
-type ReducedReports = (
-    Result<Vec<String>, Error>,
-    BTreeMap<String, Vec<String>>,
-    usize,
-    usize,
-    usize,
-    Correlation,
-    bool,
-    // the real death error behind the partial flag
-    Option<Error>,
-);
 
 /// Optional GitHub repository-search qualifiers, following the
 /// [advanced search](https://github.com/search/advanced) semantics.
@@ -71,26 +24,35 @@ type ReducedReports = (
 /// Values are validated client-side by [`SearchQualifiers::validate`]
 /// before any network request: an obviously malformed range or date fails
 /// with [`Error::InvalidSearchQualifier`] instead of reaching the API.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct SearchQualifiers {
     /// Repository star count, e.g. `>100`, `>=50`, `10..50` or `100..*`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stars: Option<String>,
     /// Repository fork count, same range syntax as `stars`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub forks: Option<String>,
     /// Repository size in kilobytes, same range syntax as `stars`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
     /// Repository creation date, e.g. `>2020-01-01`, `>=2020` or
     /// `2019-01-01..2020-01-01`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created: Option<String>,
     /// Repository last-push date, same date syntax as `created`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pushed: Option<String>,
     /// Repository license identifier, e.g. `mit` or `apache-2.0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub license: Option<String>,
     /// Repository topic, e.g. `osint`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
     /// Restrict the search to one user's repositories (login).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     /// Restrict the search to one organization's repositories (login).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub org: Option<String>,
 }
 
@@ -103,7 +65,7 @@ impl SearchQualifiers {
     /// # Errors
     ///
     /// Returns [`Error::InvalidSearchQualifier`] describing the first
-    /// malformed value. Never panics.
+    /// malformed value.
     pub fn validate(&self) -> Result<(), Error> {
         for (name, value) in self.provided() {
             match name {
@@ -321,7 +283,7 @@ pub(crate) const SEARCH_RESULT_CEILING: usize = 1000;
 ///
 /// For each found repository, it scans it and gets its developers emails,
 /// then deduplicates and sorts the concatenated result, and builds the
-/// per-author correlation report (issue #5) with the primary language each
+/// per-author correlation report with the primary language each
 /// search result already carries.
 pub(crate) fn aggregate_search(
     scanner: &Scanner,
@@ -329,8 +291,17 @@ pub(crate) fn aggregate_search(
     language: &str,
     qualifiers: &SearchQualifiers,
     limit: usize,
+    include_forks: bool,
 ) -> Result<ScanOutcome, Error> {
-    aggregate_search_at(scanner, GITHUB_API_BASE, query, language, qualifiers, limit)
+    aggregate_search_at(
+        scanner,
+        GITHUB_API_BASE,
+        query,
+        language,
+        qualifiers,
+        limit,
+        include_forks,
+    )
 }
 
 /// Fetches the search listing for the query: capped at `ceiling` (GitHub
@@ -353,11 +324,10 @@ pub(crate) fn aggregate_search(
 /// the raw HTTP error. A window 422 past the ceiling ends the listing with
 /// a warning instead of aborting the whole search with a raw HTTP error
 /// (same parity as the user investigation's external-contributions
-/// search); the hits collected so far are deliberately kept by this
-/// function's own caller instead of thrown away with the page (the
-/// defensive fallback inside the paginated loop cannot recover them — a
-/// chosen design, not a limitation). Every other failure propagates.
-/// Never panics.
+/// search): the hits already collected are discarded with the warning
+/// naming how many were dropped — they are unrecoverable from the
+/// paginated loop's error path, and the completed-but-empty outcome is the
+/// documented shape (doc/src/API.md). Every other failure propagates.
 fn fetch_search_hits(
     client: &crate::github::Client,
     base: &str,
@@ -365,34 +335,65 @@ fn fetch_search_hits(
     language: &str,
     qualifiers: &SearchQualifiers,
     ceiling: usize,
-) -> Result<Vec<SearchHit>, Error> {
+    include_forks: bool,
+) -> Result<Vec<RepoHit>, Error> {
     let collected = std::cell::Cell::new(0usize);
     let hits = match fetch_paginated_with_page_size(
         client,
         |page| search_url(base, query, language, qualifiers, page),
         |json| {
-            let (page_hits, raw_count) = parse_search_page(json)?;
-            collected.set(collected.get() + page_hits.len());
+            let (page_hits, raw_count) = parse_search_page(json, include_forks)?;
+            // the RAW item count feeds the 422 classifier, not the parsed
+            // hits (the same seam rule as `fetch_external_hits`): a fully
+            // malformed page followed by a window 422 must not be
+            // misclassified as a page-1 rejection
+            collected.set(collected.get() + raw_count);
             Ok((page_hits, raw_count))
         },
         Some(ceiling),
         PER_PAGE,
     ) {
         Ok(hits) => hits,
-        Err(Error::Http(err))
-            if err.status() == Some(reqwest::StatusCode::UNPROCESSABLE_ENTITY) =>
-        {
-            if collected.get() == 0 {
-                return Err(Error::SearchRejected);
+        Err(err) => {
+            match crate::sources::classify_search_window_422(&err, collected.get()) {
+                // a page-1 422 is the API rejecting the query itself — in
+                // practice a nonexistent or inaccessible `--user`/`--org`
+                // login: surfaced as [`Error::SearchRejected`] instead of
+                // the raw HTTP error
+                Some(crate::sources::SearchWindow422::Reject) => {
+                    return Err(Error::SearchRejected);
+                }
+                // a window 422 past the ceiling ends the listing with a
+                // warning instead of aborting the whole search with a raw
+                // HTTP error (same parity as the user investigation's
+                // external-contributions search): the hits already
+                // collected are discarded with the warning naming how many
+                // were dropped (they are unrecoverable from the paginated
+                // loop's error path)
+                Some(crate::sources::SearchWindow422::Cut) => {
+                    log::warn!(
+                        "search stopped at GitHub's 1000-result limit: {} already-found repositories were dropped",
+                        collected.get()
+                    );
+                    Vec::new()
+                }
+                None => return Err(err),
             }
-            log::warn!(
-                "search stopped at GitHub's 1000-result limit: {} already-found repositories were dropped",
-                collected.get()
-            );
-            Vec::new()
         }
-        Err(err) => return Err(err),
     };
+    if collected.get() >= SEARCH_RESULT_CEILING {
+        // the DOCUMENTED 1000-result window was reached in the listing's
+        // NORMAL completion path (a `--limit` below the ceiling is the
+        // user's own choice, not a truncation: it must never fire this
+        // warning — hence the constant, not the passed `ceiling`). The
+        // listing was cut at GitHub's documented window, so it must say so
+        // instead of looking complete — the same cap-reached warning the
+        // external-contributions walk emits (the defensive 422 branch
+        // above only covers the pathological classifier-miss path)
+        log::warn!(
+            "the search was cut at GitHub's documented {SEARCH_RESULT_CEILING}-result window: repositories beyond the first {SEARCH_RESULT_CEILING} matches were not scanned"
+        );
+    }
     Ok(hits)
 }
 
@@ -405,7 +406,7 @@ fn fetch_search_hits(
 ///
 /// The same failures as the parallel scan: a scan-wide failure aborts the
 /// scan, while a dead dedicated token alone does not; the ceiling and 422
-/// semantics are [`fetch_search_hits`]'s. Never panics.
+/// semantics are [`fetch_search_hits`]'s.
 pub(crate) fn aggregate_search_at(
     scanner: &Scanner,
     base: &str,
@@ -413,6 +414,7 @@ pub(crate) fn aggregate_search_at(
     language: &str,
     qualifiers: &SearchQualifiers,
     limit: usize,
+    include_forks: bool,
 ) -> Result<ScanOutcome, Error> {
     // fail fast on a malformed qualifier before any network request
     qualifiers.validate()?;
@@ -438,27 +440,20 @@ pub(crate) fn aggregate_search_at(
         language,
         qualifiers,
         limit.min(SEARCH_RESULT_CEILING),
+        include_forks,
     )?;
 
-    let (mut found_emails, _, repos_scanned, _, correlation, partial, _) =
-        scanner.scan_repositories_at(base, &hits, true)?;
+    let scan = scanner.scan_repositories_at(base, &hits, true)?;
+    let mut found_emails = scan.emails;
     sort_emails(&mut found_emails);
 
     Ok(ScanOutcome {
         emails: found_emails,
-        repos_scanned,
-        correlation,
-        partial,
+        per_repository: scan.per_repository,
+        repos_scanned: scan.repos_scanned,
+        correlation: scan.correlation,
+        partial: scan.partial,
     })
-}
-
-/// One repository candidate of a search listing: its `html_url` plus the
-/// primary language GitHub reports for it — free correlation metadata
-/// (issue #5), no extra API call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SearchHit {
-    pub(crate) url: String,
-    pub(crate) language: Option<String>,
 }
 
 /// Builds the search endpoint URL for `page` against `base` (the
@@ -510,8 +505,11 @@ pub(crate) fn search_q(query: &str, language: &str, qualifiers: &SearchQualifier
 /// # Errors
 ///
 /// Returns [`Error::InvalidProfile`] when the body carries no `items` field
-/// or an `items` field that is neither an array nor `null`. Never panics.
-pub(crate) fn parse_search_page(json: &Value) -> Result<(Vec<SearchHit>, usize), Error> {
+/// or an `items` field that is neither an array nor `null`.
+pub(crate) fn parse_search_page(
+    json: &Value,
+    include_forks: bool,
+) -> Result<(Vec<RepoHit>, usize), Error> {
     let Some(items) = json.get("items") else {
         return Err(Error::InvalidProfile(
             "search payload: no `items` field".to_string(),
@@ -534,9 +532,19 @@ pub(crate) fn parse_search_page(json: &Value) -> Result<(Vec<SearchHit>, usize),
     // warn-and-count rule the org and user listings apply to malformed
     // entries (the raw count still includes it so pagination keeps its
     // end-of-listing signal)
+    // GitHub's repository search INCLUDES forks: like the `user` and `org`
+    // listings, forked entries are skipped with a warning unless the caller
+    // opted in — a fork's default-branch commits mirror the upstream
+    // history, so scanning them would burn the per-repository commit budget
+    // on other projects' developers and report them under the fork's name
     let mut repositories = Vec::new();
     let mut malformed = 0usize;
+    let mut forks = 0usize;
     for item in items {
+        if !include_forks && item.get("fork").and_then(Value::as_bool) == Some(true) {
+            forks += 1;
+            continue;
+        }
         let Some(url) = item.get("html_url").and_then(Value::as_str) else {
             malformed += 1;
             continue;
@@ -545,13 +553,23 @@ pub(crate) fn parse_search_page(json: &Value) -> Result<(Vec<SearchHit>, usize),
             .get("language")
             .and_then(Value::as_str)
             .map(str::to_string);
-        repositories.push(SearchHit {
+        repositories.push(RepoHit {
             url: url.to_string(),
             language,
         });
     }
     if malformed > 0 {
         log::warn!("malformed search-listing entries skipped: {malformed}");
+    }
+    if forks > 0 {
+        let plural = if forks > 1 {
+            "repositories"
+        } else {
+            "repository"
+        };
+        log::warn!(
+            "{forks} forked {plural} skipped (their history is upstream's): pass --include-forks to scan them"
+        );
     }
     Ok((repositories, items.len()))
 }
@@ -576,591 +594,6 @@ pub(crate) fn percent_encode(value: &str) -> String {
     encoded
 }
 
-impl Scanner {
-    /// Scans the given repositories in parallel against one API
-    /// base URL: the production callers pass `https://api.github.com`, and
-    /// the offline tests run this same code against a loopback mock. A pool
-    /// of `min(nb_tokens, nb_repositories)` workers (`std::thread::scope`),
-    /// each owning exactly one dedicated token through its own
-    /// [`crate::github::Client`] — no shared mutable token state, no
-    /// contention. The repositories are distributed through a
-    /// `std::sync::mpsc` work queue: every worker pulls the next repository
-    /// from the channel until it is drained. The mono-repository /
-    /// mono-profile scans stay sequential.
-    ///
-    /// An anonymous scan (no token) runs a single worker on the shared
-    /// anonymous quota. A worker whose dedicated token runs dry
-    /// ([`Error::RateLimitExhausted`]) or is rejected by the API (HTTP 401 on
-    /// a revoked/invalid token) stops pulling work but does not fail the
-    /// scan: the other workers' tokens keep draining the queue and the
-    /// emails found so far are returned. A repository that cannot be scanned
-    /// on its own (404 of a stale search-index entry, 403 of a private
-    /// repository or a token without the right scope, 409 of an empty
-    /// repository) is skipped with a warning and does not stop the worker:
-    /// the failure is resource-scoped, the token stays valid for the
-    /// remaining repositories. Any other worker error aborts the whole scan,
-    /// as the sequential scan did.
-    ///
-    /// # Errors
-    ///
-    /// A scan-wide failure aborts the scan, while a dead dedicated token
-    /// alone does not (the parallel scan keeps the emails found so far).
-    /// `skip_transient` decides how a transport-level failure (a connection
-    /// refused or dropped, a timeout) is classified: `true` skips the one
-    /// repository with a warning (the search fan-out keeps going over a
-    /// network hiccup), `false` aborts the scan (the complete-report
-    /// contracts — `org` — can never silently miss a whole repository).
-    /// Never panics.
-    pub(crate) fn scan_repositories_at(
-        &self,
-        base: &str,
-        repositories: &[SearchHit],
-        skip_transient: bool,
-    ) -> ParallelScan {
-        if repositories.is_empty() {
-            return Ok((
-                Vec::new(),
-                BTreeMap::new(),
-                0,
-                0,
-                Correlation::default(),
-                false,
-                None,
-            ));
-        }
-        let tokens = self.client.tokens();
-        // Each worker is dedicated the next *live* token when any token is
-        // live (see [`TokenPool::live_indices`]): a token the listing phase
-        // retired or parked must not own a worker slot while healthy tokens
-        // sit beyond the worker range — with fewer listed repositories than
-        // tokens, every spawned worker could otherwise own a dead token and
-        // abort the whole scan without a single request. When every token is
-        // dead (or the pool is anonymous) the positional assignment is kept:
-        // the all-dead fallback still spawns the documented worker count so
-        // the reduction fails loudly with [`Error::RateLimitExhausted`]
-        // instead of silently reporting an empty scan, and the anonymous
-        // pool (no tokens at all) keeps its single shared-quota worker.
-        let live = tokens.live_indices();
-        let workers = worker_count(
-            if live.is_empty() {
-                tokens.len()
-            } else {
-                live.len()
-            },
-            repositories.len(),
-        );
-
-        // work queue: every repository hit is sent once, then the sender is
-        // dropped, so `recv` returns `Err` once the queue is drained — the
-        // workers' natural stop signal
-        let (work_tx, work_rx) = mpsc::channel::<SearchHit>();
-        for hit in repositories {
-            if work_tx.send(hit.clone()).is_err() {
-                break;
-            }
-        }
-        drop(work_tx);
-        let work_rx = Arc::new(Mutex::new(work_rx));
-
-        let (result_tx, result_rx) = mpsc::channel::<WorkerReport>();
-        // set as soon as a worker fails, so the others stop pulling work
-        let aborted = AtomicBool::new(false);
-
-        std::thread::scope(|scope| {
-            // shared state, borrowed by every worker closure
-            let work_rx = &work_rx;
-            let aborted = &aborted;
-            for worker in 0..workers {
-                // the `worker`-th live token when any token is live; the
-                // positional token otherwise (the all-dead fallback keeps
-                // the loud all-workers-dead reduction). `None` is the
-                // anonymous quota (no tokens at all)
-                let assigned = live.get(worker).copied().unwrap_or(worker);
-                let dedicated_token = tokens.dedicated_token(assigned);
-                // a dedicated token the shared client retired or parked
-                // during the listing phase never spawns a worker doomed to
-                // a dead first request: the worker reports the death without
-                // pulling (and doomed-losing) a repository from the queue.
-                // An anonymous quota the listing phase retired or parked is
-                // guarded the same way (its worker owns no dedicated token,
-                // so it must consult the shared anonymous index)
-                let start_dead = match dedicated_token {
-                    Some(_) => tokens.is_exhausted(assigned),
-                    None => tokens.is_exhausted(crate::github::client::ANONYMOUS_INDEX),
-                };
-                let worker_tx = result_tx.clone();
-                // `Builder::spawn_scoped` instead of `scope.spawn`: the OS
-                // refusing the thread creation must degrade to a reported
-                // failure, not panic out of the documented never-panic
-                // contract
-                match std::thread::Builder::new().spawn_scoped(scope, move || {
-                    let report = Self::scan_worker_queue(
-                        dedicated_token,
-                        base,
-                        work_rx,
-                        aborted,
-                        start_dead,
-                        skip_transient,
-                    );
-                    let _ = worker_tx.send(report);
-                }) {
-                    Ok(_handle) => {}
-                    Err(_) => {
-                        // no thread for this worker: report the prepared
-                        // failure, so the reduction still receives exactly
-                        // one report per worker instead of hanging on a
-                        // missing one
-                        let _ = result_tx.send(WorkerReport {
-                            emails: Vec::new(),
-                            requests: 0,
-                            repos_scanned: 0,
-                            skipped: 0,
-                            contributions: Vec::new(),
-                            failure: Some(Error::WorkerFailed(
-                                "the OS refused to spawn a scan worker".to_string(),
-                            )),
-                            token_died: false,
-                        });
-                    }
-                }
-            }
-        });
-        drop(result_tx); // the scope joined every worker: no more reports
-
-        // every worker sent exactly one report
-        let reports: Vec<WorkerReport> = (0..workers)
-            .map(|_| {
-                result_rx.recv().unwrap_or_else(|_| WorkerReport {
-                    emails: Vec::new(),
-                    requests: 0,
-                    repos_scanned: 0,
-                    skipped: 0,
-                    contributions: Vec::new(),
-                    failure: Some(Error::WorkerFailed(
-                        "scan worker did not report".to_string(),
-                    )),
-                    token_died: false,
-                })
-            })
-            .collect();
-        let (
-            result,
-            per_repository,
-            worker_requests,
-            repos_scanned,
-            skipped,
-            correlation,
-            partial,
-            death_error,
-        ) = reduce_worker_reports(reports);
-        self.add_worker_requests(worker_requests);
-        // the partial flag's documented meaning is "whole listed repositories
-        // may have been left unscanned" (`scanned.partial` in the JSON
-        // report): when the surviving workers fully drained the queue —
-        // every listed repository was scanned or warn-skipped — the token
-        // death lost no repository, and a complete report must not carry a
-        // false truncation alarm. The judgment is made here where the
-        // listing size is known (the reducers do not see it); the `org`
-        // caller aborts on any token death instead of judging coverage
-        let partial = partial && repos_scanned + skipped < repositories.len();
-        result.map(|emails| {
-            (
-                emails,
-                per_repository,
-                repos_scanned,
-                skipped,
-                correlation,
-                partial,
-                death_error,
-            )
-        })
-    }
-
-    /// Worker body: owns one dedicated token through its own
-    /// client, pulls the next repository from the shared `mpsc` work queue
-    /// and scans it, until the queue is drained or another worker failed.
-    /// Returns everything it found, the per-author contributions of the
-    /// repositories it scanned (issue #5), how many successful requests its
-    /// client made and, when it hit one, the failure that ended it.
-    fn scan_worker_queue(
-        dedicated_token: Option<&str>,
-        base: &str,
-        work_rx: &Arc<Mutex<mpsc::Receiver<SearchHit>>>,
-        aborted: &AtomicBool,
-        start_dead: bool,
-        skip_transient: bool,
-    ) -> WorkerReport {
-        let client = match Self::worker_client(dedicated_token) {
-            Ok(client) => client,
-            Err(err) => {
-                return WorkerReport {
-                    emails: Vec::new(),
-                    requests: 0,
-                    repos_scanned: 0,
-                    skipped: 0,
-                    contributions: Vec::new(),
-                    failure: Some(err),
-                    token_died: false,
-                };
-            }
-        };
-        if start_dead {
-            // the dedicated token was already unusable when the worker
-            // spawned: report the death without pulling a repository, so the
-            // other workers cover the whole queue instead of one repository
-            // being lost to a doomed request
-            return WorkerAccum::default().finish(&client, Some(Error::RateLimitExhausted), true);
-        }
-        let mut accum = WorkerAccum::default();
-
-        loop {
-            // stop pulling work as soon as any worker failed fatally: the
-            // scan is going to error out anyway
-            if aborted.load(Ordering::Relaxed) {
-                break;
-            }
-            // the mutex only guards pulling one hit off the channel; the
-            // queue is fully populated upfront, so `recv` never blocks long
-            let hit = {
-                let Ok(receiver) = work_rx.lock() else {
-                    break; // poisoned queue: stop pulling work
-                };
-                receiver.recv().ok() // `None` once the queue is drained
-            };
-            let Some(hit) = hit else {
-                break; // the shared queue is empty: this worker is done
-            };
-            // keep the URL around for the skip warning: the parser helpers
-            // take it by value
-            let repository_url = hit.url.clone();
-            // a listing-derived URL the parsers reject (a hostile or
-            // truncated entry) is scoped to this entry: skip it with a
-            // warning like any resource-scoped failure, never abort the
-            // whole scan for one malformed listing line (the same
-            // warn-and-count rule the org listing applies to its entries;
-            // transport and scan failures below still abort)
-            let author = match parsers::get_author(repository_url.clone()) {
-                Ok(author) => author,
-                Err(err) => {
-                    log::warn!(
-                        "skipping repository {}: {}",
-                        log_safe(&repository_url),
-                        log_safe(&err.to_string())
-                    );
-                    accum.skipped += 1;
-                    continue;
-                }
-            };
-            let repository = match parsers::get_repository(repository_url.clone()) {
-                Ok(repository) => repository,
-                Err(err) => {
-                    log::warn!(
-                        "skipping repository {}: {}",
-                        log_safe(&repository_url),
-                        log_safe(&err.to_string())
-                    );
-                    accum.skipped += 1;
-                    continue;
-                }
-            };
-            let scan = match super::repository::scan_repository(&client, base, &author, &repository)
-            {
-                Ok(scan) => scan,
-                Err(err) => match classify_failure(&err, skip_transient) {
-                    // this worker's dedicated token budget is its own: once
-                    // it dies the worker stops pulling work, but the other
-                    // workers' tokens keep draining the queue, so the failure
-                    // is not fatal and the emails found so far are kept
-                    FailureAction::TokenDied => {
-                        return accum.finish(&client, Some(err), true);
-                    }
-                    // the failure is scoped to this repository (deleted,
-                    // private, token without the right scope): skip it like
-                    // the profile fallback does, the token stays valid for
-                    // the remaining repositories. The skip is counted so a
-                    // caller with a complete-report contract can tell a
-                    // covered repository from one that was never scanned
-                    FailureAction::SkipRepository => {
-                        // the URL and the error text are API-derived: they
-                        // are sanitized like every other log site, so a
-                        // hostile payload can never forge or recolor a log
-                        // line
-                        log::warn!(
-                            "skipping repository {}: {}",
-                            log_safe(&repository_url),
-                            log_safe(&err.to_string())
-                        );
-                        accum.skipped += 1;
-                        continue;
-                    }
-                    FailureAction::AbortScan => {
-                        aborted.store(true, Ordering::Relaxed);
-                        return accum.finish(&client, Some(err), false);
-                    }
-                },
-            };
-            accum.absorb(scan, &author, &repository, hit.language);
-        }
-        accum.finish(&client, None, false)
-    }
-
-    /// Builds the client a worker exclusively owns for its dedicated token
-    /// (single-token pool, no shared state); an anonymous scan (no token)
-    /// runs one worker on the shared anonymous quota.
-    pub(crate) fn worker_client(
-        dedicated_token: Option<&str>,
-    ) -> Result<crate::github::Client, Error> {
-        match dedicated_token {
-            Some(token) => crate::github::Client::new(crate::github::TokenPool::from_token(token)?),
-            None => crate::github::Client::anonymous(),
-        }
-    }
-}
-
-/// What a scan worker must do when scanning one repository fails.
-enum FailureAction {
-    /// The worker's token died (spent quota, or the token rejected by the
-    /// API with nothing to rotate to): stop the worker, keep its findings,
-    /// let the other tokens drain the queue.
-    TokenDied,
-    /// The failure is scoped to this repository only (a 404 of a stale
-    /// search-index entry, a 403 for a private repository or a token without
-    /// the right scope, or the 409 of an empty repository — GitHub answers
-    /// 409 Conflict on `/commits` when the repository has no commits): skip
-    /// it and keep pulling work. A 403 is resource-scoped, not token-scoped:
-    /// with a fine-grained PAT or one inaccessible repository among the
-    /// results, the token stays valid for the remaining repositories.
-    SkipRepository,
-    /// Unexpected failure: abort the whole scan.
-    AbortScan,
-}
-
-/// Classifies a repository scan failure. An HTTP 403 maps to
-/// [`Error::PrivateOrUnavailable`] and is skipped, not treated as a dead
-/// token: only a token-scoped death ([`Error::RateLimitExhausted`], or
-/// [`Error::TokenRejected`] — the API refused the token itself; tokens are
-/// only format-validated at startup) stops the worker.
-fn classify_failure(err: &Error, skip_transient: bool) -> FailureAction {
-    match err {
-        Error::RateLimitExhausted | Error::TokenRejected => FailureAction::TokenDied,
-        Error::NotFound | Error::PrivateOrUnavailable | Error::EmptyRepository => {
-            FailureAction::SkipRepository
-        }
-        // A transport-level error (connection refused or dropped, timeout)
-        // is transient. For the search fan-out it skips the one repository
-        // with a warning: the other workers and the findings already made
-        // survive a one-second network hiccup, and the skip is counted and
-        // logged. A complete-report caller (`org`) keeps the documented
-        // contract instead: a transport failure aborts, so its report can
-        // never silently miss whole repositories.
-        Error::Http(http)
-            if skip_transient
-                && http.status().is_none()
-                && (http.is_connect() || http.is_timeout() || http.is_request()) =>
-        {
-            FailureAction::SkipRepository
-        }
-        _ => FailureAction::AbortScan,
-    }
-}
-
-/// What one worker accumulated across the repositories it pulled off the
-/// shared queue: the merged email list, the per-author contributions, the
-/// scan/skip counters.
-#[derive(Default)]
-struct WorkerAccum {
-    emails: Vec<String>,
-    contributions: Vec<RepoContribution>,
-    repos_scanned: usize,
-    skipped: usize,
-}
-
-impl WorkerAccum {
-    /// Merges one scanned repository into the accumulation.
-    fn absorb(&mut self, scan: RepoScan, author: &str, repository: &str, language: Option<String>) {
-        merge_emails(&mut self.emails, scan.emails);
-        self.contributions.push(RepoContribution {
-            name: format!("{author}/{repository}"),
-            language,
-            authors: scan.authors,
-        });
-        self.repos_scanned += 1;
-    }
-
-    /// Bundles what a worker found, the per-author contributions of its
-    /// scanned repositories (issue #5), how many requests its client made,
-    /// how many repositories it fully scanned, how many it warn-skipped as
-    /// resource-scoped and the failure that ended it (if any) into its
-    /// final report.
-    fn finish(
-        self,
-        client: &crate::github::Client,
-        failure: Option<Error>,
-        token_died: bool,
-    ) -> WorkerReport {
-        WorkerReport::new(
-            client,
-            self.emails,
-            self.contributions,
-            self.repos_scanned,
-            self.skipped,
-            failure,
-            token_died,
-        )
-    }
-}
-
-/// What one scan worker reports back: the emails it found, the per-author
-/// contributions of the repositories it scanned (issue #5), how many
-/// successful requests its client made, how many repositories it fully
-/// scanned, and the failure that ended it (if any) — a worker keeps its
-/// partial findings even when it failed.
-struct WorkerReport {
-    emails: Vec<String>,
-    requests: usize,
-    /// Repositories this worker fully scanned: even a worker whose token
-    /// died mid-scan may have made real progress that must not be thrown
-    /// away with its failure.
-    repos_scanned: usize,
-    /// Repositories this worker warn-skipped as resource-scoped (deleted,
-    /// private, token without the right scope, empty): covered work that a
-    /// caller with a complete-report contract must count as covered, not as
-    /// work never pulled.
-    skipped: usize,
-    /// The per-author contributions of the scanned repositories (issue #5).
-    contributions: Vec<RepoContribution>,
-    failure: Option<Error>,
-    /// Whether the failure ended the worker because its own dedicated token
-    /// died (spent quota or rejected token) rather than a scan-wide error:
-    /// the other workers' tokens can keep draining the queue.
-    token_died: bool,
-}
-impl WorkerReport {
-    fn new(
-        client: &crate::github::Client,
-        emails: Vec<String>,
-        contributions: Vec<RepoContribution>,
-        repos_scanned: usize,
-        skipped: usize,
-        failure: Option<Error>,
-        token_died: bool,
-    ) -> Self {
-        Self {
-            emails,
-            requests: client.requests_made(),
-            repos_scanned,
-            skipped,
-            contributions,
-            failure,
-            token_died,
-        }
-    }
-}
-
-/// Reduces the workers' reports into the scan result, the emails found per
-/// repository (derived from the per-repository contributions before they
-/// feed the correlation report, which merges authors across repositories),
-/// the total number of successful requests they made, the total number of
-/// repositories they actually scanned (the JSON report must not overstate
-/// coverage by counting repositories that were skipped or never pulled), the
-/// total number of repositories they warn-skipped as resource-scoped and the
-/// per-author correlation report built from their contributions (issue #5).
-///
-/// A worker whose dedicated token died ([`Error::RateLimitExhausted`], or a
-/// rejected token) does not fail the scan: the other workers' tokens keep
-/// draining the queue and the emails found so far are returned (possibly
-/// partial). Any other failure aborts the scan, as does a token death with
-/// no worker left having made any progress (single anonymous worker, or
-/// every token dead before scanning anything).
-fn reduce_worker_reports(reports: Vec<WorkerReport>) -> ReducedReports {
-    let mut found_emails: Vec<String> = Vec::new();
-    let mut per_repository: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut requests = 0usize;
-    let mut repos_scanned = 0usize;
-    let mut skipped = 0usize;
-    let mut correlation = CorrelationBuilder::new();
-    let mut failure: Option<Error> = None;
-    let mut failure_is_token_death = false;
-    let mut only_token_deaths = true;
-    let mut any_progress = false;
-    let mut partial_token_death = false;
-    for report in reports {
-        // the per-repository emails are derived from the contributions
-        // before the correlation builder consumes them: the correlation
-        // merges an author across repositories, which would lose which
-        // email was used where
-        for contribution in &report.contributions {
-            let entry = per_repository.entry(contribution.name.clone()).or_default();
-            for author in &contribution.authors {
-                if !entry.contains(&author.email) {
-                    entry.push(author.email.clone());
-                }
-            }
-        }
-        merge_emails(&mut found_emails, report.emails);
-        requests += report.requests;
-        repos_scanned += report.repos_scanned;
-        skipped += report.skipped;
-        correlation.add_all(report.contributions);
-        // a worker that scanned at least one repository made real progress,
-        // even if its token died on a later request: its findings must not
-        // be discarded with its failure
-        any_progress = any_progress || report.repos_scanned > 0 || report.failure.is_none();
-        if let Some(err) = report.failure {
-            if !report.token_died {
-                only_token_deaths = false;
-            }
-            // first-arrival attribution can misreport the scan-wide cause
-            // when a token death and a genuine abort-class failure coexist:
-            // a non-token-death failure is the more informative one, so it
-            // replaces an already-recorded token death
-            if failure.is_none() || (failure_is_token_death && !report.token_died) {
-                failure = Some(err);
-                failure_is_token_death = report.token_died;
-            }
-        }
-    }
-    let mut death_error = None;
-    let result = match failure {
-        // every failure is a dead dedicated token and at least one worker
-        // made progress on its own token: return the (possibly partial)
-        // result instead of throwing the work away
-        Some(err) if only_token_deaths && any_progress => {
-            log::warn!(
-                "one token ran out or was refused mid-scan: results may be incomplete. The JSON report marks the run \"scanned.partial\" only when a listed repository was left unscanned"
-            );
-            partial_token_death = true;
-            death_error = Some(err);
-            Ok(found_emails)
-        }
-        Some(err) => Err(err),
-        None => Ok(found_emails),
-    };
-    // deterministic order inside every per-repository list, and no noise
-    // entry for a repository whose commits held no usable email
-    for emails in per_repository.values_mut() {
-        sort_emails(emails);
-    }
-    per_repository.retain(|_, emails| !emails.is_empty());
-    (
-        result,
-        per_repository,
-        requests,
-        repos_scanned,
-        skipped,
-        correlation.finish(),
-        partial_token_death,
-        death_error,
-    )
-}
-
-/// How many workers scan the repositories: one per available
-/// token, capped by the number of repositories; an anonymous scan (no token)
-/// runs a single worker on the shared anonymous quota.
-pub(crate) fn worker_count(tokens: usize, repositories: usize) -> usize {
-    tokens.max(1).min(repositories)
-}
-
 #[cfg(test)]
 mod tests {
     // Tests may unwrap, expect and panic freely: a failing assertion must
@@ -1169,7 +602,8 @@ mod tests {
     use super::*;
     use crate::github::fetch_paginated;
     use crate::github::mock;
-    use std::sync::Arc;
+    use crate::github::pool::worker_count;
+    use std::sync::{Arc, Mutex};
 
     /// A full page of 100 commits all attributing the same `(name, email)`
     /// pair: the page-size-aware commit listing only ends on a short page,
@@ -1562,15 +996,15 @@ mod tests {
                 { "html_url": "https://github.com/b/two" }
             ]
         });
-        let (hits, raw_count) = parse_search_page(&json).expect("parsing must succeed");
+        let (hits, raw_count) = parse_search_page(&json, false).expect("parsing must succeed");
         assert_eq!(
             hits,
             vec![
-                SearchHit {
+                RepoHit {
                     url: "https://github.com/a/one".to_string(),
                     language: Some("Rust".to_string()),
                 },
-                SearchHit {
+                RepoHit {
                     url: "https://github.com/b/two".to_string(),
                     language: None,
                 },
@@ -1593,11 +1027,11 @@ mod tests {
                 { "other": true }
             ]
         });
-        let (outcome, lines) = crate::test_logger::capture(|| parse_search_page(&json));
+        let (outcome, lines) = crate::test_logger::capture(|| parse_search_page(&json, false));
         let (hits, raw_count) = outcome.expect("parsing must succeed");
         assert_eq!(
             hits,
-            vec![SearchHit {
+            vec![RepoHit {
                 url: "https://github.com/a/one".to_string(),
                 language: Some("Rust".to_string()),
             }]
@@ -1616,7 +1050,7 @@ mod tests {
         // GitHub returns {"items": null} for a rejected search: parsed as an
         // empty page, it ends the listing instead of erroring
         let json: Value = serde_json::json!({ "items": null });
-        let (hits, raw_count) = parse_search_page(&json).expect("parsing must succeed");
+        let (hits, raw_count) = parse_search_page(&json, false).expect("parsing must succeed");
         assert!(hits.is_empty());
         assert_eq!(raw_count, 0, "no raw item: the listing ends");
     }
@@ -1631,8 +1065,8 @@ mod tests {
             serde_json::json!("[]"),
             serde_json::json!([]),
         ] {
-            let error =
-                parse_search_page(&body).expect_err("a payload without items must fail explicitly");
+            let error = parse_search_page(&body, false)
+                .expect_err("a payload without items must fail explicitly");
             assert!(matches!(error, Error::InvalidProfile(details) if details.contains("items")));
         }
     }
@@ -1647,8 +1081,8 @@ mod tests {
             serde_json::json!({"items": 42}),
             serde_json::json!({"items": "x"}),
         ] {
-            let error =
-                parse_search_page(&body).expect_err("a non-array items must fail explicitly");
+            let error = parse_search_page(&body, false)
+                .expect_err("a non-array items must fail explicitly");
             assert!(matches!(error, Error::InvalidProfile(details) if details.contains("array")));
         }
     }
@@ -1661,6 +1095,104 @@ mod tests {
         // an anonymous scan runs a single worker on the shared quota
         assert_eq!(worker_count(0, 5), 1);
         assert_eq!(worker_count(0, 0), 0);
+    }
+
+    #[test]
+    fn a_forked_search_entry_is_skipped_with_a_warning_and_the_opt_in_scans_it() {
+        // GitHub's repository search includes forks: like the `user` and
+        // `org` listings, a fork is skipped with a warning (its commits
+        // mirror the upstream history) unless the caller opted in — the
+        // flag's value must reach the PARSER, not just the scanner
+        let (address, server) = mock::serve_requests(move |_index, request| {
+            let line = request.first().map(String::as_str).unwrap_or("");
+            if line.contains("/search/repositories") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        r#"{"total_count": 2, "items": [{"html_url": "https://github.com/a/forked", "fork": true}, {"html_url": "https://github.com/a/one"}]}"#.to_string(),
+                    ),
+                    _ => (200, vec![], r#"{"items": null}"#.to_string()),
+                };
+            }
+            if line.contains("/repos/a/one/commits") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        format!(
+                            "[{}]",
+                            r#"{"sha": "abc", "commit": {"author": {"name": "Alice", "email": "alice@acme.com"}}}"#
+                        ),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            if line.contains("/repos/a/forked/commits") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        r#"[{"sha": "def", "commit": {"author": {"name": "Forker", "email": "forker@example.com"}}}]"#.to_string(),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            (404, vec![], String::new())
+        });
+
+        let scanner =
+            crate::sources::Scanner::new(None, None).expect("anonymous scanner must build");
+
+        // default: the fork is skipped with the remedy-naming warning
+        let (outcome, lines) = crate::test_logger::capture(|| {
+            aggregate_search_at(
+                &scanner,
+                &address,
+                "nmap",
+                "",
+                &SearchQualifiers::default(),
+                5,
+                false,
+            )
+        });
+        let outcome = outcome.expect("the fork-free search must succeed");
+        assert_eq!(outcome.repos_scanned, 1);
+        assert!(
+            outcome.emails == vec!["alice@acme.com".to_string()],
+            "the fork's upstream emails must not reach the default report"
+        );
+        assert!(
+            lines.iter().any(|line| {
+                line.contains("1 forked repository skipped (their history is upstream's): pass --include-forks to scan them")
+            }),
+            "the fork skip must name the remedy: {lines:?}"
+        );
+
+        // opt-in: the fork is scanned like any other repository
+        let (outcome, lines) = crate::test_logger::capture(|| {
+            aggregate_search_at(
+                &scanner,
+                &address,
+                "nmap",
+                "",
+                &SearchQualifiers::default(),
+                5,
+                true,
+            )
+        });
+        let outcome = outcome.expect("the opted-in search must succeed");
+        server.join();
+
+        assert_eq!(outcome.repos_scanned, 2);
+        assert!(
+            outcome.emails.contains(&"forker@example.com".to_string()),
+            "the opted-in run must scan the fork: {outcome:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("forked repo")),
+            "nothing was skipped: no fork warning may fire: {lines:?}"
+        );
     }
 
     #[test]
@@ -1706,6 +1238,7 @@ mod tests {
             "",
             &SearchQualifiers::default(),
             5,
+            false,
         )
         .expect("a short final page must end the listing without a 422");
         // both collected hits were scanned (the mock's commit listings are
@@ -1752,6 +1285,7 @@ mod tests {
                 "",
                 &SearchQualifiers::default(),
                 5,
+                false,
             )
         });
         let outcome = outcome.expect("one malformed entry must not abort the scan");
@@ -1818,6 +1352,7 @@ mod tests {
                 "",
                 &SearchQualifiers::default(),
                 5000,
+                false,
             )
         });
         outcome
@@ -1863,6 +1398,7 @@ mod tests {
                 "",
                 &SearchQualifiers::default(),
                 1001,
+                false,
             )
         });
         outcome.expect("the capped search must succeed");
@@ -1881,6 +1417,7 @@ mod tests {
                 "",
                 &SearchQualifiers::default(),
                 1000,
+                false,
             )
         });
         assert!(!lines.iter().any(|line| line.contains("1000-result limit")));
@@ -1912,6 +1449,7 @@ mod tests {
             "",
             &SearchQualifiers::default(),
             5,
+            false,
         )
         .expect_err("a query the API rejected must fail the search");
         // the rejection is the crafted error: a typo'd --user/--org login or
@@ -1964,6 +1502,138 @@ mod tests {
             crate::sources::Scanner::new(None, None).expect("anonymous scanner must build");
         // a limit above one page keeps the walk alive past the full page 1,
         // where the mock answers the documented out-of-window 422
+        let (outcome, lines) = crate::test_logger::capture(|| {
+            aggregate_search_at(
+                &scanner,
+                &address,
+                "nmap",
+                "",
+                &SearchQualifiers::default(),
+                101,
+                false,
+            )
+        });
+        let outcome = outcome.expect("a mid-walk 422 must end the search, not abort it");
+
+        // the fallback discarded the collected hits: an empty (warned-about)
+        // listing, not a scan-wide failure — and the discard is NAMED with
+        // its count (a deleted or garbled warn must fail this test)
+        assert_eq!(outcome.repos_scanned, 0);
+        assert!(outcome.emails.is_empty());
+        assert!(!outcome.partial);
+        assert!(
+            lines.iter().any(|line| {
+                line.contains("search stopped at GitHub's 1000-result limit: 100 already-found repositories were dropped")
+            }),
+            "the discard warning must name the dropped count: {lines:?}"
+        );
+        // exactly two search pages were requested, no repository scan
+        assert_eq!(server.join(), 2);
+    }
+
+    #[test]
+    fn a_full_page_of_forks_still_advances_the_listing() {
+        // the raw count feeds the pagination contract: a page of PER_PAGE
+        // SKIPPED forks must still read as a full page, or the walk would
+        // end early and the page-2 non-fork repository would never be
+        // scanned (pin against a regression to the parsed-hits count)
+        let forks = (0..PER_PAGE)
+            .map(|i| format!(r#"{{"html_url": "https://github.com/a/fork{i}", "fork": true}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let fork_line = format!(
+            r#"{{"total_count": {}, "items": [{}]}}"#,
+            PER_PAGE + 1,
+            forks
+        );
+        let (address, _server) = mock::serve_requests(move |_index, request| {
+            let line = request.first().map(String::as_str).unwrap_or("");
+            if line.contains("/search/repositories") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (200, vec![], fork_line.clone()),
+                    2 => (
+                        200,
+                        vec![],
+                        r#"{"total_count": 101, "items": [{"html_url": "https://github.com/a/one"}]}"#.to_string(),
+                    ),
+                    _ => (200, vec![], r#"{"total_count": 101, "items": []}"#.to_string()),
+                };
+            }
+            if line.contains("/repos/a/one/commits") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        r#"[{"sha": "abc", "commit": {"author": {"name": "Alice", "email": "alice@acme.com"}}}]"#.to_string(),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            (404, vec![], String::new())
+        });
+
+        let scanner =
+            crate::sources::Scanner::new(None, None).expect("anonymous scanner must build");
+        let (outcome, lines) = crate::test_logger::capture(|| {
+            aggregate_search_at(
+                &scanner,
+                &address,
+                "nmap",
+                "",
+                &SearchQualifiers::default(),
+                150,
+                false,
+            )
+        });
+        let outcome = outcome.expect("the full-fork-page walk must reach page 2");
+        assert_eq!(
+            outcome.repos_scanned, 1,
+            "page 2's non-fork repository must be scanned despite a full page of skipped forks"
+        );
+        assert!(
+            outcome.emails == vec!["alice@acme.com".to_string()],
+            "unexpected emails: {outcome:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("forked repositories skipped")),
+            "the full-fork-page warning must name the remedy: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_fully_malformed_page_followed_by_a_window_422_is_not_a_page1_rejection() {
+        // the raw-count seam rule (the same trap `fetch_external_hits`
+        // documents): the classifier must see the RAW item count, not the
+        // parsed hits, or a page whose every entry is malformed followed by
+        // a window 422 would be misclassified as a page-1 rejection and
+        // abort a healthy search with a "query rejected" lie
+        let (address, server) = mock::serve_requests(move |_index, request| {
+            let line = request.first().map(String::as_str).unwrap_or("");
+            if line.contains("/search/repositories") {
+                if crate::github::mock::request_line_page(request) > 1 {
+                    return (
+                        422,
+                        vec![],
+                        r#"{"message": "Only the first 1000 search results are available"}"#
+                            .to_string(),
+                    );
+                }
+                // a full page whose every entry lacks `html_url`: zero
+                // parsed hits, but 100 RAW items
+                let items: Vec<String> = (0..100).map(|i| format!(r#"{{"id": {i}}}"#)).collect();
+                return (
+                    200,
+                    vec![],
+                    format!(r#"{{"items": [{}]}}"#, items.join(",")),
+                );
+            }
+            (404, vec![], String::new())
+        });
+
+        let scanner =
+            crate::sources::Scanner::new(None, None).expect("anonymous scanner must build");
         let outcome = aggregate_search_at(
             &scanner,
             &address,
@@ -1971,16 +1641,105 @@ mod tests {
             "",
             &SearchQualifiers::default(),
             101,
+            false,
         )
-        .expect("a mid-walk 422 must end the search, not abort it");
+        .expect("raw items were collected: a window 422 must not surface as a page-1 rejection");
 
-        // the fallback discarded the collected hits: an empty (warned-about)
-        // listing, not a scan-wide failure
+        // the Cut arm ran (warn + end of listing), not the Reject arm; and
+        // exactly two search pages were requested
         assert_eq!(outcome.repos_scanned, 0);
         assert!(outcome.emails.is_empty());
-        assert!(!outcome.partial);
-        // exactly two search pages were requested, no repository scan
         assert_eq!(server.join(), 2);
+    }
+
+    #[test]
+    fn reaching_the_search_ceiling_on_the_normal_path_warns_about_the_truncation() {
+        // the honesty rule of the caps: a listing that fills the entire
+        // documented search window (exactly the ceiling) must say so even
+        // when no 422 ever fires — the identical seam
+        // (`fetch_external_hits`) warns on its normal cap path
+        let (address, server) = mock::serve_requests(move |_index, request| {
+            let line = request.first().map(String::as_str).unwrap_or("");
+            if line.contains("/search/repositories") {
+                let items: Vec<String> = (0..100)
+                    .map(|i| format!(r#"{{"html_url": "https://github.com/a/rep-{i}"}}"#))
+                    .collect();
+                return (
+                    200,
+                    vec![],
+                    format!(r#"{{"items": [{}]}}"#, items.join(",")),
+                );
+            }
+            (404, vec![], String::new())
+        });
+
+        let scanner =
+            crate::sources::Scanner::new(None, None).expect("anonymous scanner must build");
+        // 10 full pages of 100: the listing ends exactly at the ceiling
+        let (hits, lines) = crate::test_logger::capture(|| {
+            fetch_search_hits(
+                scanner.client(),
+                &address,
+                "nmap",
+                "",
+                &SearchQualifiers::default(),
+                SEARCH_RESULT_CEILING,
+                false,
+            )
+        });
+        let hits = hits.expect("the capped listing must complete");
+        server.join();
+
+        assert_eq!(hits.len(), SEARCH_RESULT_CEILING);
+        assert!(
+            lines
+                .iter()
+                .any(|line| { line.contains("cut at GitHub's documented 1000-result window") }),
+            "the normal-path ceiling warning must fire: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_limit_below_the_ceiling_never_fires_the_documented_window_warning() {
+        // the user's own --limit is not a truncation: a default-size run
+        // (--limit 5) collecting exactly 5 matches must stay silent (the
+        // warning names GitHub's documented window, never the passed limit)
+        let (address, server) = mock::serve_requests(move |_index, request| {
+            let line = request.first().map(String::as_str).unwrap_or("");
+            if line.contains("/search/repositories") {
+                let items: Vec<String> = (0..5)
+                    .map(|i| format!(r#"{{"html_url": "https://github.com/a/rep-{i}"}}"#))
+                    .collect();
+                return (
+                    200,
+                    vec![],
+                    format!(r#"{{"items": [{}]}}"#, items.join(",")),
+                );
+            }
+            (404, vec![], String::new())
+        });
+
+        let scanner =
+            crate::sources::Scanner::new(None, None).expect("anonymous scanner must build");
+        let (hits, lines) = crate::test_logger::capture(|| {
+            fetch_search_hits(
+                scanner.client(),
+                &address,
+                "nmap",
+                "",
+                &SearchQualifiers::default(),
+                5,
+                false,
+            )
+        });
+        let hits = hits.expect("the short listing must complete");
+        server.join();
+
+        assert_eq!(hits.len(), 5);
+        assert!(
+            !lines.iter().any(|line| line.contains("documented")),
+            "a user-chosen --limit is not a truncation: no window warning: {lines:?}"
+        );
     }
 
     #[test]
@@ -2019,23 +1778,25 @@ mod tests {
         let scanner = Scanner::new(None, Some(&token_path)).expect("scanner must build");
         std::fs::remove_file(&token_path).ok();
 
-        let hits: Vec<SearchHit> = ["one", "two", "three"]
+        let hits: Vec<RepoHit> = ["one", "two", "three"]
             .into_iter()
-            .map(|repo| SearchHit {
+            .map(|repo| RepoHit {
                 url: format!("https://github.com/a/{repo}"),
                 language: None,
             })
             .collect();
-        let (emails, _, repos_scanned, _, _, _, _) = scanner
+        let scan = scanner
             .scan_repositories_at(&address, &hits, true)
             .expect("one revoked token must not abort the scan");
+        let emails = &scan.emails;
+        let repos_scanned = scan.repos_scanned;
 
         // the revoked token's repository was left unscanned, the two healthy
         // ones were scanned and kept their emails
         assert_eq!(repos_scanned, 2);
         assert_eq!(
             emails,
-            vec!["bob@x.com".to_string(), "carol@x.com".to_string()]
+            &vec!["bob@x.com".to_string(), "carol@x.com".to_string()]
         );
         // the 401ing repository's single doomed request, plus both pages of
         // each healthy repository's commit listing
@@ -2089,16 +1850,17 @@ mod tests {
         // the shared client spent the first token during the listing phase
         scanner.client().tokens().mark_exhausted(0);
 
-        let hits: Vec<SearchHit> = ["one", "two"]
+        let hits: Vec<RepoHit> = ["one", "two"]
             .into_iter()
-            .map(|repo| SearchHit {
+            .map(|repo| RepoHit {
                 url: format!("https://github.com/a/{repo}"),
                 language: None,
             })
             .collect();
-        let (emails, _, repos_scanned, .., partial) = scanner
+        let scan = scanner
             .scan_repositories_at(&address, &hits, true)
             .expect("the live token must cover the whole queue");
+        let (emails, repos_scanned, partial) = (&scan.emails, scan.repos_scanned, scan.death_error);
         server.join();
 
         // the retired token's worker pulled nothing, so the live worker
@@ -2152,21 +1914,21 @@ mod tests {
         // the shared client spent the first token during the listing phase
         scanner.client().tokens().mark_exhausted(0);
 
-        let hits: Vec<SearchHit> = ["one"]
+        let hits: Vec<RepoHit> = ["one"]
             .into_iter()
-            .map(|repo| SearchHit {
+            .map(|repo| RepoHit {
                 url: format!("https://github.com/a/{repo}"),
                 language: None,
             })
             .collect();
-        let (emails, _, repos_scanned, .., partial) = scanner
+        let scan = scanner
             .scan_repositories_at(&address, &hits, true)
             .expect("the live token must scan the single listed repository");
         server.join();
 
-        assert_eq!(repos_scanned, 1);
-        assert_eq!(emails, vec!["alice@x.com".to_string()]);
-        assert!(partial.is_none());
+        assert_eq!(scan.repos_scanned, 1);
+        assert_eq!(scan.emails, vec!["alice@x.com".to_string()]);
+        assert!(scan.death_error.is_none());
     }
 
     #[test]
@@ -2211,23 +1973,23 @@ mod tests {
         // the shared client spent the first token during the listing phase
         scanner.client().tokens().mark_exhausted(0);
 
-        let hits: Vec<SearchHit> = ["one", "two", "three"]
+        let hits: Vec<RepoHit> = ["one", "two", "three"]
             .into_iter()
-            .map(|repo| SearchHit {
+            .map(|repo| RepoHit {
                 url: format!("https://github.com/a/{repo}"),
                 language: None,
             })
             .collect();
-        let (emails, _, repos_scanned, _, _, partial, _) = scanner
+        let scan = scanner
             .scan_repositories_at(&address, &hits, true)
             .expect("the kept partial result is returned");
         server.join();
 
         // one repository scanned, two left uncovered by the two dead tokens
-        assert_eq!(repos_scanned, 1);
-        assert_eq!(emails.len(), 1);
+        assert!(scan.partial);
+        assert_eq!(scan.emails.len(), 1);
         assert!(
-            partial,
+            scan.partial,
             "a token death that left listed repositories unscanned is a partial scan"
         );
     }
@@ -2262,24 +2024,23 @@ mod tests {
         let scanner =
             crate::sources::Scanner::new(None, None).expect("anonymous scanner must build");
         let hits = vec![
-            SearchHit {
+            RepoHit {
                 url: "https://github.com/a/hostile\u{1b}[31mname".to_string(),
                 language: None,
             },
-            SearchHit {
+            RepoHit {
                 url: "https://github.com/a/full".to_string(),
                 language: None,
             },
         ];
         let (outcome, lines) =
             crate::test_logger::capture(|| scanner.scan_repositories_at(&address, &hits, true));
-        let (emails, _, repos_scanned, _, _, _, _) =
-            outcome.expect("a resource-scoped failure must not abort the scan");
+        let scan = outcome.expect("a resource-scoped failure must not abort the scan");
         server.join();
 
         // the hostile repository was skipped, the healthy one scanned
-        assert_eq!(emails, vec!["alice@x.com".to_string()]);
-        assert_eq!(repos_scanned, 1);
+        assert_eq!(scan.emails, vec!["alice@x.com".to_string()]);
+        assert_eq!(scan.repos_scanned, 1);
         assert!(
             !lines.iter().any(|line| line.contains('\x1b')),
             "a hostile hit URL must not carry an ESC sequence into the log: {lines:?}"
@@ -2340,6 +2101,7 @@ mod tests {
             "",
             &SearchQualifiers::default(),
             5,
+            false,
         )
         .expect("an empty repository must not abort the scan");
         server.join();
@@ -2381,10 +2143,10 @@ mod tests {
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let hits: Vec<SearchHit> = fetch_paginated(
+        let hits: Vec<RepoHit> = fetch_paginated(
             &client,
             |page| format!("{address}/search/repositories?q={q}&per_page={PER_PAGE}&page={page}"),
-            parse_search_page,
+            |json| parse_search_page(json, true),
             Some(3),
         )
         .expect("the listing must succeed");
@@ -2421,10 +2183,10 @@ mod tests {
         });
 
         let client = crate::github::Client::anonymous().expect("client must build");
-        let hits: Vec<SearchHit> = fetch_paginated(
+        let hits: Vec<RepoHit> = fetch_paginated(
             &client,
             |page| format!("{address}/search/repositories?q={q}&per_page={PER_PAGE}&page={page}"),
-            parse_search_page,
+            |json| parse_search_page(json, true),
             Some(5),
         )
         .expect("the listing must succeed");
@@ -2438,402 +2200,5 @@ mod tests {
         );
         assert!(!requests[0].contains("stars:"));
         server.join();
-    }
-
-    fn report(emails: &[&str], failure: Option<Error>) -> WorkerReport {
-        // token_died mirrors the worker behavior: a rate-limited dedicated
-        // token is the canonical "this worker's token died" failure
-        let token_died = matches!(failure, Some(Error::RateLimitExhausted));
-        WorkerReport {
-            emails: emails.iter().map(|email| email.to_string()).collect(),
-            requests: 1,
-            repos_scanned: 0,
-            skipped: 0,
-            contributions: Vec::new(),
-            failure,
-            token_died,
-        }
-    }
-
-    fn progressed_report(emails: &[&str], repos: usize, failure: Option<Error>) -> WorkerReport {
-        let token_died = failure.is_some();
-        WorkerReport {
-            emails: emails.iter().map(|email| email.to_string()).collect(),
-            requests: 1,
-            repos_scanned: repos,
-            skipped: 0,
-            contributions: Vec::new(),
-            failure,
-            token_died,
-        }
-    }
-
-    #[test]
-    fn a_rate_limited_worker_does_not_discard_the_other_workers_emails() {
-        let reports = vec![
-            report(&["a@a.a"], Some(Error::RateLimitExhausted)),
-            report(&["b@b.b"], None),
-            report(&[], None),
-        ];
-        let (result, _, requests, ..) = reduce_worker_reports(reports);
-        // the drained token fails one worker, but the scan keeps its emails
-        let emails = result.expect("the scan must not fail");
-        assert_eq!(emails.len(), 2);
-        assert_eq!(requests, 3);
-    }
-
-    #[test]
-    fn a_rate_limit_without_any_progress_fails_the_scan() {
-        // single anonymous worker, or every token spent before scanning
-        // anything: nothing to return
-        let reports = vec![report(&["a@a.a"], Some(Error::RateLimitExhausted))];
-        let (result, ..) = reduce_worker_reports(reports);
-        assert!(matches!(result, Err(Error::RateLimitExhausted)));
-    }
-
-    #[test]
-    fn warn_skipped_repositories_count_as_covered_work_for_the_callers() {
-        // a caller with a complete-report contract (the org investigation)
-        // judges the kept partial result against the listed repositories: a
-        // repository warn-skipped as resource-scoped (deleted, private or
-        // empty) is covered work, not work the dead token never reached
-        let covered = WorkerReport {
-            emails: vec!["b@b.b".to_string()],
-            requests: 1,
-            repos_scanned: 0,
-            skipped: 1,
-            contributions: Vec::new(),
-            failure: None,
-            token_died: false,
-        };
-        let (result, _, _, repos_scanned, skipped, _, partial, _) = reduce_worker_reports(vec![
-            progressed_report(&["a@a.a"], 1, Some(Error::RateLimitExhausted)),
-            covered,
-        ]);
-        result.expect("covered work must not be thrown away");
-        assert!(partial, "the death is still reported to the caller");
-        assert_eq!(
-            (repos_scanned, skipped),
-            (1, 1),
-            "scanned + skipped covers the two listed repositories"
-        );
-
-        // a dead worker's own gap (its in-flight repository) is neither
-        // scanned nor skipped: scanned + skipped stays below the listing and
-        // the caller must abort instead of writing a complete-looking report
-        let (result, _, _, repos_scanned, skipped, _, partial, _) = reduce_worker_reports(vec![
-            progressed_report(&["a@a.a"], 1, Some(Error::RateLimitExhausted)),
-            report(&["b@b.b"], None),
-        ]);
-        result.expect("the scan itself still succeeds");
-        assert!(partial);
-        assert_eq!(
-            repos_scanned + skipped,
-            1,
-            "one listed repository was left uncovered: the caller aborts"
-        );
-    }
-
-    #[test]
-    fn a_complete_result_survives_every_worker_token_dying() {
-        // quota died on each worker's final request: the queue was fully
-        // drained, so the collected emails must not be thrown away
-        let reports = vec![
-            progressed_report(&["a@a.a"], 3, Some(Error::RateLimitExhausted)),
-            progressed_report(&["b@b.b"], 2, Some(Error::RateLimitExhausted)),
-        ];
-        let (result, _, requests, ..) = reduce_worker_reports(reports);
-        let emails = result.expect("a complete result must be kept");
-        assert_eq!(emails.len(), 2);
-        assert_eq!(requests, 2);
-    }
-
-    #[test]
-    fn a_partial_result_kept_after_a_token_death_is_flagged_for_callers() {
-        // callers with a complete-report contract (the `org` investigation)
-        // must be able to tell a partial kept result from a complete one
-        let partial = vec![
-            progressed_report(&["a@a.a"], 1, Some(Error::RateLimitExhausted)),
-            report(&["b@b.b"], None),
-        ];
-        let (result, .., partial_token_death, death_error) = reduce_worker_reports(partial);
-        result.expect("the healthy workers' emails must be kept");
-        assert!(partial_token_death, "a kept partial result must be flagged");
-        assert!(
-            death_error.is_some(),
-            "the caller must receive the real death cause"
-        );
-
-        let complete = vec![report(&["a@a.a"], None), report(&["b@b.b"], None)];
-        let (result, .., partial_token_death, death_error) = reduce_worker_reports(complete);
-        result.expect("the scan must not fail");
-        assert!(
-            !partial_token_death && death_error.is_none(),
-            "a result kept without any token death is not partial"
-        );
-    }
-
-    #[test]
-    fn a_rejected_token_does_not_abort_the_workers_that_made_progress() {
-        // a token death on a dedicated token (spent quota here; an HTTP 401
-        // rejection is reported the same way) stops only its worker: the
-        // healthy workers' partial result is kept
-        let reports = vec![
-            progressed_report(&["a@a.a"], 1, Some(Error::RateLimitExhausted)),
-            report(&["b@b.b"], None),
-        ];
-        let (result, ..) = reduce_worker_reports(reports);
-        let emails = result.expect("the healthy workers' emails must be kept");
-        assert_eq!(emails.len(), 2);
-    }
-
-    #[test]
-    fn a_resource_scoped_failure_is_skipped_not_treated_as_a_dead_token() {
-        // a 403 (private repository, token without the right scope), a
-        // 404 (stale search-index entry) and a 409 (empty repository) are
-        // scoped to the repository, not to the token: the worker skips them
-        // and keeps pulling work
-        assert!(matches!(
-            classify_failure(&Error::PrivateOrUnavailable, true),
-            FailureAction::SkipRepository
-        ));
-        assert!(matches!(
-            classify_failure(&Error::NotFound, true),
-            FailureAction::SkipRepository
-        ));
-        assert!(matches!(
-            classify_failure(&Error::EmptyRepository, true),
-            FailureAction::SkipRepository
-        ));
-    }
-
-    #[test]
-    fn classify_failure_stops_the_worker_only_on_real_token_deaths() {
-        // a spent quota stops the worker, dedicated token or not; so does a
-        // token the API rejected outright (HTTP 401 surfaced as
-        // [`Error::TokenRejected`])
-        assert!(matches!(
-            classify_failure(&Error::RateLimitExhausted, true),
-            FailureAction::TokenDied
-        ));
-        assert!(matches!(
-            classify_failure(&Error::TokenRejected, true),
-            FailureAction::TokenDied
-        ));
-        // any unexpected failure aborts the whole scan
-        assert!(matches!(
-            classify_failure(&Error::InvalidUrl("nope".to_string()), true),
-            FailureAction::AbortScan
-        ));
-        assert!(matches!(
-            classify_failure(&Error::WorkerFailed("did not report".to_string()), true),
-            FailureAction::AbortScan
-        ));
-    }
-
-    #[test]
-    fn a_transport_error_skips_its_repository_instead_of_aborting_the_scan() {
-        // a connection refused (nothing listens on port 1) is a transient
-        // network condition, not a scan-fatal one: the repository is
-        // skipped, the other workers keep going
-        let client = reqwest::blocking::Client::new();
-        let err = client
-            .get("http://127.0.0.1:1/")
-            .send()
-            .expect_err("nothing listens on port 1");
-        let err = Error::from(err);
-        assert!(
-            matches!(classify_failure(&err, true), FailureAction::SkipRepository),
-            "a transport-level error is transient and must skip, not abort"
-        );
-        // a complete-report caller (`org`) keeps the documented contract: a
-        // transport failure aborts, so its report can never silently miss a
-        // whole repository
-        assert!(
-            matches!(classify_failure(&err, false), FailureAction::AbortScan),
-            "the complete-report contract must abort on a transport error"
-        );
-    }
-
-    #[test]
-    fn an_abort_failure_is_preferred_over_an_earlier_token_death() {
-        // first-arrival attribution would report the scan-wide cause as a
-        // mere rate limit when a genuine abort-class failure coexists: the
-        // non-token-death failure is the more informative one and wins
-        let reports = vec![
-            progressed_report(&["a@a.a"], 1, Some(Error::RateLimitExhausted)),
-            report(&["b@b.b"], Some(Error::InvalidUrl("nope".to_string()))),
-        ];
-        let (result, ..) = reduce_worker_reports(reports);
-        assert!(matches!(result, Err(Error::InvalidUrl(_))));
-    }
-
-    #[test]
-    fn a_non_rate_limit_failure_fails_the_scan() {
-        let reports = vec![
-            report(&["a@a.a"], Some(Error::RateLimitExhausted)),
-            report(&["b@b.b"], Some(Error::InvalidUrl("nope".to_string()))),
-            report(&[], None),
-        ];
-        let (result, ..) = reduce_worker_reports(reports);
-        // a failure other than a drained token aborts the scan: the first
-        // reported failure wins, so the scan errors out either way
-        assert!(matches!(
-            result,
-            Err(Error::RateLimitExhausted | Error::InvalidUrl(_))
-        ));
-    }
-
-    #[test]
-    fn reduce_worker_reports_sums_the_repositories_actually_scanned() {
-        // the JSON report must not overstate coverage: skipped or
-        // unscanned repositories are not counted
-        let reports = vec![
-            progressed_report(&["a@a.a"], 2, None),
-            progressed_report(&["b@b.b"], 1, Some(Error::RateLimitExhausted)),
-            report(&[], None),
-        ];
-        let (result, _, _, repos_scanned, ..) = reduce_worker_reports(reports);
-        result.expect("the scan must not fail");
-        assert_eq!(repos_scanned, 3);
-    }
-}
-
-#[cfg(test)]
-mod correlation_tests {
-    // Tests may unwrap, expect and panic freely: a failing assertion must
-    // be loud, so the zero-panic lints do not apply to the test modules.
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-    use super::*;
-    use crate::correlate::CommitAuthor;
-
-    /// Builds a worker report carrying one scanned repository's contribution.
-    fn contribution_report(
-        emails: &[&str],
-        repo: &str,
-        language: Option<&str>,
-        authors: &[(&str, &str, usize)],
-    ) -> WorkerReport {
-        WorkerReport {
-            emails: emails.iter().map(|email| email.to_string()).collect(),
-            requests: 1,
-            repos_scanned: 1,
-            skipped: 0,
-            contributions: vec![RepoContribution {
-                name: repo.to_string(),
-                language: language.map(str::to_string),
-                authors: authors
-                    .iter()
-                    .map(|(name, email, hits)| CommitAuthor {
-                        name: (*name).to_string(),
-                        email: (*email).to_string(),
-                        hits: *hits,
-                    })
-                    .collect(),
-            }],
-            failure: None,
-            token_died: false,
-        }
-    }
-
-    #[test]
-    fn reduce_worker_reports_aggregates_the_contributions_across_workers() {
-        // two workers, each scanning one repository where the same author
-        // appears with the same email and different primary languages
-        let reports = vec![
-            contribution_report(
-                &["alice@x.com"],
-                "a/one",
-                Some("Rust"),
-                &[("Alice", "alice@x.com", 2)],
-            ),
-            contribution_report(
-                &["alice@x.com", "bob@y.y"],
-                "b/two",
-                Some("Go"),
-                &[("Alice", "alice@x.com", 1), ("Bob", "bob@y.y", 1)],
-            ),
-        ];
-
-        let (result, _, requests, repos_scanned, _, correlation, ..) =
-            reduce_worker_reports(reports);
-        let emails = result.expect("the scan must not fail");
-        assert_eq!(
-            emails,
-            vec!["alice@x.com".to_string(), "bob@y.y".to_string()]
-        );
-        assert_eq!(requests, 2);
-        assert_eq!(repos_scanned, 2);
-
-        // the same author seen by two different workers is merged: emails
-        // deduplicated, hits summed, both languages kept dominant first
-        assert_eq!(correlation.authors.len(), 2);
-        let alice = &correlation.authors[0];
-        assert_eq!(alice.author, "Alice");
-        assert_eq!(alice.total_hits, 3);
-        assert_eq!(alice.emails, vec!["alice@x.com".to_string()]);
-        assert_eq!(alice.languages, vec!["Rust".to_string(), "Go".to_string()]);
-        assert_eq!(correlation.authors[1].author, "Bob");
-    }
-
-    #[test]
-    fn a_worker_whose_token_died_still_keeps_its_contributions() {
-        // a dead dedicated token does not throw away the contributions of the
-        // repositories its worker already scanned
-        let mut report = contribution_report(
-            &["alice@x.com"],
-            "a/one",
-            Some("Rust"),
-            &[("Alice", "alice@x.com", 1)],
-        );
-        report.failure = Some(Error::RateLimitExhausted);
-        report.token_died = true;
-
-        let (result, _, _, _, _, correlation, ..) = reduce_worker_reports(vec![report, {
-            contribution_report(&["bob@y.y"], "b/two", Some("Go"), &[("Bob", "bob@y.y", 1)])
-        }]);
-
-        result.expect("a token death with progress keeps the scan result");
-        assert_eq!(correlation.authors.len(), 2);
-        assert_eq!(correlation.authors[0].first_seen_repo, "a/one");
-        assert_eq!(correlation.authors[1].first_seen_repo, "b/two");
-    }
-
-    #[test]
-    fn reduce_worker_reports_derives_the_emails_found_per_repository() {
-        // the per-repository attribution comes from the contributions before
-        // the correlation merges the authors across repositories: an author
-        // using two emails in two repositories must be reported per repo
-        let reports = vec![
-            contribution_report(
-                &[],
-                "a/one",
-                Some("Rust"),
-                &[("Alice", "alice@x.com", 2), ("Alice", "alice@y.com", 1)],
-            ),
-            contribution_report(&[], "b/two", None, &[("Bob", "bob@y.y", 1)]),
-            // a worker that scanned nothing contributes no repository
-            WorkerReport {
-                emails: Vec::new(),
-                requests: 0,
-                repos_scanned: 0,
-                skipped: 0,
-                contributions: Vec::new(),
-                failure: None,
-                token_died: false,
-            },
-        ];
-
-        let (result, per_repository, ..) = reduce_worker_reports(reports);
-        result.expect("the scan must not fail");
-        assert_eq!(
-            per_repository.get("a/one"),
-            Some(&vec!["alice@x.com".to_string(), "alice@y.com".to_string()])
-        );
-        assert_eq!(
-            per_repository.get("b/two"),
-            Some(&vec!["bob@y.y".to_string()])
-        );
-        assert_eq!(per_repository.len(), 2);
     }
 }

@@ -1,7 +1,8 @@
 //! Test-only capturing logger: pins at the wiring level that the terminal
 //! report builders actually apply the shared log sanitizer, not only that
 //! the sanitizer helper works (a dropped `log_safe()` call must fail the
-//! suite).
+//! suite). Every caller is a test, so the test-only panic allowance applies.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -87,4 +88,45 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
         records.clear();
     }
     (result, lines)
+}
+
+/// A CWD-isolated body for the tests that exercise the relative
+/// `results/` layout: the text writer writes relative to the current
+/// directory, so the result-file scenarios must not touch the real
+/// workspace. The single process-wide chdir lock is shared by every user
+/// of this fixture (output tests and CLI-arm tests alike): the chdir is
+/// process-wide, so two fixtures restoring "their own" CWD concurrently
+/// could restore one another into a deleted temp directory.
+///
+/// Test-only, but compiled with the crate: callers are `#[cfg(test)]`
+/// modules of the lib and the bin.
+pub(crate) fn in_temp_cwd<T>(f: impl FnOnce() -> T) -> T {
+    use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
+    static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let lock = CWD_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let original = std::env::current_dir().expect("test setup: current dir");
+    let temp = std::env::temp_dir().join(format!("git2mail_cwd_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp);
+    std::fs::create_dir_all(&temp).expect("test setup: temp cwd");
+    std::env::set_current_dir(&temp).expect("test setup: enter temp cwd");
+    // panic-safe restore: a test panicking inside `f` must not leave the
+    // process CWD inside the temp directory the teardown deletes (every
+    // later `current_dir()` of the suite would then fail with NotFound)
+    struct RestoreCwd<'a>(&'a Path);
+    impl Drop for RestoreCwd<'_> {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(self.0);
+        }
+    }
+    let _restore = RestoreCwd(&original);
+    let result = f();
+    drop(_restore);
+    std::env::set_current_dir(&original).expect("test teardown: restore cwd");
+    let _ = std::fs::remove_dir_all(&temp);
+    drop(lock);
+    result
 }

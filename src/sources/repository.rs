@@ -1,25 +1,12 @@
 //! Repository commits scan: the emails of a repository's commit authors,
 //! plus the per-author attribution consumed by the correlation report
-//! (issue #5).
+//!.
 
 use crate::correlate::{CommitAuthor, RepoScan};
 use crate::errors::Error;
 use crate::github::{Client, fetch_paginated_with_page_size};
-use crate::output::sanitize_log_text as log_safe;
-use crate::sources::{PER_PAGE, is_usable_email, merge_emails, sort_emails};
+use crate::sources::{EmailList, PER_PAGE, is_usable_email};
 use serde_json::Value;
-use std::cell::Cell;
-
-/// Cap on the number of commit pages one repository scan lists (the same
-/// honesty budget as the reverse lookup's candidate verification): only the
-/// most recent `MAX_COMMIT_PAGES * PER_PAGE` commits of the default branch
-/// are walked, so a single large repository (or an `org` scan across many
-/// of them) can never burn the whole hourly token pool on one commit
-/// history and abort a nearly-complete investigation with
-/// [`Error::RateLimitExhausted`]. When the budget cuts the walk, a warning
-/// says the history may be incomplete instead of the scan silently
-/// pretending it saw all of it.
-pub(crate) const MAX_COMMIT_PAGES: usize = 10;
 
 /// Fetches a GitHub repository's commits pages and returns the authors'
 /// emails, deduplicated, noreply addresses excluded, sorted, together with
@@ -29,10 +16,8 @@ pub(crate) const MAX_COMMIT_PAGES: usize = 10;
 /// `base` is the API base URL: the production callers pass the GitHub API
 /// base, and the offline tests run this same code against a loopback mock.
 ///
-/// The listing is capped at [`MAX_COMMIT_PAGES`] pages of commits (counted
-/// in raw commits): when the budget cuts the walk, a warning says the
-/// history may be incomplete instead of the scan silently pretending it
-/// saw all of it.
+/// The listing walks the repository's full default-branch history: it ends
+/// when GitHub's listing ends (a short page), with no local budget.
 pub(crate) fn scan_repository(
     client: &Client,
     base: &str,
@@ -40,11 +25,8 @@ pub(crate) fn scan_repository(
     repository: &str,
 ) -> Result<RepoScan, Error> {
     // one CommitAuthor per kept commit: pages are merged below, summing the
-    // hits of every (name, email) pair across pages. The raw commit count
-    // streams through this cell so a budget cut can be warned about after
-    // the walk
-    let listed_commits = Cell::new(0usize);
-    let commit_ceiling = MAX_COMMIT_PAGES * usize::from(PER_PAGE);
+    // hits of every (name, email) pair across pages. No local budget: the
+    // walk ends when GitHub's listing ends (a short page)
     let kept_commits: Vec<CommitAuthor> = fetch_paginated_with_page_size(
         client,
         |page| {
@@ -60,43 +42,27 @@ pub(crate) fn scan_repository(
         },
         |json| {
             let (page_authors, raw_count) = parse_commit_page(json)?;
-            listed_commits.set(listed_commits.get() + raw_count);
             Ok((page_authors, raw_count))
         },
-        Some(commit_ceiling),
+        None,
         PER_PAGE,
     )?;
-    if listed_commits.get() >= commit_ceiling {
-        // the raw-count ceiling was reached: the walk was cut at the
-        // repository budget (a repository with exactly `commit_ceiling`
-        // commits also lands here — the "may" phrasing keeps the warning
-        // honest for that boundary case too). Say so instead of letting the
-        // report look complete
-        log::warn!(
-            "repository {}/{}: only the most recent {} commits were scanned (built-in limit), older commits may hold emails that were missed",
-            log_safe(author),
-            log_safe(repository),
-            listed_commits.get()
-        );
-    }
 
     // merge sums the hits of a (name, email) pair seen on several pages
     let mut authors: Vec<CommitAuthor> = Vec::new();
     for author in kept_commits {
         merge_author(&mut authors, author);
     }
-    // the legacy email list: every kept email, deduplicated, sorted
-    let mut found_emails: Vec<String> = Vec::new();
-    merge_emails(
-        &mut found_emails,
-        authors.iter().map(|author| author.email.clone()).collect(),
-    );
-    // sort alphabetically found emails
-    sort_emails(&mut found_emails);
+    // the legacy email list: every kept email, deduplicated, sorted (the
+    // O(1)-membership accumulator: the adversarial worst case plants
+    // thousands of distinct addresses across the pages)
+    let mut found_emails = EmailList::new();
+    found_emails.merge(authors.iter().map(|author| author.email.clone()).collect());
+    found_emails.sort();
     // deterministic attribution order: by author name, then email
     authors.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.email.cmp(&b.email)));
     Ok(RepoScan {
-        emails: found_emails,
+        emails: found_emails.into_vec(),
         authors,
     })
 }
@@ -152,6 +118,10 @@ fn parse_commit_page(json: &Value) -> Result<(Vec<CommitAuthor>, usize), Error> 
             name: name.to_string(),
             email: email.to_string(),
             hits: 1,
+            last_commit_date: author
+                .get("date")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         });
     }
     Ok((authors, items.len()))
@@ -176,6 +146,58 @@ mod tests {
         let emails: Vec<String> = authors.iter().map(|author| author.email.clone()).collect();
         assert_eq!(emails, vec!["dev@example.com".to_string()]);
         assert_eq!(raw_count, 4);
+    }
+
+    #[test]
+    fn parse_commit_page_carries_the_commit_author_date() {
+        // the data-freshness field: the raw ISO 8601 stamp of the payload,
+        // absent (None) when the page carries none
+        let json: Value = serde_json::json!([
+            {
+                "commit": {
+                    "author": {
+                        "email": "dev@example.com",
+                        "date": "2024-06-01T12:00:00Z"
+                    }
+                }
+            },
+            { "commit": { "author": { "email": "other@example.com" } } }
+        ]);
+        let (authors, _) = parse_commit_page(&json).expect("parsing must succeed");
+        assert_eq!(
+            authors[0].last_commit_date.as_deref(),
+            Some("2024-06-01T12:00:00Z"),
+            "the commit date must reach the correlation input"
+        );
+        assert_eq!(authors[1].last_commit_date, None);
+    }
+
+    #[test]
+    fn the_correlation_merge_keeps_the_most_recent_commit_date() {
+        // the same author seen on several pages/repositories: the report
+        // carries the MAXIMUM date (ISO 8601 UTC stamps order
+        // lexicographically = chronologically), never the first-seen one
+        let mut builder = crate::correlate::CorrelationBuilder::new();
+        let contribution = |date: Option<&str>| crate::correlate::RepoContribution {
+            name: "acme/one".to_string(),
+            language: None,
+            authors: vec![crate::correlate::CommitAuthor {
+                name: "Alice".to_string(),
+                email: "alice@acme.com".to_string(),
+                hits: 1,
+                last_commit_date: date.map(str::to_string),
+            }],
+        };
+        builder.add_repo(contribution(Some("2024-01-01T00:00:00Z")));
+        builder.add_repo(contribution(Some("2025-03-15T10:30:00Z")));
+        builder.add_repo(contribution(Some("2023-12-31T23:59:59Z")));
+        builder.add_repo(contribution(None));
+        let correlation = builder.finish();
+        assert_eq!(
+            correlation.authors[0].last_commit_date.as_deref(),
+            Some("2025-03-15T10:30:00Z"),
+            "the most recent date must win the merge"
+        );
     }
 
     #[test]
@@ -280,6 +302,7 @@ mod tests {
                 name: "real@x.com".to_string(),
                 email: "real@x.com".to_string(),
                 hits: 1,
+                last_commit_date: None,
             }]
         );
     }
@@ -316,11 +339,13 @@ mod tests {
                     name: "Alice".to_string(),
                     email: "alice@x.com".to_string(),
                     hits: 1,
+                    last_commit_date: None,
                 },
                 CommitAuthor {
                     name: "noname@y.y".to_string(),
                     email: "noname@y.y".to_string(),
                     hits: 1,
+                    last_commit_date: None,
                 },
             ]
         );
@@ -332,6 +357,7 @@ mod tests {
             name: "Alice".to_string(),
             email: "alice@x.com".to_string(),
             hits: 1,
+            last_commit_date: None,
         }];
         merge_author(
             &mut authors,
@@ -339,6 +365,7 @@ mod tests {
                 name: "Alice".to_string(),
                 email: "alice@x.com".to_string(),
                 hits: 2,
+                last_commit_date: None,
             },
         );
         merge_author(
@@ -347,6 +374,7 @@ mod tests {
                 name: "Bob".to_string(),
                 email: "bob@y.y".to_string(),
                 hits: 1,
+                last_commit_date: None,
             },
         );
         assert_eq!(
@@ -356,25 +384,28 @@ mod tests {
                     name: "Alice".to_string(),
                     email: "alice@x.com".to_string(),
                     hits: 3,
+                    last_commit_date: None,
                 },
                 CommitAuthor {
                     name: "Bob".to_string(),
                     email: "bob@y.y".to_string(),
                     hits: 1,
+                    last_commit_date: None,
                 },
             ]
         );
     }
 
     #[test]
-    fn scan_repository_commit_listing_is_capped_per_repository() {
-        // a repository whose history never ends (every page holds 100
-        // commits with a fresh, usable email) must not walk its entire
-        // commit history: the repository budget caps the listing at
-        // MAX_COMMIT_PAGES pages counted in raw commits, and the walk stops
-        // instead of draining the token pool page after page
+    fn scan_repository_walks_the_full_history_with_no_local_budget() {
+        // a repository whose history spans more than the old built-in
+        // budget (10 pages) must be walked to the END: the only ceilings
+        // are GitHub's (pagination ends on a short page), never a local
+        // constant — 11 full pages plus the short 12th are all scanned
         let (address, server) = crate::github::mock::serve_requests(move |index, _request| {
-            let commits: Vec<String> = (0..100)
+            let page = index + 1;
+            let per_page = if page < 12 { 100 } else { 37 };
+            let commits: Vec<String> = (0..per_page)
                 .map(|i| {
                     format!(
                         r#"{{"commit": {{"author": {{"name": "Dev{}", "email": "dev{}{}@x.com"}}}}}}"#,
@@ -387,15 +418,12 @@ mod tests {
 
         let client = crate::github::Client::anonymous().expect("client must build");
         let scan = scan_repository(&client, &address, "octocat", "huge")
-            .expect("the capped listing must succeed");
+            .expect("the full walk must succeed");
         let handled = server.join();
 
-        // the ceiling is reached on the 10th full page: no 11th request, no
-        // empty page to wait for
-        assert_eq!(handled, MAX_COMMIT_PAGES);
-        // every kept author of the capped pages is reported
-        assert_eq!(scan.authors.len(), MAX_COMMIT_PAGES * 100);
-        assert_eq!(scan.emails.len(), MAX_COMMIT_PAGES * 100);
+        // 11 full pages + the short 12th that ends the listing
+        assert_eq!(handled, 12);
+        assert_eq!(scan.authors.len(), 11 * 100 + 37);
     }
 
     #[test]
@@ -436,19 +464,19 @@ mod tests {
                     name: "Alice".to_string(),
                     email: "alice@x.com".to_string(),
                     hits: 2,
+                    last_commit_date: None,
                 },
                 CommitAuthor {
                     name: "Bob".to_string(),
                     email: "bob@y.y".to_string(),
                     hits: 1,
+                    last_commit_date: None,
                 },
             ]
         );
-        let mut emails: Vec<String> = Vec::new();
-        merge_emails(
-            &mut emails,
-            authors.iter().map(|author| author.email.clone()).collect(),
-        );
+        let mut emails = EmailList::new();
+        emails.merge(authors.iter().map(|author| author.email.clone()).collect());
+        let emails = emails.into_vec();
         assert_eq!(
             emails,
             vec!["alice@x.com".to_string(), "bob@y.y".to_string()]

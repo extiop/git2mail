@@ -23,19 +23,18 @@
 //! does; a rate-limit or transport failure is a scan-wide condition and
 //! aborts the investigation, so a token parked by a secondary rate limit
 //! can never yield a complete-looking report silently missing whole
-//! repositories. Like the `user` investigation (and unlike the capped
-//! reverse-email heuristic), the listings (the organization's members and
-//! repositories) walk every page; each listed repository's commit walk is
-//! capped at the shared per-repository budget (10 pages of 100 commits,
-//! `crate::sources::repository::MAX_COMMIT_PAGES`), like every other
-//! repository scan.
+//! repositories. Like the `user` investigation (and unlike the
+//! search-bounded reverse-email heuristic), the listings (the
+//! organization's members and repositories) walk every page; each listed
+//! repository's commit walk covers the full default-branch history with no
+//! local budget, like every other repository scan.
 
 use crate::consts::GITHUB_API_BASE;
 use crate::errors::Error;
 use crate::github::fetch_paginated;
-use crate::output::sanitize_log_text as log_safe;
 use crate::parsers::is_safe_repository_name;
-use crate::sources::{PER_PAGE, Scanner, SearchHit, sort_emails};
+use crate::sanitize::log_safe;
+use crate::sources::{PER_PAGE, RepoHit, Scanner, sort_emails};
 use crate::user::validate_username;
 use log::info;
 use serde::Serialize;
@@ -86,6 +85,9 @@ pub struct OrgScanned {
 /// sections and the `--json` shape, documented in the README.
 #[derive(Debug, Clone, Serialize)]
 pub struct OrgReport {
+    /// The when/what of the report (generation timestamp, tool version).
+    #[serde(flatten)]
+    pub provenance: crate::output::Provenance,
     /// The investigated organization.
     pub org: OrgInfo,
     /// The public member logins (`GET /orgs/{org}/public_members`).
@@ -120,9 +122,14 @@ pub struct OrgReport {
 /// parallel scan whose dedicated token died mid-scan aborts with the
 /// token's real death error (a revoked token is not a spent allowance).
 /// `limit` (the optional `--limit`) caps the number of listed
-/// repositories. Never panics.
-pub fn investigate(scanner: &Scanner, org: &str, limit: Option<usize>) -> Result<OrgReport, Error> {
-    investigate_at(scanner, GITHUB_API_BASE, org, limit)
+/// repositories.
+pub fn investigate(
+    scanner: &Scanner,
+    org: &str,
+    limit: Option<usize>,
+    include_forks: bool,
+) -> Result<OrgReport, Error> {
+    investigate_at(scanner, GITHUB_API_BASE, org, limit, include_forks)
 }
 
 /// The investigation itself, driven against one API base URL:
@@ -134,20 +141,8 @@ pub fn investigate(scanner: &Scanner, org: &str, limit: Option<usize>) -> Result
 ///
 /// # Errors
 ///
-/// The same failures as [`investigate`]. Never panics.
+/// The same failures as [`investigate`].
 ///
-/// What the org repository scan feeds back to the report: the merged
-/// email list, the per-repository email map, how many repositories were
-/// fully scanned, and the token-death error (if any) the caller judges
-/// against the skip-vs-abort contract.
-type OrgScanFeedback = (
-    Vec<String>,
-    BTreeMap<String, Vec<String>>,
-    usize,
-    Option<Error>,
-    crate::correlate::Correlation,
-);
-
 /// Filters the raw listing (untrusted API data: an entry whose name is
 /// empty, a dot segment or carries a path separator or query/fragment
 /// would corrupt the composed scan URL, see [`is_safe_repository_name`],
@@ -160,7 +155,7 @@ fn scan_org_repositories(
     base: &str,
     repositories: &[String],
     canonical_login: &str,
-) -> Result<OrgScanFeedback, Error> {
+) -> crate::sources::ParallelScan {
     let safe_repositories: Vec<&String> = repositories
         .iter()
         .filter(|repository| {
@@ -175,22 +170,14 @@ fn scan_org_repositories(
             }
         })
         .collect();
-    let hits: Vec<SearchHit> = safe_repositories
+    let hits: Vec<RepoHit> = safe_repositories
         .iter()
-        .map(|repository| SearchHit {
+        .map(|repository| RepoHit {
             url: format!("https://github.com/{}/{repository}", canonical_login),
             language: None,
         })
         .collect();
-    let (all, per_repository, repos_scanned, _, correlation, _, token_death_error) =
-        scanner.scan_repositories_at(base, &hits, false)?;
-    Ok((
-        all,
-        per_repository,
-        repos_scanned,
-        token_death_error,
-        correlation,
-    ))
+    scanner.scan_repositories_at(base, &hits, false)
 }
 
 fn investigate_at(
@@ -198,6 +185,7 @@ fn investigate_at(
     base: &str,
     org: &str,
     limit: Option<usize>,
+    include_forks: bool,
 ) -> Result<OrgReport, Error> {
     let client = scanner.client();
     validate_username(org)?;
@@ -236,7 +224,7 @@ fn investigate_at(
             // them — the documented contract is the public repositories
             format!("{base}/orgs/{org}/repos?type=public&per_page={PER_PAGE}&page={page}")
         },
-        parse_repos_page,
+        |json| parse_repos_page(json, include_forks),
         limit,
     )?;
 
@@ -251,32 +239,32 @@ fn investigate_at(
             log_safe(&info.login)
         );
     }
-    let (all, per_repository, repos_scanned, token_death_error, correlation) =
-        scan_org_repositories(scanner, base, &repositories, &info.login)?;
+    let feedback = scan_org_repositories(scanner, base, &repositories, &info.login)?;
     // token death mid-scan: the skip-vs-abort contract is the module-level
     // one, but a partial kept after a dedicated token died may have left
     // repositories unscanned — abort with the token's real death error
     // instead of writing a complete-looking report (a revoked token is not
     // a spent allowance)
-    if let Some(death_error) = token_death_error {
+    if let Some(death_error) = feedback.death_error {
         return Err(death_error);
     }
-    let mut all = all;
+    let mut all = feedback.emails;
     sort_emails(&mut all);
 
     let report = OrgReport {
+        provenance: crate::output::Provenance::now(),
         org: info,
         members,
         repositories,
         emails: OrgEmails {
-            per_repository,
+            per_repository: feedback.per_repository,
             all,
         },
         scanned: OrgScanned {
-            repos: repos_scanned,
+            repos: feedback.repos_scanned,
             pages: scanner.requests_made(),
         },
-        correlation,
+        correlation: feedback.correlation,
     };
     report.log_summary();
     Ok(report)
@@ -291,7 +279,7 @@ fn investigate_at(
 /// # Errors
 ///
 /// Returns [`Error::InvalidProfile`] when `login` is missing from the
-/// payload. Never panics.
+/// payload.
 fn parse_org(json: &Value) -> Result<OrgInfo, Error> {
     let string_field = |name: &str| {
         json.get(name)
@@ -320,7 +308,6 @@ fn parse_org(json: &Value) -> Result<OrgInfo, Error> {
 /// # Errors
 ///
 /// Returns [`Error::InvalidProfile`] when the body is not a JSON array.
-/// Never panics.
 fn parse_members_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
     parse_string_field_page(json, "login", "members")
 }
@@ -336,8 +323,7 @@ fn parse_members_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
 /// # Errors
 ///
 /// Returns [`Error::InvalidProfile`] when the body is not a JSON array.
-/// Never panics.
-fn parse_repos_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
+fn parse_repos_page(json: &Value, include_forks: bool) -> Result<(Vec<String>, usize), Error> {
     let Some(items) = json.as_array() else {
         return Err(Error::InvalidProfile(
             "repositories payload: not an array".to_string(),
@@ -345,16 +331,16 @@ fn parse_repos_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
     };
     // the same hostile-listing discipline as the user investigation's
     // repositories listing: entries without a usable name are malformed
-    // (warned, never silent), and forked repositories are skipped —
-    // `type=public` includes forks, whose default-branch commits mirror the
-    // upstream history, so upstream developers' emails would otherwise land
-    // in the org's report unmarked
+    // (warned, never silent), and forked repositories are skipped unless the
+    // caller opted in (`--include-forks`) — `type=public` includes forks,
+    // whose default-branch commits mirror the upstream history, so upstream
+    // developers' emails would otherwise land in the org's report unmarked
     let mut repositories = Vec::new();
     let mut malformed = 0usize;
     let mut forks = 0usize;
     for item in items {
         let name = item.get("name").and_then(Value::as_str);
-        if item.get("fork").and_then(Value::as_bool) == Some(true) {
+        if !include_forks && item.get("fork").and_then(Value::as_bool) == Some(true) {
             forks += 1;
             continue;
         }
@@ -373,7 +359,9 @@ fn parse_repos_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
         } else {
             "repository"
         };
-        log::warn!("{forks} forked {plural} skipped (their history is upstream's)");
+        log::warn!(
+            "{forks} forked {plural} skipped (their history is upstream's): pass --include-forks to scan them"
+        );
     }
     Ok((repositories, items.len()))
 }
@@ -387,7 +375,6 @@ fn parse_repos_page(json: &Value) -> Result<(Vec<String>, usize), Error> {
 /// # Errors
 ///
 /// Returns [`Error::InvalidProfile`] when the body is not a JSON array.
-/// Never panics.
 fn parse_string_field_page(
     json: &Value,
     field: &str,
@@ -412,7 +399,7 @@ impl OrgReport {
     /// and globally). Silent on empty sections. Every untrusted string
     /// (API-derived logins, names, repository names, emails) is sanitized
     /// first: control characters become `_`, so a hostile payload can
-    /// never forge or spoof log lines. Never panics.
+    /// never forge or spoof log lines.
     fn log_summary(&self) {
         info!("============ ORG ============");
         info!("[+] login: {}", log_safe(&self.org.login));
@@ -529,6 +516,7 @@ mod tests {
         // at the sanitizer helper: a dropped `log_safe()` call must fail
         // this test (capturing logger, see `crate::test_logger`)
         let report = OrgReport {
+            provenance: crate::output::Provenance::now(),
             org: OrgInfo {
                 login: "acme\u{1b}[31m".to_string(),
                 name: Some("Acme\nCorp".to_string()),
@@ -571,7 +559,7 @@ mod tests {
         });
 
         let scanner = Scanner::new(None, None).expect("anonymous scanner must build");
-        let error = investigate_at(&scanner, &address, "acme", None)
+        let error = investigate_at(&scanner, &address, "acme", None, false)
             .expect_err("a missing organization must fail");
         assert!(matches!(error, Error::NotFound));
         server.join();
@@ -592,7 +580,7 @@ mod tests {
         });
 
         let scanner = Scanner::new(None, None).expect("anonymous scanner must build");
-        let error = investigate_at(&scanner, &address, "acme", None)
+        let error = investigate_at(&scanner, &address, "acme", None, false)
             .expect_err("a hostile login payload must fail");
         let shape_rejected = matches!(error, Error::InvalidProfile(ref details) if details.contains("username shape"));
         assert!(shape_rejected, "unexpected error: {error:?}");
@@ -603,8 +591,8 @@ mod tests {
     fn an_invalid_org_login_is_rejected_before_any_network_request() {
         let scanner = Scanner::new(None, None).expect("anonymous scanner must build");
         for bad in ["", "acme corp", "a/b", "-acme", "ac--me"] {
-            let error =
-                investigate_at(&scanner, "http://127.0.0.1:1", bad, None).expect_err("must fail");
+            let error = investigate_at(&scanner, "http://127.0.0.1:1", bad, None, false)
+                .expect_err("must fail");
             assert!(
                 matches!(error, Error::InvalidUsername(_)),
                 "{bad:?} must be rejected client-side"
@@ -619,7 +607,7 @@ mod tests {
         });
 
         let scanner = Scanner::new(None, None).expect("anonymous scanner must build");
-        let error = investigate_at(&scanner, &address, "acme", None)
+        let error = investigate_at(&scanner, &address, "acme", None, false)
             .expect_err("a payload without login must fail");
         assert!(matches!(
             &error,
@@ -653,7 +641,7 @@ mod tests {
             });
 
             let scanner = Scanner::new(None, None).expect("anonymous scanner must build");
-            let error = investigate_at(&scanner, &address, "acme", None)
+            let error = investigate_at(&scanner, &address, "acme", None, false)
                 .expect_err("a non-array body must fail the listing");
             server.join();
             assert!(
@@ -688,8 +676,8 @@ mod tests {
         });
 
         let scanner = Scanner::new(None, None).expect("anonymous scanner must build");
-        let report =
-            investigate_at(&scanner, &address, "acme", None).expect("the listing must succeed");
+        let report = investigate_at(&scanner, &address, "acme", None, false)
+            .expect("the listing must succeed");
         server.join();
 
         assert_eq!(report.org.login, "acme");
@@ -734,8 +722,8 @@ mod tests {
         });
 
         let scanner = token_scanner(false);
-        let report =
-            investigate_at(&scanner, &address, "acme", Some(1)).expect("the listing must succeed");
+        let report = investigate_at(&scanner, &address, "acme", Some(1), false)
+            .expect("the listing must succeed");
 
         // --limit 1: the first page held 2 items but only 1 is kept, and no
         // second page was ever requested to be thrown away
@@ -775,7 +763,7 @@ mod tests {
             // request (index 0) runs before any worker exists: delaying it
             // would only add latency, not widen the race window
             if index > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/orgs/acme/public_members") {
@@ -813,7 +801,7 @@ mod tests {
         // two tokens: two workers, one dedicated token each
         let scanner = token_scanner(true);
         let report =
-            investigate_at(&scanner, &address, "acme", None).expect("the scan must succeed");
+            investigate_at(&scanner, &address, "acme", None, false).expect("the scan must succeed");
         server.join();
 
         assert_eq!(report.org.login, "acme");
@@ -899,12 +887,12 @@ mod tests {
         });
 
         let scanner = token_scanner(false);
-        let error = investigate_at(&scanner, &address, "acme", None)
-            .expect_err("a token death mid-scan must abort the investigation");
+        let error = investigate_at(&scanner, &address, "acme", None, false)
+            .expect_err("a secondary-limit park mid-scan must abort the investigation");
         server.join();
         assert!(
-            matches!(error, Error::RateLimitExhausted),
-            "unexpected error: {error:?}"
+            matches!(error, Error::RateLimitPaused),
+            "a secondary-park stop must surface the dedicated paused error: {error:?}"
         );
     }
 
@@ -950,7 +938,7 @@ mod tests {
         });
 
         let scanner = token_scanner(false);
-        let error = investigate_at(&scanner, &address, "acme", None)
+        let error = investigate_at(&scanner, &address, "acme", None, false)
             .expect_err("a kept partial result must abort the org scan");
         server.join();
         assert!(
@@ -995,7 +983,7 @@ mod tests {
 
         let scanner = token_scanner(false);
         let (outcome, lines) =
-            crate::test_logger::capture(|| investigate_at(&scanner, &address, "acme", None));
+            crate::test_logger::capture(|| investigate_at(&scanner, &address, "acme", None, false));
         let report = outcome.expect("a shape-valid foreign login must not abort the scan");
         server.join();
 
@@ -1043,7 +1031,7 @@ mod tests {
 
         let scanner = token_scanner(false);
         let report =
-            investigate_at(&scanner, &address, "ACME", None).expect("the scan must succeed");
+            investigate_at(&scanner, &address, "ACME", None, false).expect("the scan must succeed");
         server.join();
 
         assert_eq!(report.org.login, "acme");
@@ -1092,7 +1080,7 @@ mod tests {
 
         let scanner = token_scanner(false);
         let (outcome, lines) =
-            crate::test_logger::capture(|| investigate_at(&scanner, &address, "acme", None));
+            crate::test_logger::capture(|| investigate_at(&scanner, &address, "acme", None, false));
         let report = outcome.expect("the scan must succeed despite the malformed entry");
         server.join();
 
@@ -1164,7 +1152,7 @@ mod tests {
 
         let scanner = token_scanner(false);
         let report =
-            investigate_at(&scanner, &address, "acme", None).expect("the scan must succeed");
+            investigate_at(&scanner, &address, "acme", None, false).expect("the scan must succeed");
         server.join();
 
         assert_eq!(report.org.login, "acme");
@@ -1174,6 +1162,73 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("/orgs/acme/repos?type=public&")),
             "the repositories listing must request type=public: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn an_opted_in_fork_is_scanned_like_any_other_repository() {
+        // `--include-forks`: the same listing holding a fork is scanned in
+        // full when the caller opted in — the fork's own commits are the
+        // caller's explicit choice, and the skipped-forks warning must not
+        // fire (nothing was skipped)
+        let (address, server) = serve_requests(move |_index, request| {
+            let line = request.first().map(String::as_str).unwrap_or("");
+            if line.contains("/orgs/acme/repos") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        r#"[{"name": "upstream-fork", "fork": true}, {"name": "one"}]"#.to_string(),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            if line.contains("/orgs/acme/public_members") {
+                return (200, vec![], "[]".to_string());
+            }
+            if line.contains("/repos/acme/upstream-fork/commits") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        format!("[{}]", commit_json("Forker", "forker@example.com")),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            if line.contains("/repos/acme/one/commits") {
+                return match crate::github::mock::request_line_page(request) {
+                    1 => (
+                        200,
+                        vec![],
+                        format!("[{}]", commit_json("Alice", "alice@acme.com")),
+                    ),
+                    _ => (200, vec![], "[]".to_string()),
+                };
+            }
+            (
+                200,
+                vec![],
+                r#"{"login": "acme", "name": "Acme Corp"}"#.to_string(),
+            )
+        });
+
+        let scanner = token_scanner(false);
+        let (outcome, lines) =
+            crate::test_logger::capture(|| investigate_at(&scanner, &address, "acme", None, true));
+        let report = outcome.expect("the opted-in scan must succeed");
+        server.join();
+
+        // both repositories were scanned, the fork's emails reported like
+        // any other repository's
+        assert_eq!(report.scanned.repos, 2, "the fork must be scanned");
+        assert_eq!(
+            report.emails.per_repository.get("acme/upstream-fork"),
+            Some(&vec!["forker@example.com".to_string()])
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("forked")),
+            "nothing was skipped: no fork warning may fire: {lines:?}"
         );
     }
 
@@ -1217,7 +1272,7 @@ mod tests {
 
         let scanner = token_scanner(false);
         let (outcome, lines) =
-            crate::test_logger::capture(|| investigate_at(&scanner, &address, "acme", None));
+            crate::test_logger::capture(|| investigate_at(&scanner, &address, "acme", None, false));
         let report = outcome.expect("the scan must succeed despite the fork");
         server.join();
 
@@ -1247,6 +1302,7 @@ mod tests {
     #[test]
     fn the_report_serializes_the_documented_json_shape() {
         let report = OrgReport {
+            provenance: crate::output::Provenance::now(),
             org: OrgInfo {
                 login: "acme".to_string(),
                 name: Some("Acme Corp".to_string()),
@@ -1272,6 +1328,7 @@ mod tests {
                     languages: Vec::new(),
                     first_seen_repo: "acme/one".to_string(),
                     total_hits: 1,
+                    last_commit_date: None,
                 }],
             },
             scanned: OrgScanned { repos: 1, pages: 5 },
@@ -1302,6 +1359,14 @@ mod tests {
         assert_eq!(
             parsed["correlation"]["authors"][0]["emails"],
             serde_json::json!(["alice@acme.com"])
+        );
+        // the provenance is universal (doc/src/OUTPUT.md: every report
+        // carries it): a dropped field must fail this shape test
+        assert_eq!(parsed["tool_version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            parsed["generated_at"]
+                .as_str()
+                .is_some_and(|stamp| stamp.len() == 20 && stamp.ends_with('Z'))
         );
     }
 }

@@ -23,7 +23,7 @@ Six subcommands (`src/main.rs`, clap derive):
 |---|---|---|
 | `scan --url <repo-or-profile>` | emails of a repository or profile | `src/sources/` |
 | `search --query <q>` | keyword search + parallel scan | `src/sources/search.rs` |
-| `user <username>` | full profile investigation (usernames/names history via the noreply technique, email variants, secondary accounts, SSH keys, external contributions) | `src/user.rs` |
+| `user <username>` | full profile investigation (usernames/names history via the noreply technique, email variants, secondary accounts, SSH keys, external contributions) | `src/user/` |
 | `email <address>` / `emails <file>` | reverse email → account (heuristic, confidence-graded) | `src/email.rs` |
 | `org <org>` | organization members + repositories + emails | `src/org.rs` |
 
@@ -54,11 +54,10 @@ an async runtime "just this once".
 3. **Zero runtime panics**: `clippy::unwrap_used`, `expect_used`, `panic`,
    `todo`, `unimplemented`, `unreachable` are `deny` in `Cargo.toml`.
    Production code returns `Result`; the only allowed production `expect`s
-   are the two documented static-regex inits (`src/parsers.rs`) and the two
-   justified `#[expect]` allowances inventoried with their justification in
+   are the two documented static-regex inits (`src/parsers.rs`) and the one
+   justified `#[expect]` allowance inventoried with its justification in
    `Cargo.toml`'s lint table (`clippy::large_enum_variant` on the CLI
-   `Command` enum in `src/main.rs`, `clippy::too_many_arguments` on
-   `output::write_scan_report_json` — `#[expect]`, so a stale allowance fails the
+   `Command` enum in `src/main.rs` — `#[expect]`, so a stale allowance fails the
    build). Tests may panic freely.
 4. **No async/tokio**: threads from `std` (`std::thread::scope`) +
    `reqwest` blocking client. One dedicated token per parallel worker.
@@ -84,17 +83,24 @@ src/
 │   ├── client.rs      Client + TokenPool: rotation, retry-after, quota semantics
 │   ├── mod.rs         the fetch_paginated family's shared wiring
 │   ├── paginated.rs   the ONE pagination loop (page-size aware, caps, 422 handling)
+│   ├── pool.rs        the token-dedicated worker pool shared by search/org/emails
 │   └── mock.rs        loopback mock HTTP server used by every offline test
 ├── sources/
 │   ├── mod.rs         CLI-facing Scanner + shared rules: is_usable_email, noreply handling
+│   ├── parallel.rs    the token-dedicated worker pool shared by search/org/emails
 │   ├── profile.rs     profile scan (events walk, 300-event cap)
-│   ├── repository.rs  repository scan (per-repo commit budget)
-│   └── search.rs      keyword search, qualifier validation, parallel workers
-├── user.rs            `user` investigation + variant engine (caps, ranking)
+│   ├── repository.rs  repository scan (full-history commit walk)
+│   └── search.rs      keyword search, qualifier validation, listing parsing
+├── user/              `user` investigation
+│   ├── mod.rs         the engine (commit walk, folding, aggregation) + tests
+│   ├── parsing.rs     the API payload parsers (profile, listings)
+│   ├── report.rs      the report structs + terminal summary
+│   └── variants.rs    the variant engine (capped combinatorics, ranking)
 ├── email.rs           `email`/`emails` reverse lookup (heuristic, budgets)
 ├── org.rs             `org` investigation (members, repos, parallel scan)
 ├── correlate.rs       per-author correlation report (JSON)
-├── output.rs          text results + JSON reports (atomic publish)
+├── output.rs          text results + JSON/CSV reports (atomic publish)
+├── sanitize.rs        shared log-safety sanitizer (terminal strings, file names)
 ├── test_logger.rs     capturing log sink backing the sanitization pins (test-only)
 └── parsers.rs         URL parsing (host rules), static regexes
 ```
@@ -109,16 +115,21 @@ src/
 - **Reports publish atomically** (`output.rs::publish_atomically`): staging
   file + rename, permissions preserved, symlink targets refused. Two
   concurrent instances must never tear a file.
-- **Rate limits**: core quota (5000/h) aborts with
-  `Error::RateLimitExhausted` only when *every* token is exhausted;
-  a 403/429 with `Retry-After` **parks** the token until the deadline
-  (capped at 1 h) while others keep working; a 401 rejects the token
+- **Rate limits**: core quota (5000/h) parks the token until the
+  `x-ratelimit-reset` instant (capped at 1 h; retired instead only when the
+  header is absent) and aborts with `Error::RateLimitExhausted` only when
+  *every* token is unusable; a secondary limit (429/`Retry-After`/abuse
+  body) **parks** the token until the deadline (capped at 1 h) while others
+  keep working, and a drained-on-secondary-pauses run aborts with the
+  dedicated `Error::RateLimitPaused`; a 401 rejects the token
   (`Error::TokenRejected`) only after no other token could take over.
 - **Caps inventory** (each warns honestly when it bites, never silently
-  truncates): per-repository commits 10 pages × 100; profile events
-  timeline 300 (GitHub-documented); search results 1000 (GitHub-documented);
-  email-lookup candidates 50; variant engine 64 name pairs × 64 domains ×
-  1000 generated (+ ≤ 64 custom `--variant-pattern` templates).
+  truncates): profile events timeline 300 and search results 1000
+  (both GitHub-documented); variant engine 64 name pairs × 64 domains ×
+  1000 generated (+ ≤ 64 custom `--variant-pattern` templates). The commit
+  walks carry **no local cap**: every repository listing covers its full
+  default-branch history and ends when GitHub's listing ends (a short
+  page) — the token pool, not a local budget, bounds a run.
 - **Noreply discipline**: `id+username@users.noreply.github.com` feeds the
   histories, never the emails list; the web-flow identity
   (`noreply@github.com`) is never a secondary account; foreign-forge
@@ -127,7 +138,7 @@ src/
   reports `scanned.partial`; never-processed bulk work is `skipped`,
   never "unmatched".
 - **Documented API deltas** (README "API-only deltas" sections): the REST
-  commits API exposes the default branch only; the noreply history requires
+  commit walk covers the default branch only (per-branch walking is a cost decision, not an API limit); the noreply history requires
   id+username commits; the reverse-email heuristic only sees candidate
   repositories whose name/description/topics match. Keep these claims in
   sync when touching the code.
@@ -152,7 +163,7 @@ tagging (the release workflow reads it).
 Writing a test: build the mock with `serve_requests` (closure per request),
 drive the `_at`-suffixed internal entry point against the mock base URL,
 assert on report shapes **and** on `scanned`/request counts. Look at
-`src/user.rs` and `src/org.rs` tests for the patterns (planted-data
+`src/user/mod.rs` and `src/org.rs` tests for the patterns (planted-data
 adversarial cases, hostile payloads, concurrent publishers).
 
 ## 6. Repository conventions (maintainer requirements)

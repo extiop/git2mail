@@ -9,7 +9,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # pinned like the other workflows (one image moving under a run must be a visible decision)
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
 
@@ -30,7 +31,8 @@ jobs:
 
   deploy:
     needs: build
-    runs-on: ubuntu-latest
+    # pinned like the other workflows (one image moving under a run must be a visible decision)
+    runs-on: ubuntu-26.04
     environment:
       name: github-pages # GitHub automatically uses this environment for Pages
       url: ${{ steps.deployment.outputs.page_url }}

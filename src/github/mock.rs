@@ -252,11 +252,19 @@ pub(crate) fn request_line_page(request_lines: &[String]) -> u16 {
 }
 
 /// Writes a temporary token-pool file for tests and returns its path: the
-/// caller removes it after use. `unique` keeps concurrent test files apart.
+/// caller removes it after use. `unique` keeps a caller's own files apart,
+/// and a process-global counter keeps DIFFERENT callers' files apart: the
+/// paginated and client test modules run in the same test process (same
+/// pid, parallel test threads) and reuse the same `unique` values with
+/// different contents, so without the counter a concurrent test could read
+/// or delete another module's file.
 pub(crate) fn temp_token_file(contents: &str, unique: u32) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQUENCE: AtomicU32 = AtomicU32::new(0);
     let path = std::env::temp_dir().join(format!(
-        "git2mail_token_pool_test_{}_{unique}.json",
-        std::process::id()
+        "git2mail_token_pool_test_{}_{unique}_{}.json",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::write(&path, contents).expect("test setup: write temp file");
     path
