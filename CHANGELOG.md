@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-10-26
+
+A documentation release with one breaking output change: the README
+becomes a short landing page and the user guide (the mdBook) grows to
+one page per subject, so every deep topic has exactly one home.
+
+### Changed
+
+- **BREAKING:** every plain-text result file now carries a `.log`
+  extension, so it opens natively in the default text editor (Windows
+  Notepad included): `results/repository/<owner>[_<repo>].log`,
+  `results/profile/<user>.log`, `results/keyword/<query>[_<language>].log`,
+  `results/user/<login>.log` and `results/org/<org>.log` replace the
+  extensionless names. The extension is appended after sanitization, so
+  the reserved-device-name prefix (`_CON.log`, never `CON.log`), the
+  200-byte stem cap and the anti-clobber hash are unchanged, and an
+  unchanged target keeps its exact name plus the extension
+  (`octocat_Hello-World` becomes exactly `octocat_Hello-World.log`).
+  Old extensionless files are not migrated: new runs write `<name>.log`
+  and the stale file stays behind — the path the run prints is
+  authoritative. The file remains a complete snapshot of the run, not an
+  append-only log. `--json` and `--csv` paths stay exactly as you name
+  them, and the exit codes (0/1/2/3) and the `[!]` stderr marker are
+  unchanged: pipelines keying on them are unaffected.
+- The README shrinks to a short landing (pitch, subcommand table,
+  quickstart, one measured performance number, condensed examples) and
+  the user guide grows from three pages to one page per subject:
+  Scanning (scan & search), User investigation, Organization
+  investigation, Reverse email lookup, Reports & files on disk, Data
+  quality & limitations, GitHub API usage — including a new
+  "Network egress: proxies and Tor" page (verified against the bundled
+  HTTP stack: case-sensitive lowercase proxy schemes, `socks5h` resolves
+  hostnames proxy-side, anonymous runs through Tor share the exit's
+  60-requests-per-hour quota, and the startup check proves the proxy at
+  launch, not the whole run's path).
+
 ## [0.7.0] - 2026-10-26
 
 git2mail grows from 2 to 6 subcommands: the tool now investigates whole
