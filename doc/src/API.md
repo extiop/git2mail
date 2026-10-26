@@ -32,10 +32,12 @@ Two guards bound the loop:
 
 ## Network egress: proxies and Tor
 
-The HTTP client honors the standard proxy environment variables exactly
-the way the HTTP stack resolves them, and git2mail checks them at
-startup, announces the proxy actually used, and loudly warns instead of
-silently falling back when a configured proxy is unusable.
+The HTTP client honors the standard proxy environment variables with the
+same precedence rules the HTTP stack applies, and git2mail checks them
+at startup, announces the proxy actually used, and loudly warns instead
+of silently falling back when a configured proxy is unusable (the check
+mirrors the stack conservatively: a value it cannot vouch for is warned
+about, which only ever over-warns — never the reverse).
 
 ### What the stack honors
 
@@ -45,11 +47,15 @@ silently falling back when a configured proxy is unusable.
   usually means a proxy is configured but scoped elsewhere).
 - `ALL_PROXY` (or `all_proxy`) is the fallback, used only when the
   primary variable is absent or unusable.
-- Proxy schemes are **case-sensitive** and lowercase-only: `socks5://`,
-  `socks5h://`, `socks4://`, `socks4a://`, `http://`, `https://` work;
-  `SOCKS5://` is not recognized by the stack (a warning names it).
+- Proxy schemes: the `http` and `https` schemes are accepted
+  case-insensitively (`HTTP://proxy:8080` works); the `socks` schemes
+  (`socks5://`, `socks5h://`, `socks4://`, `socks4a://`) are matched
+  case-**sensitively** and lowercase-only — `SOCKS5://` is not
+  recognized by the stack (a warning names it). A scheme-less bare
+  authority is assumed `http`.
 - A set-but-empty variable counts as set and shadows its lowercase
-  twin: the run goes direct and the warning says so.
+  twin: the fallback (if any) is used instead — when no fallback
+  exists, the run goes direct — and the warning names the outcome.
 - A set `NO_PROXY` can bypass the proxy for some hosts: warned about
   when a proxy is in use.
 - A set `REQUEST_METHOD` (the stack's CGI marker) makes the stack
@@ -75,9 +81,9 @@ Tor.
 Two honesty notes, stated plainly:
 
 - **The startup check proves the proxy at launch, not the whole run's
-  path.** It resolves the environment exactly like the HTTP stack and
-  announces the proxy in use, but it is not a continuous guarantee:
-  before a sensitive run, verify your exit IP.
+  path.** It resolves the environment with the stack's own precedence
+  rules and announces the proxy in use, but it is not a continuous
+  guarantee: before a sensitive run, verify your exit IP.
 - **Anonymous runs through Tor are practically unusable**: GitHub's
   anonymous quota (about 60 requests per hour) is shared by every user
   of that exit node, so a shared exit is spent before your first scan

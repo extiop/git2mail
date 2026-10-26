@@ -695,7 +695,7 @@ fn main() {
         // exit code 3 is the "completed but found nothing" code (an empty
         // scan/search result): scripting branches on it to tell a live but
         // email-less target apart from a real failure (documented in the
-        // README's scripting notes)
+        // user guide's exit-code and scripting-notes sections)
         let code = if matches!(err, Error::NoResults) {
             3
         } else {

@@ -97,11 +97,11 @@ counts only processed addresses):
 ```json
 {
   "generated_at": "2026-02-14T18:22:33Z",
-  "tool_version": "0.7.0",
+  "tool_version": "0.8.0",
   "results": [
     {
       "generated_at": "2026-02-14T18:22:41Z",
-      "tool_version": "0.7.0",
+      "tool_version": "0.8.0",
       "email": "jane.dupont@acme.com", "account": null, "evidence": null, "candidates": []
     }
   ],

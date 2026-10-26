@@ -82,7 +82,8 @@ pub struct OrgScanned {
 }
 
 /// The full organization investigation report: the terminal summary
-/// sections and the `--json` shape, documented in the README.
+/// sections and the `--json` shape, documented in the user guide (ORG.md
+/// page).
 #[derive(Debug, Clone, Serialize)]
 pub struct OrgReport {
     /// The when/what of the report (generation timestamp, tool version).

@@ -34,12 +34,13 @@ one page per subject, so every deep topic has exactly one home.
   the user guide grows from three pages to one page per subject:
   Scanning (scan & search), User investigation, Organization
   investigation, Reverse email lookup, Reports & files on disk, Data
-  quality & limitations, GitHub API usage — including a new
-  "Network egress: proxies and Tor" page (verified against the bundled
-  HTTP stack: case-sensitive lowercase proxy schemes, `socks5h` resolves
-  hostnames proxy-side, anonymous runs through Tor share the exit's
-  60-requests-per-hour quota, and the startup check proves the proxy at
-  launch, not the whole run's path).
+  quality, prevention & limitations, GitHub API usage — the latter with
+  a new "Network egress: proxies and Tor" section (verified against the
+  bundled HTTP stack: socks proxy schemes matched case-sensitively
+  while `http`/`https` are accepted case-insensitively, `socks5h`
+  resolves hostnames proxy-side, anonymous runs through Tor share the
+  exit's 60-requests-per-hour quota, and the startup check proves the
+  proxy at launch, not the whole run's path).
 
 ## [0.7.0] - 2026-10-26
 

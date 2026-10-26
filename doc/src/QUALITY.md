@@ -17,9 +17,13 @@ commit URL as `https://github.com/<owner>/<repo>/commit/<sha>`. The
 sha, so the reverse lookup is the evidence step.
 
 A note on pull requests: when a contributor's pull request was
-squash-merged through GitHub's web interface, the commit is authored by
-GitHub's `noreply@github.com` alias, which this tool deliberately
-excludes. A prolific pull-request contributor can therefore stay
+squash-merged through GitHub's web interface, the squashed commit's
+**author** email is the contributor's private
+`id+username@users.noreply.github.com` alias (GitHub stamps its own
+web-flow identity, `noreply@github.com`, as the **committer**). The
+`scan` and `search` subcommands filter out the
+`users.noreply.github.com` domain, so the squashed commit contributes
+nothing to them: a prolific pull-request contributor can therefore stay
 invisible to the `scan` and `search` subcommands; the `user` subcommand
 recovers their identities through the commit history instead.
 

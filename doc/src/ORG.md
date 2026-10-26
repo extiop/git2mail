@@ -50,7 +50,7 @@ With `--json`, the report carries the documented shape:
 ```json
 {
   "generated_at": "2026-02-14T18:40:12Z",
-  "tool_version": "0.7.0",
+  "tool_version": "0.8.0",
   "org": { "login": "acme", "name": "Acme Corp", "blog": "https://acme.example" },
   "members": ["alice", "bob"],
   "repositories": ["one", "two"],

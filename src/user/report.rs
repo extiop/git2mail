@@ -156,7 +156,7 @@ pub struct ExternalContribution {
 }
 
 /// The full investigation report: the terminal summary sections and the
-/// enriched `--json` shape, documented in the README.
+/// enriched `--json` shape, documented in the user guide (USER.md page).
 #[derive(Debug, Clone, Serialize)]
 pub struct UserReport {
     /// The when/what of the report (generation timestamp, tool version).

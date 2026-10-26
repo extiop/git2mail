@@ -55,7 +55,9 @@ atomically.
 ## Startup proxy check
 
 Before the first request, the run resolves the environment's proxy
-variables exactly the way the HTTP stack resolves them. What is actually
+variables with the same precedence rules as the HTTP stack, mirrored
+conservatively: a value the check cannot vouch for is warned about
+rather than trusted. What is actually
 used is announced in the log, and a set-but-unusable variable is named
 with a loud warning instead of the stack's silent fallback to a direct
 connection; proxy variable values are never logged (a proxy URL can
@@ -95,7 +97,7 @@ write to a timestamped file name and swap the symlink yourself.
   "per_repository": { "owner/repo": ["email@example.com"] },
   "scanned": { "repos": 12, "pages": 30, "partial": false },
   "generated_at": "2026-02-14T18:22:33Z",
-  "tool_version": "0.7.0",
+  "tool_version": "0.8.0",
   "correlation": {
     "authors": [
       {

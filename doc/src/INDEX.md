@@ -82,6 +82,52 @@ and `pkg-config` (the bundled TLS library compiles C code; on macOS,
 start with `xcode-select --install` then `brew install cmake
 pkg-config`).
 
+### Running the downloaded binary
+
+Pick the file for your computer: `git2mail-windows-v<version>.exe`
+(Windows), `git2mail-macos-v<version>` (Mac, Apple Silicon) or
+`git2mail-linux-static-v<version>` (Linux; "static" means one single
+file, nothing else to install). The builds are signed and logged by
+GitHub's artifact attestation (a receipt GitHub generates at build time,
+proving this exact file came from this repository's official build
+pipeline); verifying requires the GitHub CLI `gh`:
+`gh attestation verify --repo extiop/git2mail <file>`, as described in
+each release's notes. Replace `<version>` below with the version you
+downloaded, without the leading `v`.
+
+Then open a terminal (the text window on your computer: Terminal on Mac
+and Linux, PowerShell on Windows) in your Downloads folder and run the
+program from there:
+
+- **Windows:** open the Downloads folder in File Explorer, type
+  `powershell` in the address bar and press Enter, then run the program
+  with its real file name, for example
+  `./git2mail-windows-v0.8.0.exe scan --url https://github.com/octocat/Hello-World`
+  (a small repository: the anonymous quickstart in the README completes
+  on it). If Windows shows a "Windows protected your PC" screen, first
+  verify the file's attestation (`gh attestation verify --repo
+  extiop/git2mail <file>`, with the GitHub CLI `gh` installed), then
+  click *More info* and *Run anyway* (the program is not digitally
+  signed).
+- **Mac:** in Terminal, type `cd ~/Downloads` then
+  `chmod +x git2mail-macos-*` (make it executable) and run a first scan,
+  for example `./git2mail-macos-v0.8.0 scan --url
+  https://github.com/octocat/Hello-World`. Running the file bare prints
+  the help and exits. If the terminal instead prints `zsh: killed` with
+  no dialog, macOS silently refused the quarantined file: clear the
+  block with `xattr -d com.apple.quarantine git2mail-macos-*` and run it
+  again. If macOS says it "cannot be opened because it is from an
+  unidentified developer": right-click the file, choose *Open* then
+  *Open* again, or clear the block with the same `xattr` command. The
+  downloaded program is built for Apple Silicon Macs; on an Intel Mac,
+  build from source instead (above).
+- **Linux:** `chmod +x git2mail-linux-static-*` then run a first scan,
+  for example `./git2mail-linux-static-v0.8.0 scan --url
+  https://github.com/octocat/Hello-World`.
+
+The tool is not on Homebrew: get the release binary (above) or build
+from source with Cargo.
+
 ## Design principles
 
 - **GitHub REST API only.** No HTML scraping, no binary git dependency:

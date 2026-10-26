@@ -34,9 +34,9 @@ logged by GitHub's artifact attestation.
 | Command | When to use it |
 |---|---|
 | `scan --url <repo-or-profile>` | You have one repository or profile URL: it recovers the emails behind its commits. |
-| `search --query <q>` | You have a topic, not a target: it searches GitHub and scans every matching repository (metadata filters included). |
+| `search --query <q>` | You have a topic, not a target: it searches GitHub and scans the matching repositories (top 5 by default, `--limit N` to change; metadata filters included). |
 | `user <username>` | You have a login: full profile investigation — usernames/names history, email variants, secondary accounts, SSH keys, external contributions. |
-| `email <address>` | You have one address: reverse lookup back to the GitHub account, with a confidence grade. |
+| `email <address>` | You have one address: reverse lookup back to the GitHub account, with a confidence grade (`commit-author` proven by a commit, `repo-owner-weak` a presumption only). |
 | `emails <file>` | You have many addresses: the same reverse lookup in bulk over the token pool. |
 | `org <org>` | You have an organization: members, repositories, and the emails found scanning them. |
 
@@ -99,11 +99,15 @@ startup — on a sensitive target, verify your exit IP (see the guide's
 > `.log` extension, so a double-click opens them in your default text
 > editor.
 
-The result file is one email per line, ready to paste. These addresses
+The result file is one email per line, ready to paste. A URL copied
+from a GitHub page is cleaned where it can be (trailing `/`, `?tab=…`)
+or fails with a named error — a `/tree/…` link targets a subfolder:
+paste the repository root. These addresses
 are read from public commit metadata: they can be old or spoofed — see
 [Data quality](https://extiop.github.io/git2mail/) before contacting
 anyone, and remember a prolific pull-request contributor whose PRs were
-squash-merged through GitHub's web UI can stay invisible to scans.
+squash-merged through GitHub's web UI can stay invisible to the scan and
+search commands.
 
 ### 3. Create a token for real scans
 
@@ -132,10 +136,10 @@ during this measurement, so the wall time includes proxy round-trips; a
 direct connection may be faster or slower. Extra tokens deepen the
 request quota and parallelize multi-repository runs (one worker per live
 token pulls repositories from a shared queue), but a single repository's
-history walk is sequential and is not made faster by them. Scans are
-bounded only by GitHub's API itself — nothing is truncated locally — and
-a scan that loses coverage mid-run says so (`scanned.partial` in its
-JSON report).
+history walk is sequential and is not made faster by them. A history
+walk is bounded only by GitHub's API itself — nothing is truncated
+locally — and a scan that loses coverage mid-run says so
+(`scanned.partial` in its JSON report).
 
 ## Examples
 
@@ -161,8 +165,8 @@ git2mail org "acme" --token-file tokens.json
 ```
 
 Add `--json report.json` to any command to save the structured report
-(`--json -` prints it to stdout for pipes), or `--csv authors.csv` on the
-scan subcommands for a one-row-per-developer spreadsheet.
+(`--json -` prints it to stdout for pipes), or `--csv authors.csv` on
+scan, search and org for a one-row-per-developer spreadsheet.
 
 ## Roadmap
 

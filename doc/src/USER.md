@@ -113,7 +113,7 @@ With `--json`, the enriched report carries the documented shape:
 ```json
 {
   "generated_at": "2026-02-14T18:22:33Z",
-  "tool_version": "0.7.0",
+  "tool_version": "0.8.0",
   "profile": { "login": "jane-doe", "id": 42, "name": "Jane Dupont", "...": null },
   "usernames_history": [{ "username": "oldname", "names": ["jane d."], "repos": ["jane/old"] }],
   "names_history": [{ "name": "jane dupont", "repos": ["jane/old"] }],
