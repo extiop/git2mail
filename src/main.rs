@@ -138,7 +138,7 @@ enum Command {
     },
     /// Investigate a GitHub organization: its public members, its public
     /// repositories and the developers' emails found scanning them (the
-    /// emails are also saved to the file results/org/<org>; add `--json`
+    /// emails are also saved to the file results/org/<org>.log; add `--json`
     /// for the full report). A token is strongly recommended: the walk
     /// covers every listed repository and aborts on a spent anonymous
     /// allowance.
@@ -518,7 +518,7 @@ fn write_report_deliverable<T: serde::Serialize>(
 }
 
 /// Runs the `org` subcommand: the investigation, the paste-able
-/// `results/org/<org>` text file, and the JSON deliverable.
+/// `results/org/<org>.log` text file, and the JSON deliverable.
 ///
 /// An empty result is a successful run (user/email parity): `log_summary`
 /// already printed the org-scoped `[-]` no-results line, and `NoResults`'

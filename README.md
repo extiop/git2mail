@@ -137,7 +137,7 @@ Starting git2mail!
 [!] no token provided: running anonymously, limited to 60 requests/hour — create one at github.com/settings/tokens and use --token or --token-file <tokens.json> for 5000 requests/hour each
 --------------------------------
 [+] Found 3 emails
-[+] Result is available at results/repository/octocat_Hello-World
+[+] Result is available at results/repository/octocat_Hello-World.log
 [+] Top author 1: John Doe <john@doe.example> — unknown language, 1 commits
 ```
 
@@ -161,9 +161,8 @@ reveal.
 > (0600 on Unix) rather than world-readable. Store and share them with the
 > same care as the data itself, delete them when you are done, and add
 > `results/` to your `.gitignore` if you run this tool inside a git
-> repository. The result files have no file extension: if double-clicking
-> one does nothing, right-click it, choose *Open with* and pick a text
-> editor (Notepad, TextEdit, VS Code).
+> repository. The result files carry a `.log` extension, so a double-click
+> opens them in your default text editor (Notepad, TextEdit, VS Code).
 
 The result file is a plain list of email addresses, one per line: open it
 in any text editor, or copy the addresses into a spreadsheet, an email
@@ -275,7 +274,7 @@ GitHub's, so a URL pointing at another server (a GitLab or Gitea remote,
 for instance) would otherwise be silently scanned against the github.com
 namesake.
 
-A trailing `.git` suffix is kept verbatim as part of the repository name: it is passed through to the GitHub API request and included in the output file name (`results/repository/some-user_my-repo.git`). Since the GitHub API only resolves repository names without the suffix (`GET /repos/some-user/my-repo.git` answers 404, verified live), a scan with a `.git` URL always fails with "GitHub resource not found": the suffix documents a passthrough guarantee, not a usable input form: drop it before scanning.
+A trailing `.git` suffix is kept verbatim as part of the repository name: it is passed through to the GitHub API request and included in the output file name (`results/repository/some-user_my-repo.git.log`, the `.log` extension appended after the passthrough name). Since the GitHub API only resolves repository names without the suffix (`GET /repos/some-user/my-repo.git` answers 404, verified live), a scan with a `.git` URL always fails with "GitHub resource not found": the suffix documents a passthrough guarantee, not a usable input form: drop it before scanning.
 
 A trailing `/` on the URL, however, is a leftover from copy-pasting, never part of the repository name: it is trimmed before the request (`https://github.com/some-user/my-repo/` targets `some-user/my-repo`, not the guaranteed-404 `my-repo%2F`). A link copied from a file browsing page (`/tree/<branch>/…`) targets a subfolder, not the repository root: paste the repository root URL instead. The other github.com page-navigation leftovers from copy-pasting (`?tab=repositories`, `?plain=1#L12`, `#readme`…) are stripped the same way, since no GitHub login or repository name contains `?` or `#`. The URL scheme is case-insensitive too: `HTTPS://GITHUB.COM/some-user/my-repo` parses exactly like its lowercase form (login/repository case is preserved). A profile URL has no name after its separator to trim, so a trailing `/` there is rejected as an invalid URL.
 
@@ -327,7 +326,7 @@ Result files and JSON reports are written to a temporary file first, then rename
 }
 ```
 
-In this mode, your results will be stored per profile with the following relative path, from your current working directory: `results/profile/$author`. If a repository is defined, it will be at `results/repository/$author_$repository`. A name the tool had to change (sanitized) carries a 16-hex-digit suffix derived from the original name, so two different targets whose names collapse onto the same sanitized file name cannot silently overwrite each other on a case-sensitive filesystem; on a case-insensitive one (macOS, Windows), two targets differing only by case share a file name. An unchanged name keeps its exact file name, and the exact target is always printed with every report. The run always prints the real path of every file it writes. The JSON report records when it ran (`generated_at`), which version
+In this mode, your results will be stored per profile with the following relative path, from your current working directory: `results/profile/$author.log`. If a repository is defined, it will be at `results/repository/$author_$repository.log`. A name the tool had to change (sanitized) carries a 16-hex-digit suffix derived from the original name, so two different targets whose names collapse onto the same sanitized file name cannot silently overwrite each other on a case-sensitive filesystem; on a case-insensitive one (macOS, Windows), two targets differing only by case share a file name. An unchanged name keeps its exact file name, and the exact target is always printed with every report. The run always prints the real path of every file it writes. The JSON report records when it ran (`generated_at`), which version
 produced it (`tool_version`) and, on a keyword search, the exact query,
 language filter and qualifiers used (`request`); qualifiers are GitHub's
 `key:value` search filters such as `stars:>100`, so two runs with
@@ -346,7 +345,7 @@ The `user` subcommand investigates one GitHub profile end to end, 100% API (no c
 git2mail user "jane-doe" --token "$YOUR_TOKEN"
 ```
 
-It accepts the shared `--token`/`--token-file`/`--json` flags and reports, both in the terminal log and in the opt-in JSON report. The observed email addresses are also saved to `results/user/<username>`, one per line, the same paste-able file the scan and `org` subcommands write:
+It accepts the shared `--token`/`--token-file`/`--json` flags and reports, both in the terminal log and in the opt-in JSON report. The observed email addresses are also saved to `results/user/<username>.log`, one per line, the same paste-able file the scan and `org` subcommands write:
 
 - **Profile**: the account fields that carry OSINT value (name, company, blog, location, public email, bio, creation date, account type, Twitter/X handle and public repository count). An organization target is rejected with a clear error pointing at the `org` subcommand.
 - **Usernames/names history**: the *noreply technique*: GitHub hides users' real email in commits behind an alias like `12345+jane@users.noreply.github.com`, and the number in that alias is the account's ID, so matching it exposes usernames the account used in the past. The username in the alias is written by the commit author's Git configuration, not by GitHub: treat it as strong evidence, not as a verified fact. The target's own repositories' commits are scanned, and every author/committer email shaped `<id>+<username>@users.noreply.github.com` whose numeric `id` equals the target's reveals a username the account used in the past (with the commit names seen with it and the repositories where it appeared). The older pre-2017 form `<id>@users.noreply.github.com` attributes the current username only.
@@ -404,7 +403,7 @@ It accepts the shared `--token`/`--token-file`/`--json` flags plus an optional `
 - **Org**: the `GET /orgs/{org}` fields that carry OSINT value (login, name, blog). A missing organization is a clean not-found error.
 - **Members**: the organization's publicly visible member usernames (just names on GitHub, no contact details; many companies hide this list entirely, and the endpoint only lists members who chose to publicize: a short list is not a malfunction). The emails below come from the repositories' commits, not from these members. To investigate one member, run `git2mail user <username>`.
 - **Repositories**: the public repositories (`GET /orgs/{org}/repos`, paginated).
-- **Emails**: the developers' emails found scanning the organization's repositories' commits with the same worker-per-token parallelism as the parallel `search`, reported per repository and globally (noreply addresses excluded, like every scan). The found addresses are also saved to `results/org/<org>`, one per line, the same paste-able file the scan subcommands write. For an exposure audit, the `per_repository` map is the finding: it
+- **Emails**: the developers' emails found scanning the organization's repositories' commits with the same worker-per-token parallelism as the parallel `search`, reported per repository and globally (noreply addresses excluded, like every scan). The found addresses are also saved to `results/org/<org>.log`, one per line, the same paste-able file the scan subcommands write. For an exposure audit, the `per_repository` map is the finding: it
 tells you which repository leaks which addresses; attribute a person to an
 address with `git2mail email <address>` before contacting them.
 
@@ -516,7 +515,7 @@ git2mail search --query nmap --language rust --token-file tokens.json --limit 5
 
 Without `--limit`, the search defaults to scanning 5 repositories.
 
-In this mode, your results will be stored per query with the following relative path, from your current working directory: `results/keyword/$query`. If a language is defined, it will be at `results/keyword/$query_$language`. As everywhere else, a name the tool had to change (sanitized) carries a 16-hex-digit suffix derived from the original name; the run always prints the real path of every file it writes.
+In this mode, your results will be stored per query with the following relative path, from your current working directory: `results/keyword/$query.log`. If a language is defined, it will be at `results/keyword/$query_$language.log`. As everywhere else, a name the tool had to change (sanitized) carries a 16-hex-digit suffix derived from the original name; the run always prints the real path of every file it writes.
 
 GitHub's repository search includes forks: like the profile and organization investigations, forked repositories are skipped with a warning (their commit history mirrors the upstream project's, so scanning them would report other projects' developers under the fork's name). Pass `--include-forks` to scan them too when the forks themselves are your subject.
 
@@ -552,7 +551,7 @@ To target one user's repositories on a topic:
 git2mail search --query nmap --topic osint --user octocat --token-file tokens.json
 ```
 
-`--user` and `--org` are mutually exclusive (the GitHub search API accepts only one owner filter). Values are validated client-side before any request: an obviously malformed range or date (say `--stars abc` or `--created 2020-13-01`) fails fast with a clear `invalid search filter` error instead of silently returning no result from the API. Count and date ranges follow the GitHub search range syntax (`>`, `>=`, `<`, `<=`, `start..end`, with `*` for an open end); dates accept the `YYYY`, `YYYY-MM` and `YYYY-MM-DD` granularities. An inverted range (`--stars 50..10`, `--created 2020-01-01..2019-01-01`) is well-formed but rejected client-side like every other malformed value; for dates this matters because GitHub itself does not reject an inverted range: it silently swaps the sides and quietly covers the opposite window. The stricter name rules are validated client-side too: a `--user`/`--org` value must be a valid GitHub login (ASCII letters, digits or hyphens; a login with `.` or `_` would silently match nothing) and a `--license`/`--topic` value must hold at least one alphanumeric character (a separator-only `...` or `--` would silently match nothing). Only one `--topic` value is accepted per run; to combine topics, pass them in the query itself (`--query "topic:osint topic:recon"`). The repository listing itself is capped at GitHub's documented 1000-result search ceiling: the over-ceiling page is never requested (the API answers it with a raw 422), so a query matching more than 1000 repositories scans at most the first 1000. The qualifiers are not part of the output file name: results are stored per query/language, so two runs differing only by their qualifiers write to the same `results/keyword/$query_$language` file, and the last run overwrites the previous one. For a systematic sweep over qualifiers, give each run its own `--json report-<qualifier>.json` path: the text file is the working list, the JSON reports are the archive.
+`--user` and `--org` are mutually exclusive (the GitHub search API accepts only one owner filter). Values are validated client-side before any request: an obviously malformed range or date (say `--stars abc` or `--created 2020-13-01`) fails fast with a clear `invalid search filter` error instead of silently returning no result from the API. Count and date ranges follow the GitHub search range syntax (`>`, `>=`, `<`, `<=`, `start..end`, with `*` for an open end); dates accept the `YYYY`, `YYYY-MM` and `YYYY-MM-DD` granularities. An inverted range (`--stars 50..10`, `--created 2020-01-01..2019-01-01`) is well-formed but rejected client-side like every other malformed value; for dates this matters because GitHub itself does not reject an inverted range: it silently swaps the sides and quietly covers the opposite window. The stricter name rules are validated client-side too: a `--user`/`--org` value must be a valid GitHub login (ASCII letters, digits or hyphens; a login with `.` or `_` would silently match nothing) and a `--license`/`--topic` value must hold at least one alphanumeric character (a separator-only `...` or `--` would silently match nothing). Only one `--topic` value is accepted per run; to combine topics, pass them in the query itself (`--query "topic:osint topic:recon"`). The repository listing itself is capped at GitHub's documented 1000-result search ceiling: the over-ceiling page is never requested (the API answers it with a raw 422), so a query matching more than 1000 repositories scans at most the first 1000. The qualifiers are not part of the output file name: results are stored per query/language, so two runs differing only by their qualifiers write to the same `results/keyword/$query_$language.log` file, and the last run overwrites the previous one. For a systematic sweep over qualifiers, give each run its own `--json report-<qualifier>.json` path: the text file is the working list, the JSON reports are the archive.
 
 ### Developer correlation
 

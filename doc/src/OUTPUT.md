@@ -40,11 +40,17 @@ scripting can tell "live but empty" apart from a real failure.
 
 | Scan | Path |
 |------|------|
-| Repository (`scan --url …/repo`) | `results/repository/<owner>[_<repo>]` |
-| Profile (`scan --url https://github.com/<user>`) | `results/profile/<user>` |
-| Search (`search --query …`) | `results/keyword/<query>[_<language>]` |
-| User investigation (`user <username>`) | `results/user/<username>` |
-| Organization investigation (`org <org>`) | `results/org/<org>` |
+| Repository (`scan --url …/repo`) | `results/repository/<owner>[_<repo>].log` |
+| Profile (`scan --url https://github.com/<user>`) | `results/profile/<user>.log` |
+| Search (`search --query …`) | `results/keyword/<query>[_<language>].log` |
+| User investigation (`user <username>`) | `results/user/<username>.log` |
+| Organization investigation (`org <org>`) | `results/org/<org>.log` |
+
+Every text result file carries the `.log` extension so a double-click opens
+it natively (Notepad, TextEdit, VS Code); the name before the extension is
+the sanitized target name (see "File names" below). Each `.log` file is a
+complete snapshot of its run, not an append-only log: a rerun replaces it
+atomically.
 
 ## Startup proxy check
 
@@ -159,8 +165,8 @@ own warnings and do not set the flag.
 
 The investigation subcommands write a JSON report to the path given by
 `--json` (`org` and `user` also write the same one-email-per-line text file
-as the scan subcommands, at `results/org/<org>` and
-`results/user/<username>`):
+as the scan subcommands, at `results/org/<org>.log` and
+`results/user/<username>.log`):
 
 - `user`: identity history, external contributions, generated email
   variants and the addresses they matched, potential secondary accounts,
@@ -179,7 +185,7 @@ as the scan subcommands, at `results/org/<org>` and
   surfaces the candidate repositories, each verified over its full
   default-branch history, until a `commit-author` match ends the lookup
   early); `org` additionally writes a
-  text file `results/org/<org>` with one found email per line,
+  text file `results/org/<org>.log` with one found email per line,
   ready to paste into a spreadsheet or outreach tool. An `emails` (bulk)
   report carries `skipped_addresses` (an empty list on a clean run): on an
   interrupted run it is the file-order list of the addresses a stopped

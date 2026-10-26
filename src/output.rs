@@ -331,8 +331,12 @@ fn publish_atomically(target: &Path, staging: &Path, content: &str) -> Result<()
 }
 
 /// Writes the legacy text output: one email per line, into
-/// `results/<directory>/<file_name>` relative to the current working
-/// directory. The text format is unchanged.
+/// `results/<directory>/<file_name>.log` relative to the current working
+/// directory. The `.log` extension is always appended (after
+/// [`sanitize_file_name`], so every sanitizer invariant holds on the stem
+/// and the extension rides on top): the plain-text deliverable must
+/// open natively in a default editor (Windows Notepad opens `.log` files
+/// without an *Open with* dance). The text format is unchanged.
 ///
 /// # Errors
 ///
@@ -358,6 +362,15 @@ pub fn write_text(
     // (`..\\x`) or Windows reserved device names (`CON`)
     let directory = sanitize_file_name(directory);
     let file_name = sanitize_file_name(file_name);
+    // the deliverable is always `<sanitized name>.log` (a double-clickable
+    // file for the tool's non-developer audience): the extension is appended
+    // after sanitization, so the reserved-device-name prefix, the 200-byte
+    // stem cap and the anti-clobber hash stay on the stem and the name of an
+    // unchanged target keeps its exact stem (`octocat_Hello-World` becomes
+    // exactly `octocat_Hello-World.log`). A raw name already ending in
+    // `.log` ends in `.log.log`: harmless and pinned, never stripped — the
+    // printed path is authoritative either way.
+    let file_name = format!("{file_name}.log");
 
     info!("--------------------------------");
     if emails.len() > 1 {
@@ -1027,7 +1040,9 @@ mod tests {
             fs::create_dir_all("results/keyword").expect("the results dir must be creatable");
             let real = Path::new("results/keyword/real.txt");
             fs::write(real, "sentinel").expect("the temp file must be writable");
-            let link = Path::new("results/keyword/acme.txt");
+            // the writer targets `<sanitized name>.log`: the symlink must sit
+            // exactly on the path the rename would take
+            let link = Path::new("results/keyword/acme.txt.log");
             std::os::unix::fs::symlink(real, link).expect("the symlink must be creatable");
 
             let error = write_text("keyword", "acme.txt", &["dev@acme.com".to_string()])
@@ -1243,8 +1258,8 @@ mod tests {
                 .expect("the file must be written");
             assert_eq!(
                 plain.file_name().and_then(|name| name.to_str()),
-                Some("a_b"),
-                "a name the sanitizer did not change keeps its exact file name"
+                Some("a_b.log"),
+                "a name the sanitizer did not change keeps its exact stem, with the .log extension"
             );
             assert_ne!(plain, path, "a/b and a_b must land in distinct files");
 
@@ -1818,8 +1833,12 @@ mod tests {
                 );
                 handle_a.join().expect("writer A must not panic");
                 handle_b.join().expect("writer B must not panic");
-                let content = fs::read_to_string(Path::new("results").join(&directory).join(&name))
-                    .expect("result must be readable");
+                let content = fs::read_to_string(
+                    Path::new("results")
+                        .join(&directory)
+                        .join(format!("{name}.log")),
+                )
+                .expect("result must be readable");
                 let all_a = content.lines().all(|line| line.starts_with("writerA-"));
                 let all_b = content.lines().all(|line| line.starts_with("writerB-"));
                 assert!(
@@ -1981,6 +2000,80 @@ mod tests {
             assert!(path.exists());
             let content = fs::read_to_string(&path).expect("result must be readable");
             assert_eq!(content, "a@b.c\n");
+        });
+    }
+
+    /// The plain-text deliverable always carries the `.log` extension, so a
+    /// double-click opens it natively (Windows Notepad). The extension is
+    /// appended AFTER sanitization: the reserved-device-name prefix, the
+    /// 200-byte stem cap and the anti-clobber hash stay on the stem, and the
+    /// whole path component stays far below the filesystem's 255-byte limit.
+    #[test]
+    fn write_text_always_appends_the_log_extension_after_sanitization() {
+        in_temp_cwd(|| {
+            let directory = format!("git2mail_output_test_log_{}", std::process::id());
+            let emails = vec!["a@b.c".to_string()];
+
+            // an unchanged name keeps its exact stem, plus the extension
+            let path = write_text(&directory, "octocat_Hello-World", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
+            assert_eq!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("octocat_Hello-World.log"),
+                "the extension must be the ONLY change to an unchanged name"
+            );
+
+            // a Windows reserved device name stays prefixed WITH the
+            // extension: `CON.log` would still be reserved, so the result
+            // must be `_CON.log`, never `CON.log`
+            let path = write_text(&directory, "CON", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("a UTF-8 result file name");
+            assert!(
+                name.starts_with("_CON-"),
+                "reserved stems keep their lossy-hash disambiguation: {name}"
+            );
+            assert!(
+                name.ends_with(".log"),
+                "the reserved name still carries the extension: {name}"
+            );
+
+            // a raw name already ending in `.log` is not stripped: the
+            // doubled extension is harmless and the printed path is
+            // authoritative
+            let path = write_text(&directory, "report.log", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
+            assert_eq!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("report.log.log"),
+                "an existing .log suffix is never stripped nor doubled into the stem"
+            );
+
+            // the capped multibyte stem carries the extension too, and the
+            // full component stays below the 255-byte filesystem limit:
+            // stem (<= 200) + hash suffix (17) + ".log" (4)
+            let path = write_text(&directory, &"日".repeat(110), &emails)
+                .expect("the 330-byte multibyte name must still write")
+                .expect("the file must be written");
+            let component = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("a UTF-8 result file name");
+            assert!(
+                component.len() <= 255,
+                "the full component must fit one filesystem entry: {} bytes",
+                component.len()
+            );
+            assert!(
+                component.ends_with(".log"),
+                "the capped name still carries the extension: {component}"
+            );
         });
     }
 
