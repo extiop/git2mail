@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+
+{% block title %}git2mail - find the email addresses behind any GitHub repository or profile{% endblock title %}
+{% block description %}Scan a public GitHub repository or profile anonymously, in your
+browser, and recover the email addresses its commits expose.{% endblock description %}
+
+{% block content %}
+<section aria-label="Anonymous scan">
+  <section class="hero">
+    <h1>Find the email addresses behind any GitHub repository or profile</h1>
+    <p class="hero-sub">
+      You give it a GitHub repository or a profile, and it lists the email
+      addresses the developers left in their commits (the changes they
+      published) - read straight from GitHub's public interface, in your
+      browser. Free, no account, nothing stored here.
+    </p>
+  </section>
+
+  <section class="card-surface scan-box" aria-label="Scan form">
+    <form id="scan-form" aria-describedby="attribution-warning">
+      <label for="target-url">GitHub repository or profile URL</label>
+      <input type="url" id="target-url" name="url" required
+             placeholder="e.g. https://github.com/octocat/Hello-World"
+             spellcheck="false" autocomplete="off">
+      <button type="submit">Scan</button>
+    </form>
+    <p class="scan-note">Try an example:
+      <a href="{{ config.base_url }}?url=https://github.com/octocat/Hello-World">octocat/Hello-World</a>
+      <a href="{{ config.base_url }}?url=https://github.com/octocat" aria-label="octocat (profile example)">a whole profile</a>
+    </p>
+    <p id="attribution-warning" class="warning">
+      The scan runs in <strong>your browser</strong>: GitHub receives the
+      requests from <strong>your IP address</strong> and sees every query.
+      If you are signed in to GitHub in this browser, GitHub can link
+      these requests to your account. The repository's traffic graph
+      counts page views and clones, not API calls, so the scan itself
+      will not show up there. GitHub limits anonymous visitors to about
+      60 requests per hour. The number you have left appears below once
+      the scan starts.
+    </p>
+    <p id="quota" class="quota"></p>
+  </section>
+
+  <div id="status" class="status-line" role="status" aria-live="polite"></div>
+
+  <section id="results" class="results" hidden>
+    <section id="summary" class="card-surface"></section>
+    <section class="card-surface trust">
+      <h2>Read this before acting on a result</h2>
+      <ul>
+        <li>These addresses come from the information stored inside public
+            commits, and that information can be old or faked: an address
+            in a commit proves nothing about who owns the mailbox
+            (<a href="{{ config.base_url }}guide/QUALITY.html">data quality</a>).</li>
+        <li>Not everyone appears here: when a project folds several changes
+            into one merge, some names never show up. A repository scan
+            reads the default branch - the project's main line - not every
+            branch.</li>
+        <li>A profile scan reads GitHub's public events timeline, which
+            only keeps recent activity.</li>
+      </ul>
+    </section>
+    <section id="actions" class="card-surface actions">
+      <button id="copy-emails" type="button" title="Paste into the To: or Bcc: field">Copy for email</button>
+      <button id="copy-list" type="button" title="Paste into any spreadsheet: one row per address (name, email, last seen)">Copy for spreadsheet</button>
+      <button id="download-log" type="button" title="Save one email per line, with a provenance header">Download results (.log)</button>
+    </section>
+    <section id="authors" aria-label="Authors found"></section>
+    <section id="funnel" class="card-surface"></section>
+  </section>
+
+</section>
+{% endblock content %}
