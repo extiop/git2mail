@@ -1,6 +1,6 @@
 //! Organization investigation: the public
 //! members, the public repositories and the developers' emails found in
-//! their commits — 100% API (no clone, no scraping, no new dependency).
+//! their commits - 100% API (no clone, no scraping, no new dependency).
 //!
 //! `git2mail org <org>` reuses the same building blocks as the rest of
 //! the crate:
@@ -17,7 +17,7 @@
 //!
 //! The investigation never panics: every fallible operation returns
 //! [`crate::errors::Error`]. A repository that cannot be scanned on its own
-//! (a private or deleted repository, a stale listing entry, an empty one —
+//! (a private or deleted repository, a stale listing entry, an empty one -
 //! GitHub answers 409 on its commits listing) is skipped with
 //! a warning instead of aborting the report, like the parallel search
 //! does; a rate-limit or transport failure is a scan-wide condition and
@@ -114,7 +114,7 @@ pub struct OrgReport {
 /// # Errors
 ///
 /// Returns [`Error::InvalidUsername`] when `org` is not a valid GitHub
-/// login (rejected client-side, before any network request — GitHub
+/// login (rejected client-side, before any network request - GitHub
 /// organizations follow the same login shape as users),
 /// [`Error::NotFound`] for a missing organization,
 /// [`Error::PrivateOrUnavailable`] or [`Error::RateLimitExhausted`] /
@@ -222,7 +222,7 @@ fn investigate_at(
             // so an authenticated token able to see the org's private
             // repositories would otherwise leak their names into the report
             // inventory and burn a doomed 403 request (or worse) per one of
-            // them — the documented contract is the public repositories
+            // them - the documented contract is the public repositories
             format!("{base}/orgs/{org}/repos?type=public&per_page={PER_PAGE}&page={page}")
         },
         |json| parse_repos_page(json, include_forks),
@@ -231,7 +231,7 @@ fn investigate_at(
 
     // the API resolves the org through redirects: a shape-valid login that
     // differs from the requested one (beyond casing) is either a rename or
-    // a response the caller should know about — warn, then scan what the
+    // a response the caller should know about - warn, then scan what the
     // API actually returned
     if !info.login.eq_ignore_ascii_case(org) {
         log::warn!(
@@ -243,7 +243,7 @@ fn investigate_at(
     let feedback = scan_org_repositories(scanner, base, &repositories, &info.login)?;
     // token death mid-scan: the skip-vs-abort contract is the module-level
     // one, but a partial kept after a dedicated token died may have left
-    // repositories unscanned — abort with the token's real death error
+    // repositories unscanned - abort with the token's real death error
     // instead of writing a complete-looking report (a revoked token is not
     // a spent allowance)
     if let Some(death_error) = feedback.death_error {
@@ -253,7 +253,7 @@ fn investigate_at(
     sort_emails(&mut all);
 
     let report = OrgReport {
-        provenance: crate::output::Provenance::now(),
+        provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
         org: info,
         members,
         repositories,
@@ -333,7 +333,7 @@ fn parse_repos_page(json: &Value, include_forks: bool) -> Result<(Vec<String>, u
     // the same hostile-listing discipline as the user investigation's
     // repositories listing: entries without a usable name are malformed
     // (warned, never silent), and forked repositories are skipped unless the
-    // caller opted in (`--include-forks`) — `type=public` includes forks,
+    // caller opted in (`--include-forks`) - `type=public` includes forks,
     // whose default-branch commits mirror the upstream history, so upstream
     // developers' emails would otherwise land in the org's report unmarked
     let mut repositories = Vec::new();
@@ -414,7 +414,7 @@ impl OrgReport {
         info!("============ MEMBERS ============");
         if self.members.is_empty() {
             info!(
-                "[-] no public member listed (the organization may keep this list private — the emails below come from the repositories)"
+                "[-] no public member listed (the organization may keep this list private - the emails below come from the repositories)"
             );
         }
         for member in &self.members {
@@ -432,7 +432,7 @@ impl OrgReport {
         info!("============ EMAILS ============");
         if self.emails.all.is_empty() {
             info!(
-                "[-] no email found in these repositories' commits — scan again with more tokens (--token / --token-file), or a higher --limit if you set one"
+                "[-] no email found in these repositories' commits - scan again with more tokens (--token / --token-file), or a higher --limit if you set one"
             );
         }
         for (repository, emails) in &self.emails.per_repository {
@@ -517,7 +517,7 @@ mod tests {
         // at the sanitizer helper: a dropped `log_safe()` call must fail
         // this test (capturing logger, see `crate::test_logger`)
         let report = OrgReport {
-            provenance: crate::output::Provenance::now(),
+            provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
             org: OrgInfo {
                 login: "acme\u{1b}[31m".to_string(),
                 name: Some("Acme\nCorp".to_string()),
@@ -902,7 +902,7 @@ mod tests {
         // the reduction keeps a partial result when a dedicated token dies
         // with progress, whatever the death cause: the org caller must
         // re-raise THAT cause. A revoked token (401 → `TokenRejected`) must
-        // not be misreported as "allowance used up — wait for the window"
+        // not be misreported as "allowance used up - wait for the window"
         let (address, server) = serve_requests(move |_index, request| {
             let line = request.first().map(String::as_str).unwrap_or("");
             if line.contains("/orgs/acme/repos") {
@@ -1118,7 +1118,7 @@ mod tests {
         // the endpoint defaults to type=all: without the explicit type=public
         // parameter an authenticated token able to see private repositories
         // would leak their names into the report and burn a doomed request
-        // per one of them — the wire format is pinned here
+        // per one of them - the wire format is pinned here
         let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&requests);
         let (address, server) = serve_requests(move |_index, request| {
@@ -1169,7 +1169,7 @@ mod tests {
     #[test]
     fn an_opted_in_fork_is_scanned_like_any_other_repository() {
         // `--include-forks`: the same listing holding a fork is scanned in
-        // full when the caller opted in — the fork's own commits are the
+        // full when the caller opted in - the fork's own commits are the
         // caller's explicit choice, and the skipped-forks warning must not
         // fire (nothing was skipped)
         let (address, server) = serve_requests(move |_index, request| {
@@ -1303,7 +1303,7 @@ mod tests {
     #[test]
     fn the_report_serializes_the_documented_json_shape() {
         let report = OrgReport {
-            provenance: crate::output::Provenance::now(),
+            provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
             org: OrgInfo {
                 login: "acme".to_string(),
                 name: Some("Acme Corp".to_string()),

@@ -20,12 +20,12 @@ struct SharedArgs {
     /// Authenticate with your GitHub token (raises the limit from 60 to
     /// 5000 requests/hour). Create one at github.com/settings/tokens.
     /// Typing it here leaves it visible in your shell history and to other
-    /// programs — prefer `--token-file`; when both are given, the --token
+    /// programs - prefer `--token-file`; when both are given, the --token
     /// value is used unless it is empty or only spaces (then --token-file
     /// is read). `--token ""` on its own runs anonymously
     #[arg(short, long)]
     token: Option<String>,
-    /// File holding one or more GitHub tokens, e.g. {"0": "ghp_…"} — each
+    /// File holding one or more GitHub tokens, e.g. {"0": "ghp_…"} - each
     /// token adds 5000 requests/hour; copy tokens.example.json to get
     /// started (create tokens at github.com/settings/tokens)
     #[arg(long, value_name = "TOKENS_JSON")]
@@ -49,7 +49,7 @@ struct SharedArgs {
     name = "git2mail",
     author,
     version,
-    about = "Find developers' public email addresses on GitHub — from repositories, profiles, organizations and keyword searches",
+    about = "Find developers' public email addresses on GitHub - from repositories, profiles, organizations and keyword searches",
     arg_required_else_help = true,
     after_help = "Examples:
   git2mail scan --url https://github.com/denoland/deno
@@ -87,7 +87,7 @@ enum Command {
     /// up to 3 candidate searches (duplicates collapse; a rejected query
     /// costs its candidates, not the lookup) and walks the full history of
     /// every candidate repository the search serves (until a
-    /// `commit-author` match ends the lookup early) — the cost is bounded
+    /// `commit-author` match ends the lookup early) - the cost is bounded
     /// only by GitHub's own limits, so a token is strongly recommended. The
     /// result prints on screen; add `--json <path>` (or `--json -`) to
     /// save it
@@ -116,7 +116,7 @@ enum Command {
     ///
     /// The full report prints on screen (add `--json <path>` or `--json -`
     /// to save it): past usernames and names found in the account's commit
-    /// noreply addresses (like 12345+jane@users.noreply.github.com — the
+    /// noreply addresses (like 12345+jane@users.noreply.github.com - the
     /// address GitHub puts in commits when you keep your email private),
     /// real email addresses used, likely addresses guessed from the
     /// person's name, other accounts that may belong to the same person,
@@ -143,10 +143,10 @@ enum Command {
     /// covers every listed repository and aborts on a spent anonymous
     /// allowance.
     Org {
-        /// GitHub organization name — the word in its page address, e.g.
+        /// GitHub organization name - the word in its page address, e.g.
         /// `acme` in github.com/acme
         org: String,
-        /// Scan only the first N repositories (default: every one — big
+        /// Scan only the first N repositories (default: every one - big
         /// organizations take a long time, so try `--limit 10` first)
         #[arg(
             long,
@@ -163,7 +163,7 @@ enum Command {
     /// Search GitHub repositories by keyword and scan them for developers' emails
     Search {
         /// Keywords describing the repositories you want (GitHub matches
-        /// them against repository names, descriptions and topics — to
+        /// them against repository names, descriptions and topics - to
         /// investigate one person, use the `user` subcommand)
         #[arg(short, long, value_parser = non_empty_query)]
         query: String,
@@ -523,7 +523,7 @@ fn write_report_deliverable<T: serde::Serialize>(
 /// An empty result is a successful run (user/email parity): `log_summary`
 /// already printed the org-scoped `[-]` no-results line, and `NoResults`'
 /// person-oriented advice does not apply to an org the user chose
-/// deliberately — only a real write failure surfaces (handled by
+/// deliberately - only a real write failure surfaces (handled by
 /// [`write_report_deliverable`]). The JSON report is attempted in EVERY
 /// case: the org scan spends the most API budget of any subcommand, so an
 /// explicit `--json` deliverable must not vanish on the empty run.
@@ -579,7 +579,7 @@ fn write_outputs(
                     partial: outcome.partial,
                 },
                 correlation: &outcome.correlation,
-                provenance: output::Provenance::now(),
+                provenance: output::Provenance::now(env!("CARGO_PKG_VERSION")),
             },
         )
     };
@@ -594,7 +594,7 @@ fn write_outputs(
                 // the legacy text write failed: the user-requested JSON report
                 // must still be written, so a successful scan's findings do not
                 // vanish from both outputs at once (the JSON write itself would
-                // have succeeded — e.g. a stray file blocking the `results/`
+                // have succeeded - e.g. a stray file blocking the `results/`
                 // layout, or a read-only CWD). The text failure stays the
                 // surfaced error; if the JSON write fails too, it is warned
                 // about on top of it
@@ -659,7 +659,7 @@ fn build_logger_with_ambient_filter(
     let mut builder = pretty_env_logger::formatted_builder();
     // The terminal report vocabulary is `[+]` success / `[-]` error /
     // `[!]` warning / `[.]` informational listing, so a
-    // warning must carry its own scannable marker (`[!]`) — otherwise a
+    // warning must carry its own scannable marker (`[!]`) - otherwise a
     // partial-scan warning looks like progress chatter once colors are
     // stripped (redirect, screen reader, plain terminal). The marker is
     // applied here at the format level (one site) instead of editing every
@@ -997,7 +997,7 @@ mod tests {
     #[test]
     fn a_malformed_variant_pattern_is_rejected_at_parse_time() {
         // the clap value_parser must carry the client-side validation: a
-        // reverted value_parser would only fail later (or never) — this pins
+        // reverted value_parser would only fail later (or never) - this pins
         // the parse-time rejection (exit 2, usage error, no network)
         for pattern in ["{first", "{unknown}", "{first} {last}", "a}b{first}"] {
             let cli =
@@ -1180,7 +1180,7 @@ mod tests {
         }
         // the value names are part of the help contract too: `--size` is
         // named by its range syntax (`--size <RANGE>`, like `--stars` and
-        // `--forks`) and the date flags by theirs (`<DATE_RANGE>`) — a
+        // `--forks`) and the date flags by theirs (`<DATE_RANGE>`) - a
         // reverted `value_name` falls back to clap's default placeholder
         // (a bare `<SIZE>`), which this pins against
         for flag_value in ["--stars <RANGE>", "--forks <RANGE>", "--size <RANGE>"] {
@@ -1264,7 +1264,7 @@ mod tests {
     /// directory, so the blocker-file scenarios must not touch the real
     /// workspace. Local copy, not a shared fixture: the bin tests run in
     /// their own process (cargo test builds one test binary per target),
-    /// so the lib's test fixture and its lock never coexist with this one —
+    /// so the lib's test fixture and its lock never coexist with this one -
     /// the chdir is process-wide but the two fixtures never coexist in a
     /// process. The lock still serializes the parallel tests of this
     /// module, which share the process.
@@ -1305,7 +1305,7 @@ mod tests {
         // a stray file named `results` (planted by a previous `--json
         // results` run, or a read-only CWD) blocks the legacy text layout:
         // the scan itself succeeded, so the user-requested JSON report must
-        // still be written — a hard text-write failure used to abort before
+        // still be written - a hard text-write failure used to abort before
         // `write_report_json`, discarding the successful scan's findings from both
         // outputs at once. The text failure stays the surfaced error
         in_temp_cwd(|| {

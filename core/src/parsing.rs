@@ -4,11 +4,14 @@
 //! entries it skips. Every payload is untrusted API data: the parsers
 //! bound the field sizes and the caller sanitizes what it logs.
 
-use super::report::{Profile, SshKey};
 use crate::errors::Error;
+use crate::report::{Profile, SshKey};
 use serde_json::Value;
 
-pub(crate) fn validate_username(username: &str) -> Result<(), Error> {
+/// Validates a GitHub login the way the API would match it: non-empty,
+/// ASCII letters, digits or hyphens only. A login with `.` or `_` would
+/// silently match nothing on the search endpoints.
+pub fn validate_username(username: &str) -> Result<(), Error> {
     let valid = !username.is_empty()
         && username.len() <= 39
         && !username.starts_with('-')
@@ -32,7 +35,7 @@ pub(crate) fn validate_username(username: &str) -> Result<(), Error> {
 ///
 /// Returns [`Error::InvalidProfile`] with `message` when the body is not a
 /// JSON array.
-pub(crate) fn require_array<'a>(json: &'a Value, message: &str) -> Result<&'a [Value], Error> {
+pub fn require_array<'a>(json: &'a Value, message: &str) -> Result<&'a [Value], Error> {
     match json.as_array() {
         Some(items) => Ok(items.as_slice()),
         None => Err(Error::InvalidProfile(message.to_string())),
@@ -50,7 +53,7 @@ pub(crate) fn require_array<'a>(json: &'a Value, message: &str) -> Result<&'a [V
 ///
 /// Returns [`Error::InvalidProfile`] when `login` or `id` is missing from
 /// the payload.
-pub(crate) fn parse_profile(json: &Value) -> Result<Profile, Error> {
+pub fn parse_profile(json: &Value) -> Result<Profile, Error> {
     let string_field = |name: &str| {
         json.get(name)
             .and_then(Value::as_str)
@@ -93,7 +96,7 @@ pub(crate) fn parse_profile(json: &Value) -> Result<Profile, Error> {
 /// # Errors
 ///
 /// Returns [`Error::InvalidProfile`] when the body is not a JSON array.
-pub(crate) fn parse_user_repos_page(
+pub fn parse_user_repos_page(
     json: &Value,
     include_forks: bool,
 ) -> Result<(Vec<String>, usize), Error> {
@@ -101,14 +104,14 @@ pub(crate) fn parse_user_repos_page(
     // the listing contract is completeness: an entry without its `full_name`
     // is skipped, but counted and warned about (the count stays the
     // end-of-listing signal of `fetch_paginated`) instead of silently
-    // shrinking the investigated set — the same explicit rule the org and
+    // shrinking the investigated set - the same explicit rule the org and
     // search listings apply to malformed entries. A forked repository is
     // skipped too unless the caller opted in (`--include-forks`, the same
     // opt-in as the org investigation): its default branch mirrors the
     // upstream history the REST commits API exposes, so scanning it burns
     // the commit budget on data that is not the target's and its upstream
     // authors would pollute the co-author heuristics with false secondary
-    // accounts — the same public-listing rule the search and org walks apply
+    // accounts - the same public-listing rule the search and org walks apply
     let mut repositories = Vec::new();
     let mut malformed = 0usize;
     let mut forks = 0usize;
@@ -142,11 +145,20 @@ pub(crate) fn parse_user_repos_page(
 /// The people a single commit exposes: both the author and the committer
 /// name/email pairs (the noreply technique reads the committer too).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommitPeople {
-    pub(crate) author_name: Option<String>,
-    pub(crate) author_email: Option<String>,
-    pub(crate) committer_name: Option<String>,
-    pub(crate) committer_email: Option<String>,
+pub struct CommitPeople {
+    /// The commit author's name field (self-declared metadata).
+    pub author_name: Option<String>,
+    /// The commit author's email field (the address the scan paths read).
+    pub author_email: Option<String>,
+    /// The commit author's raw date field (ISO 8601), so a consumer can
+    /// judge an exposure's recency without a second request.
+    pub date: Option<String>,
+    /// The commit committer's name field (a real second channel, rarely
+    /// different but sometimes the only one that leaks).
+    pub committer_name: Option<String>,
+    /// The commit committer's email field (read by the `user` investigation
+    /// alongside the author email when they differ).
+    pub committer_email: Option<String>,
 }
 
 /// Extracts the author and committer identities of every commit of a
@@ -162,7 +174,7 @@ pub(crate) struct CommitPeople {
 /// # Errors
 ///
 /// Returns [`Error::InvalidProfile`] when the body is not a JSON array.
-pub(crate) fn parse_people_page(json: &Value) -> Result<(Vec<CommitPeople>, usize), Error> {
+pub fn parse_people_page(json: &Value) -> Result<(Vec<CommitPeople>, usize), Error> {
     let mut people: Vec<CommitPeople> = Vec::new();
     let mut malformed = 0usize;
     let items = require_array(json, "commits payload: not an array")?;
@@ -185,6 +197,7 @@ pub(crate) fn parse_people_page(json: &Value) -> Result<(Vec<CommitPeople>, usiz
         people.push(CommitPeople {
             author_name: field("author", "name"),
             author_email: field("author", "email"),
+            date: field("author", "date"),
             committer_name: field("committer", "name"),
             committer_email: field("committer", "email"),
         });
@@ -198,9 +211,11 @@ pub(crate) fn parse_people_page(json: &Value) -> Result<(Vec<CommitPeople>, usiz
 /// One external-contribution search hit: the repository holding a commit
 /// authored by the target.
 #[derive(Debug)]
-pub(crate) struct ExternalHit {
-    pub(crate) repository: String,
-    pub(crate) url: Option<String>,
+pub struct ExternalHit {
+    /// The repository `full_name` the external commit was attributed to.
+    pub repository: String,
+    /// The commit's `html_url`, when the listing carried one.
+    pub url: Option<String>,
 }
 
 /// Extracts the external repositories of a `search/commits` page: the
@@ -208,8 +223,8 @@ pub(crate) struct ExternalHit {
 /// raw item count. A rejected search (`{"items": null}`) ends the listing.
 /// A 200 body without an `items` field at all, or with an `items` field that
 /// is neither an array nor `null`, is an intermediary or a shape change, not
-/// an empty page, and fails explicitly (the same rule as
-/// [`crate::sources::search`]'s `parse_search_page`) instead of yielding a
+/// an empty page, and fails explicitly (the same rule as the CLI crate's
+/// `sources::search::parse_search_page`) instead of yielding a
 /// complete-looking report whose external-contributions section silently
 /// went missing.
 ///
@@ -217,7 +232,7 @@ pub(crate) struct ExternalHit {
 ///
 /// Returns [`Error::InvalidProfile`] when the body carries no `items` field
 /// or an `items` field that is neither an array nor `null`.
-pub(crate) fn parse_external_page(json: &Value) -> Result<(Vec<ExternalHit>, usize), Error> {
+pub fn parse_external_page(json: &Value) -> Result<(Vec<ExternalHit>, usize), Error> {
     let Some(items) = json.get("items") else {
         return Err(Error::InvalidProfile(
             "external payload: no `items` field".to_string(),
@@ -273,7 +288,7 @@ pub(crate) fn parse_external_page(json: &Value) -> Result<(Vec<ExternalHit>, usi
 /// # Errors
 ///
 /// Returns [`Error::InvalidProfile`] when the body is not a JSON array.
-pub(crate) fn parse_keys_page(json: &Value) -> Result<(Vec<SshKey>, usize), Error> {
+pub fn parse_keys_page(json: &Value) -> Result<(Vec<SshKey>, usize), Error> {
     let items = require_array(json, "keys payload: not an array")?;
     // the public endpoint documents exactly {id, key}: the title and
     // creation date exist only on the authenticated `/user/keys` listing,

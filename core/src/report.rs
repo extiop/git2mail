@@ -47,7 +47,7 @@ pub struct UsernameSighting {
     /// The username revealed by the noreply email.
     pub username: String,
     /// The commit names seen with this username (normalized: lowercased,
-    /// ASCII-folded — see the variants section of the README).
+    /// ASCII-folded - see the variants section of the README).
     pub names: Vec<String>,
     /// The target's repositories where this username was seen.
     pub repos: Vec<String>,
@@ -87,7 +87,7 @@ pub struct VariantMatch {
     pub email: String,
     /// The pattern that generated it (`first.last`, `firstlast`,
     /// `initiallast`, `first_last`, `initial_last`, `first`, `last`,
-    /// `initial.last` — the built-in variants combinatorics).
+    /// `initial.last` - the built-in variants combinatorics).
     pub pattern: String,
     /// The domain the variant was generated for.
     pub domain: String,
@@ -161,7 +161,7 @@ pub struct ExternalContribution {
 pub struct UserReport {
     /// The when/what of the report (generation timestamp, tool version).
     #[serde(flatten)]
-    pub provenance: crate::output::Provenance,
+    pub provenance: crate::provenance::Provenance,
     /// The investigated profile.
     pub profile: Profile,
     /// The usernames history revealed by the noreply technique.
@@ -200,12 +200,15 @@ pub struct UserReport {
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidUsername`] when `username` is not a valid GitHub
-/// username (rejected client-side, before any network request),
-/// [`Error::Organization`] when the profile is an organization (the message
-/// points at the dedicated `org` subcommand), [`Error::NotFound`] for a
-/// missing profile, [`Error::PrivateOrUnavailable`] or
-/// [`Error::RateLimitExhausted`] / [`Error::Http`] for the corresponding API
+/// Returns [`Error::InvalidUsername`](crate::errors::Error::InvalidUsername)
+/// when `username` is not a valid GitHub username (rejected client-side,
+/// before any network request),
+/// [`Error::Organization`](crate::errors::Error::Organization) when the
+/// profile is an organization (the message points at the dedicated `org`
+/// subcommand), [`Error::NotFound`](crate::errors::Error::NotFound) for a
+/// missing profile, [`Error::PrivateOrUnavailable`](crate::errors::Error::PrivateOrUnavailable)
+/// or [`Error::RateLimitExhausted`](crate::errors::Error::RateLimitExhausted)
+/// / [`Error::Http`](crate::errors::Error::Http) for the corresponding API
 /// failures. The skip-vs-abort contract (unscannable repositories, rate
 impl UserReport {
     /// Logs the human-readable terminal report: one section per finding
@@ -216,7 +219,7 @@ impl UserReport {
     /// untrusted string (commit metadata, profile fields)
     /// is sanitized first: control characters become `_`, so a
     /// hostile commit can never forge or spoof log lines.
-    pub(crate) fn log_summary(&self) {
+    pub fn log_summary(&self) {
         let profile = &self.profile;
         info!("============ PROFILE ============");
         info!(

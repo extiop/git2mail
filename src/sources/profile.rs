@@ -14,13 +14,13 @@ use serde_json::Value;
 /// cap is answered with a raw 422 instead of an empty page. With the API
 /// maximum `per_page=100`, a prolific user serves exactly three full pages,
 /// and the plain paginated walk used to request page 4 and abort the whole
-/// profile scan with a raw HTTP error — discarding the emails already
+/// profile scan with a raw HTTP error - discarding the emails already
 /// extracted from the 300 events and skipping the repositories fallback
-/// (live repro: sindresorhus, yyx990803) — exactly for the most active
+/// (live repro: sindresorhus, yyx990803) - exactly for the most active
 /// users, the primary OSINT targets. The walk therefore ends at the cap
 /// (the raw-count limit below makes the out-of-window page unreachable),
 /// and a 422 that still slips through is treated as the end of the listing
-/// when events were already collected — the same window-422 parity the
+/// when events were already collected - the same window-422 parity the
 /// search seams apply to their documented 1000-result ceiling.
 const EVENTS_CEILING: usize = 300;
 
@@ -28,7 +28,7 @@ const EVENTS_CEILING: usize = 300;
 ///
 /// It checks the events' metadata to hopefully retrieve the owner's email.
 /// GitHub caps the events timeline (300 events over the recent window), so
-/// the events technique only sees that documented cap — the scan stays
+/// the events technique only sees that documented cap - the scan stays
 /// complete within it and falls back to all the user's repositories'
 /// commits, which can lead to retrieve multiple developers emails.
 pub(crate) fn scan_profile(scanner: &Scanner, author: &str) -> Result<super::ScanOutcome, Error> {
@@ -44,7 +44,7 @@ pub(crate) fn scan_profile(scanner: &Scanner, author: &str) -> Result<super::Sca
 ///
 /// Returns the failures of the underlying listings and repository scans:
 /// a repository that cannot be scanned on its own (deleted, private or
-/// empty — GitHub answers 409 on its commits listing) is skipped with a
+/// empty - GitHub answers 409 on its commits listing) is skipped with a
 /// warning, but a rate-limit or transport failure is a scan-wide condition
 /// and aborts the scan instead of yielding a complete-looking partial
 /// result.
@@ -95,7 +95,7 @@ pub(crate) fn scan_profile_at(
             if raw_seen.get() >= EVENTS_CEILING {
                 // the raw count reached the cap: the walk was cut at
                 // GitHub's documented timeline window (a user with exactly
-                // `EVENTS_CEILING` events also lands here — the "may"
+                // `EVENTS_CEILING` events also lands here - the "may"
                 // phrasing keeps the warning honest for that boundary case
                 // too, like the sibling repository budget). Say so instead
                 // of letting the events stage look complete
@@ -162,7 +162,7 @@ pub(crate) fn scan_profile_at(
                             repos_scanned += 1;
                         }
                         // one resource-scoped failure (deleted, private or
-                        // empty repository — GitHub answers 409 on its
+                        // empty repository - GitHub answers 409 on its
                         // commits listing) must not abort the whole fallback
                         // scan and discard the emails already collected from
                         // other repos; a rate-limit or transport failure is a

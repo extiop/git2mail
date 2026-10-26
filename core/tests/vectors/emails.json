@@ -1,0 +1,17 @@
+[
+  {"input": "dev@example.com", "usable": true},
+  {"input": "john.noreply@acme.com", "usable": true},
+  {"input": "dev@xusers.noreply.github.com", "usable": true},
+  {"input": "12345+dev@users.noreply.github.com", "usable": false},
+  {"input": "12345+dev@USERS.NOREPLY.GITHUB.COM", "usable": false},
+  {"input": "\"12345+dev@users.noreply.github.com\"", "usable": false},
+  {"input": "", "usable": false},
+  {"input": "dev@x.com\n evil@x.com", "usable": false},
+  {"input": "dev\t@x.com", "usable": false},
+  {"input": "dev@x.com\u001b[31m", "usable": false},
+  {"input": "jdoe", "usable": false},
+  {"input": "@example.com", "usable": false},
+  {"input": "dev@", "usable": false},
+  {"input": "dev@x@com", "usable": false},
+  {"input": "\"dev@example.com\"", "usable": true}
+]

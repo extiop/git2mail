@@ -11,26 +11,32 @@ readme = "README.md"
 keywords = ["github", "osint", "rust", "leak", "email"]
 categories = ["command-line-utilities"]
 
-# MLA-style strict lints (single-crate equivalent of the MLA workspace
-# `[workspace.lints]` table): the panic-family lints enforce the zero-panic
+# MLA-style workspace: the root package is the CLI; `core/` holds the pure
+# std-only logic (compiles to wasm32-unknown-unknown, consumed by the web
+# bindings); `web/wasm` holds the WASM bindings of the site.
+[workspace]
+members = ["core"]
+
+# MLA-style strict workspace lints: the panic-family lints enforce the zero-panic
 # runtime path of the hand-made error handling, `missing_docs` makes the
-# public documentation part of the API surface.
-[lints.rust]
+# public documentation part of the API surface. Shared by every workspace
+# member through `[lints] workspace = true`.
+[workspace.lints.rust]
 # Every public item of the lib (errors, github, output, sources, parsers)
 # must be documented: what it does, which errors it returns, and that it
 # never panics at runtime.
 missing_docs = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 # `clippy::all` is denied through the `-D warnings` convention (CI and the
 # verification gate run `cargo clippy --all-targets -- -D warnings`), so the
 # table only pins the restriction-group lints that `-D warnings` would leave
 # allow-by-default: the runtime path must never unwrap, expect, panic,
 # hit an `unreachable!` fallback, or stub out code. The only allowances are the two static regex `LazyLock`
-# inits of `src/parsers.rs` (a static regex failing to compile is a
+# inits of `core/src/parsers.rs` (a static regex failing to compile is a
 # programming error) and the one justified production-code expect
 # (`#[expect(clippy::large_enum_variant)]` on the CLI `Command` enum in
-# `src/main.rs` — `expect` instead of `allow`, so the
+# `src/main.rs` - `expect` instead of `allow`, so the
 # build fails when it stops applying), and the test modules,
 # where failing loudly is the point.
 unwrap_used = "deny"
@@ -49,6 +55,13 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 # logging
 log = { version = "0.4", default-features = false, features = ["std"] }
 pretty_env_logger = { version = "0.5", default-features = false }
+# the pure core (URL parsing, email rules, sanitization, correlation,
+# variants, payload parsing) extracted so the web bindings can compile it
+# to wasm32-unknown-unknown
+git2mail-core = { path = "core", version = "0.8.0", features = ["http"] }
+
+[lints]
+workspace = true
 
 [profile.release]
 codegen-units = 1   # Use minimum codegen units for best size and runtime performances

@@ -330,8 +330,20 @@ name = "git2mail"
 version = "0.8.0"
 dependencies = [
  "clap",
+ "git2mail-core",
  "log",
  "pretty_env_logger",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "git2mail-core"
+version = "0.8.0"
+dependencies = [
+ "log",
  "regex",
  "reqwest",
  "serde",

@@ -223,7 +223,7 @@ fn validate_date_range(name: &str, value: &str) -> Result<(), Error> {
         // so the sides are validated as plain dates, without stripping
         if (low == "*" || is_date(low)) && (high == "*" || is_date(high)) {
             // an inverted date range (`2020-01-01..2019-01-01`) is
-            // well-formed but meaningless — and worse than the numeric
+            // well-formed but meaningless - and worse than the numeric
             // case: GitHub does not answer it with a raw 422, it silently
             // swaps the sides, so the scan would quietly cover the opposite
             // window (live-verified: `created:2020-01-01..2019-01-01` lists
@@ -249,7 +249,7 @@ fn validate_date_range(name: &str, value: &str) -> Result<(), Error> {
 }
 
 /// Validates a `license`/`topic`/`user`/`org` value. A `user`/`org` value
-/// must be a valid GitHub login (ASCII letters, digits or hyphens — the
+/// must be a valid GitHub login (ASCII letters, digits or hyphens - the
 /// same rule as the `user` target, reused from
 /// [`crate::user::validate_username`]): a login with `.` or `_` would
 /// silently match nothing. A `license`/`topic` value may hold separators
@@ -306,7 +306,7 @@ pub(crate) fn aggregate_search(
 
 /// Fetches the search listing for the query: capped at `ceiling` (GitHub
 /// never serves more than 1000 search results, so the over-ceiling page is
-/// never requested — the API answers it with a raw 422, and the extra
+/// never requested - the API answers it with a raw 422, and the extra
 /// pages would only be thrown away anyway). The page-size-aware loop also
 /// ends the listing on a short final page and counts raw items toward the
 /// cap, so a total that is not a multiple of the page size can no longer
@@ -317,7 +317,7 @@ pub(crate) fn aggregate_search(
 /// # Errors
 ///
 /// A page-1 422 (nothing collected) is the API rejecting the query itself
-/// — in practice a nonexistent or inaccessible `--user`/`--org` login (the
+/// in practice a nonexistent or inaccessible `--user`/`--org` login (the
 /// API's own body says "The listed users cannot be searched…", but the raw
 /// reqwest error discards it, leaving a typo'd target indistinguishable
 /// from a tool failure): surfaced as [`Error::SearchRejected`] instead of
@@ -325,7 +325,7 @@ pub(crate) fn aggregate_search(
 /// a warning instead of aborting the whole search with a raw HTTP error
 /// (same parity as the user investigation's external-contributions
 /// search): the hits already collected are discarded with the warning
-/// naming how many were dropped — they are unrecoverable from the
+/// naming how many were dropped - they are unrecoverable from the
 /// paginated loop's error path, and the completed-but-empty outcome is the
 /// documented shape (doc/src/API.md). Every other failure propagates.
 fn fetch_search_hits(
@@ -356,7 +356,7 @@ fn fetch_search_hits(
         Ok(hits) => hits,
         Err(err) => {
             match crate::sources::classify_search_window_422(&err, collected.get()) {
-                // a page-1 422 is the API rejecting the query itself — in
+                // a page-1 422 is the API rejecting the query itself - in
                 // practice a nonexistent or inaccessible `--user`/`--org`
                 // login: surfaced as [`Error::SearchRejected`] instead of
                 // the raw HTTP error
@@ -385,9 +385,9 @@ fn fetch_search_hits(
         // the DOCUMENTED 1000-result window was reached in the listing's
         // NORMAL completion path (a `--limit` below the ceiling is the
         // user's own choice, not a truncation: it must never fire this
-        // warning — hence the constant, not the passed `ceiling`). The
+        // warning - hence the constant, not the passed `ceiling`). The
         // listing was cut at GitHub's documented window, so it must say so
-        // instead of looking complete — the same cap-reached warning the
+        // instead of looking complete - the same cap-reached warning the
         // external-contributions walk emits (the defensive 422 branch
         // above only covers the pathological classifier-miss path)
         log::warn!(
@@ -528,13 +528,13 @@ pub(crate) fn parse_search_page(
         ));
     };
     // a listing-derived html_url is untrusted API data: an entry without
-    // a usable URL is skipped with a warning, never silently — the same
+    // a usable URL is skipped with a warning, never silently - the same
     // warn-and-count rule the org and user listings apply to malformed
     // entries (the raw count still includes it so pagination keeps its
     // end-of-listing signal)
     // GitHub's repository search INCLUDES forks: like the `user` and `org`
     // listings, forked entries are skipped with a warning unless the caller
-    // opted in — a fork's default-branch commits mirror the upstream
+    // opted in - a fork's default-branch commits mirror the upstream
     // history, so scanning them would burn the per-repository commit budget
     // on other projects' developers and report them under the fork's name
     let mut repositories = Vec::new();
@@ -1101,7 +1101,7 @@ mod tests {
     fn a_forked_search_entry_is_skipped_with_a_warning_and_the_opt_in_scans_it() {
         // GitHub's repository search includes forks: like the `user` and
         // `org` listings, a fork is skipped with a warning (its commits
-        // mirror the upstream history) unless the caller opted in — the
+        // mirror the upstream history) unless the caller opted in - the
         // flag's value must reach the PARSER, not just the scanner
         let (address, server) = mock::serve_requests(move |_index, request| {
             let line = request.first().map(String::as_str).unwrap_or("");
@@ -1200,7 +1200,7 @@ mod tests {
         // a page holding fewer items than the page size is the last page of
         // the listing: a total that is not a multiple of the page size used
         // to keep the walk alive up to the page past GitHub's 1000-result
-        // window, which the API answers with a raw 422 — silently discarding
+        // window, which the API answers with a raw 422 - silently discarding
         // every hit collected so far through the defensive fallback. The
         // short-page rule ends the listing instead, and the hits are kept
         let (address, server) = mock::serve_requests(move |_index, request| {
@@ -1429,7 +1429,7 @@ mod tests {
     fn a_page1_422_fails_the_search_explicitly_instead_of_an_empty_scan() {
         // the defensive 422 fallback only covers the out-of-window page: a
         // 422 on the very first page (nothing collected yet) can never be a
-        // ceiling 422 — the API rejected the query itself (an over-long or
+        // ceiling 422 - the API rejected the query itself (an over-long or
         // otherwise invalid `q`). It must propagate instead of degrading
         // into a complete-looking empty report with exit 0
         let (address, server) = mock::serve_requests(move |_index, _request| {
@@ -1471,7 +1471,7 @@ mod tests {
         // the defensive 422 fallback's collected>0 branch: a full page 1
         // followed by a raw 422 on page 2 (never reachable for GitHub's
         // documented paging, hence the defensiveness) ends the search with
-        // a warning instead of aborting it with a raw HTTP error — and it
+        // a warning instead of aborting it with a raw HTTP error - and it
         // must not silently yield a complete-looking empty report without
         // at least being pinned here (a mutation deleting the branch would
         // turn the 422 into a scan-wide abort)
@@ -1516,7 +1516,7 @@ mod tests {
         let outcome = outcome.expect("a mid-walk 422 must end the search, not abort it");
 
         // the fallback discarded the collected hits: an empty (warned-about)
-        // listing, not a scan-wide failure — and the discard is NAMED with
+        // listing, not a scan-wide failure - and the discard is NAMED with
         // its count (a deleted or garbled warn must fail this test)
         assert_eq!(outcome.repos_scanned, 0);
         assert!(outcome.emails.is_empty());
@@ -1656,7 +1656,7 @@ mod tests {
     fn reaching_the_search_ceiling_on_the_normal_path_warns_about_the_truncation() {
         // the honesty rule of the caps: a listing that fills the entire
         // documented search window (exactly the ceiling) must say so even
-        // when no 422 ever fires — the identical seam
+        // when no 422 ever fires - the identical seam
         // (`fetch_external_hits`) warns on its normal cap path
         let (address, server) = mock::serve_requests(move |_index, request| {
             let line = request.first().map(String::as_str).unwrap_or("");
@@ -1867,7 +1867,7 @@ mod tests {
         // scanned both repositories: no repository was lost to a doomed
         // request, and the complete coverage must not raise a false
         // `scanned.partial` truncation alarm (the flag means whole listed
-        // repositories may have been left unscanned — here none was)
+        // repositories may have been left unscanned - here none was)
         assert_eq!(repos_scanned, 2);
         assert_eq!(emails.len(), 2);
         assert!(

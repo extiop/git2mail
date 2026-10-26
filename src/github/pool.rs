@@ -21,7 +21,7 @@ pub(crate) fn worker_count(tokens: usize, items: usize) -> usize {
 /// Each worker is dedicated the next *live* token when any token is live
 /// (see [`TokenPool::live_indices`]): a token the pool retired or parked
 /// must not own a worker slot while healthy tokens sit beyond the worker
-/// range — with fewer work items than tokens, every spawned worker could
+/// range - with fewer work items than tokens, every spawned worker could
 /// otherwise own a dead token and abort the whole run without a single
 /// request. When every token is dead (or the pool is anonymous) the
 /// positional assignment is kept: the all-dead fallback still spawns the
@@ -39,10 +39,10 @@ pub(crate) fn worker_count(tokens: usize, items: usize) -> usize {
 /// slot sends `failure_report(cause)` instead, so the reduction still
 /// receives exactly one report per worker.
 ///
-/// * `work` — the queued items; every item is sent once, then the sender is
+/// * `work` - the queued items; every item is sent once, then the sender is
 ///   dropped, so `recv` returns `None` once the queue is drained (the
 ///   workers' natural stop signal).
-/// * `job` — the worker body: pulls work from the shared queue until it is
+/// * `job` - the worker body: pulls work from the shared queue until it is
 ///   drained or another worker failed (via the `aborted` flag). The queue
 ///   is fully populated upfront, so `recv` never blocks long.
 pub(crate) fn run_token_worker_pool<I, R>(
@@ -70,7 +70,7 @@ where
     );
 
     // work queue: every item is sent once, then the sender is dropped, so
-    // `recv` returns `Err` once the queue is drained — the workers'
+    // `recv` returns `Err` once the queue is drained - the workers'
     // natural stop signal
     let (work_tx, work_rx) = mpsc::channel::<I>();
     for item in items {

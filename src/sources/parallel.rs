@@ -69,7 +69,7 @@ pub(crate) struct ReducedReports {
 /// One repository candidate handed to the parallel scan (a search
 /// listing entry, an org listing entry or a reverse-lookup candidate): its
 /// `html_url` plus the
-/// primary language GitHub reports for it — free correlation metadata,
+/// primary language GitHub reports for it - free correlation metadata,
 /// no extra API call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoHit {
@@ -83,7 +83,7 @@ impl Scanner {
     /// the offline tests run this same code against a loopback mock. A pool
     /// of `min(nb_tokens, nb_repositories)` workers (`std::thread::scope`),
     /// each owning exactly one dedicated token through its own
-    /// [`crate::github::Client`] — no shared mutable token state, no
+    /// [`crate::github::Client`] - no shared mutable token state, no
     /// contention. The repositories are distributed through a
     /// `std::sync::mpsc` work queue: every worker pulls the next repository
     /// from the channel until it is drained. The mono-repository /
@@ -110,7 +110,7 @@ impl Scanner {
     /// refused or dropped, a timeout) is classified: `true` skips the one
     /// repository with a warning (the search fan-out keeps going over a
     /// network hiccup), `false` aborts the scan (the complete-report
-    /// contracts — `org` — can never silently miss a whole repository).
+    /// contracts - `org` - can never silently miss a whole repository).
     pub(crate) fn scan_repositories_at(
         &self,
         base: &str,
@@ -131,7 +131,7 @@ impl Scanner {
         // Each worker is dedicated the next *live* token when any token is
         // live (see [`TokenPool::live_indices`]): a token the listing phase
         // retired or parked must not own a worker slot while healthy tokens
-        // sit beyond the worker range — with fewer listed repositories than
+        // sit beyond the worker range - with fewer listed repositories than
         // tokens, every spawned worker could otherwise own a dead token and
         // abort the whole scan without a single request. When every token is
         // dead (or the pool is anonymous) the positional assignment is kept:
@@ -161,8 +161,8 @@ impl Scanner {
         self.add_worker_requests(reduced.worker_requests);
         // the partial flag's documented meaning is "whole listed repositories
         // may have been left unscanned" (`scanned.partial` in the JSON
-        // report): when the surviving workers fully drained the queue —
-        // every listed repository was scanned or warn-skipped — the token
+        // report): when the surviving workers fully drained the queue -
+        // every listed repository was scanned or warn-skipped - the token
         // death lost no repository, and a complete report must not carry a
         // false truncation alarm. The judgment is made here where the
         // listing size is known (the reducers do not see it); the `org`
@@ -323,7 +323,7 @@ pub(crate) enum FailureAction {
     TokenDied,
     /// The failure is scoped to this repository only (a 404 of a stale
     /// search-index entry, a 403 for a private repository or a token without
-    /// the right scope, or the 409 of an empty repository — GitHub answers
+    /// the right scope, or the 409 of an empty repository - GitHub answers
     /// 409 Conflict on `/commits` when the repository has no commits): skip
     /// it and keep pulling work. A 403 is resource-scoped, not token-scoped:
     /// with a fine-grained PAT or one inaccessible repository among the
@@ -336,7 +336,7 @@ pub(crate) enum FailureAction {
 /// Classifies a repository scan failure. An HTTP 403 maps to
 /// [`Error::PrivateOrUnavailable`] and is skipped, not treated as a dead
 /// token: only a token-scoped death ([`Error::RateLimitExhausted`],
-/// [`Error::RateLimitPaused`], or [`Error::TokenRejected`] — the API refused
+/// [`Error::RateLimitPaused`], or [`Error::TokenRejected`] - the API refused
 /// the token itself; tokens are only format-validated at startup) stops the
 /// worker.
 pub(crate) fn classify_failure(err: &Error, skip_transient: bool) -> FailureAction {
@@ -414,7 +414,7 @@ impl WorkerAccum {
 /// What one scan worker reports back: the emails it found, the per-author
 /// contributions of the repositories it scanned, how many
 /// successful requests its client made, how many repositories it fully
-/// scanned, and the failure that ended it (if any) — a worker keeps its
+/// scanned, and the failure that ended it (if any) - a worker keeps its
 /// partial findings even when it failed.
 pub(crate) struct ScanWorkerReport {
     emails: Vec<String>,
