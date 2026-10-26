@@ -20,7 +20,7 @@
 //! [`org`] modules. Every fallible call returns [`errors::Error`]; the reports
 //! serialize to the documented JSON shapes. The `Error` display strings
 //! are written for a terminal user (they carry next steps), not for
-//! programmatic matching — match on the variant, not the text.
+//! programmatic matching - match on the variant, not the text.
 //!
 //! ```no_run
 //! use git2mail::sources::Scanner;
@@ -35,20 +35,21 @@
 //!
 //!
 
-/// Per-author attribute correlation: aggregates the scan results
-/// per author with the repositories scanned, their primary language and the
-/// commit counts, for the opt-in JSON report and the terminal summary.
-pub mod correlate;
-
-/// MLA-style hand-made error type shared by the whole crate.
-pub mod errors;
-
-/// Shared constants of the crate (the GitHub API base URL and the noreply
-/// domain), defined once instead of duplicated per module.
-pub mod consts;
+// The pure core lives in the workspace's `core/` crate (compilable to
+// `wasm32-unknown-unknown`, see the web bindings): these re-exports keep the
+// crate's public API at its historical paths, so `git2mail::parsers`,
+// `git2mail::correlate` and friends keep resolving exactly as before.
+pub use git2mail_core::{consts, correlate, errors, parsers, provenance};
+// The log-safety module stays crate-private at the same path for the
+// crate's own modules (`crate::sanitize::log_safe`), as it always was.
+use git2mail_core::sanitize;
+// The test-only capturing logger moved with the pure core; the crate's own
+// tests keep resolving it at `crate::test_logger`.
+#[cfg(test)]
+pub(crate) use git2mail_core::test_logger;
 
 /// Reverse email lookup: reconstructs
-/// candidate repositories from the address (documented heuristic — GitHub
+/// candidate repositories from the address (documented heuristic - GitHub
 /// has no email search API) and verifies them by commits to resolve the
 /// GitHub account behind an email, with an honest confidence level.
 pub mod email;
@@ -58,7 +59,7 @@ pub mod github;
 
 /// Organization investigation: the public members, the public repositories and the
 /// developers' emails found in their commits, scanned with the token-worker
-/// pool — 100% API.
+/// pool - 100% API.
 pub mod org;
 
 /// Result writers: legacy text files and opt-in JSON reports.
@@ -72,15 +73,5 @@ pub mod sources;
 /// Full profile investigation of a GitHub user:
 /// usernames/names history through the noreply technique, email
 /// variants, secondary-account candidates, SSH keys and external
-/// contributions — 100% API, documented deltas included.
+/// contributions - 100% API, documented deltas included.
 pub mod user;
-
-/// The `parsers` module exists to handle some strings and returns requested parts of it
-/// For instance, it gets, from a given repository URL, its author and project name.
-pub mod parsers;
-mod sanitize;
-
-/// Test-only capturing logger (compiled into the crate's own test binary
-/// only): pins the terminal-report sanitization at the wiring level.
-#[cfg(test)]
-pub(crate) mod test_logger;

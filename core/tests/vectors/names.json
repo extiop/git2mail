@@ -1,0 +1,6 @@
+[
+  {"input": "octocat_Hello-World", "expect": "octocat_Hello-World"},
+  {"input": "a/b", "expect_prefix": "a_b-", "note": "lossy replacement carries the anti-clobber hash"},
+  {"input": "CON", "expect_prefix": "_CON-", "note": "Windows reserved device name"},
+  {"input": "octocat/Hello-World/tree/main", "expect_prefix": "octocat_Hello-World_tree_main-"}
+]

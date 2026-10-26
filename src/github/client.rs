@@ -15,7 +15,7 @@ pub(crate) const ANONYMOUS_INDEX: usize = usize::MAX;
 
 // The pool-member wording for a log line: the anonymous quota has no
 // token, so "token #N" would name something that does not exist. The
-// number is the 0-based pool position — it matches the `tokens.json` key
+// number is the 0-based pool position - it matches the `tokens.json` key
 // only for a contiguous duplicate-free file (the duplicate warning keeps
 // them aligned), so "token #1" points the user at the `"1"` entry of the
 // file.
@@ -168,14 +168,14 @@ const VALID_TOKEN_PREFIXES: [&str; 2] = ["ghp_", "github_pat_"];
 /// handful of tokens (a few hundred bytes). A FIFO (`--token-file mypipe`)
 /// would block forever with no diagnostic, and a character device like
 /// `/dev/zero` (valid UTF-8 NUL bytes) grows the read without bound until
-/// the process is killed — neither is ever a token file, so both fail fast
+/// the process is killed - neither is ever a token file, so both fail fast
 /// like any other invalid input instead.
 const MAX_TOKEN_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Upper bound on an API response body read: a hostile or broken network
 /// path can announce (or stream) an arbitrarily large body inside the
 /// request timeout, and buffering it exhausts memory on the user's machine
-/// — inconsistent with the hostile-server defenses this module already
+/// inconsistent with the hostile-server defenses this module already
 /// enforces (request timeout, Retry-After cap, page-wrap guard). A GitHub
 /// API JSON body never approaches the cap.
 const MAX_RESPONSE_BODY_BYTES: u64 = 64 * 1024 * 1024;
@@ -255,7 +255,7 @@ enum RateLimitClass {
 /// check), the UTF-8 BOM strip
 /// (Windows editors prepend it: the JSON parse would otherwise fail with a
 /// bare "expected value at line 1 column 1" on a file that looks perfectly
-/// fine in the editor that produced it — the same BOM-strip rule the bulk
+/// fine in the editor that produced it - the same BOM-strip rule the bulk
 /// emails reader applies, see `read_addresses` in `crate::email`) and the
 /// parse. Every failure names the file (Debug-escaped once, with its
 /// surrounding quotes trimmed: the Display arm escapes the whole payload a
@@ -441,7 +441,7 @@ impl TokenPool {
     /// control characters wherever they sit: a token carrying them (a
     /// CRLF-edited token file, a pasted newline) is accepted by the prefix
     /// check but fails later inside reqwest's header build with a cryptic
-    /// `builder error` that never names the credential — rejecting it here
+    /// `builder error` that never names the credential - rejecting it here
     /// keeps the fail-fast validation promise with the masked-excerpt
     /// convention.
     ///
@@ -553,7 +553,7 @@ impl TokenPool {
     /// (neither retired nor parked), in index order. The parallel worker
     /// pools use it to dedicate each worker a live token when possible: a
     /// token the listing phase retired or parked must not own a worker slot
-    /// while healthy tokens sit beyond the worker range — with fewer work
+    /// while healthy tokens sit beyond the worker range - with fewer work
     /// items than tokens, every spawned worker could otherwise own a dead
     /// token and abort the whole run without a single request, against the
     /// pool's "a dead token must not abort the run while healthy tokens sit
@@ -660,13 +660,13 @@ impl Client {
     /// The proxy environment variables the HTTP stack honors, resolved
     /// EXACTLY like the pinned stack (hyper-util's system matcher): the
     /// https scope reads `HTTPS_PROXY`/`https_proxy` (the FIRST SET one,
-    /// even empty — an empty value shadows the lowercase twin) and falls
+    /// even empty - an empty value shadows the lowercase twin) and falls
     /// back to `ALL_PROXY`/`all_proxy` when the primary is unusable. A
     /// set-but-unusable value (a typo'd scheme, a missing `://`, a path or
     /// query on a scheme-less value, whitespace or a URI-rejected byte) is
-    /// silently ignored by the underlying client — the run then leaves from
+    /// silently ignored by the underlying client - the run then leaves from
     /// the REAL IP while the user believes they are behind their proxy or
-    /// Tor, which for a privacy-sensitive run is silent de-anonymization —
+    /// Tor, which for a privacy-sensitive run is silent de-anonymization -
     /// so the startup names what is used and what is ignored, loudly.
     /// `HTTP_PROXY` is named too (git2mail's traffic is HTTPS-only, so an
     /// http-scope proxy is never used for it), a set `NO_PROXY` is warned
@@ -691,7 +691,7 @@ impl Client {
             if any_set {
                 log::warn!(
                     "REQUEST_METHOD is set (the HTTP stack's CGI marker): every proxy \
-                     variable is discarded and requests go DIRECT from your real IP — \
+                     variable is discarded and requests go DIRECT from your real IP - \
                      unset it or run outside a CGI environment before a sensitive run"
                 );
             }
@@ -742,14 +742,14 @@ impl Client {
             log::warn!(
                 "{name} is set but the HTTP stack cannot use it (empty, an unsupported \
                  scheme, or not a parsable proxy URI): requests go DIRECT from your real \
-                 IP — fix the variable or unset it before a sensitive run"
+                 IP - fix the variable or unset it before a sensitive run"
             );
         }
         let proxy_in_use = primary_usable || fallback_usable;
         let no_proxy = lookup("NO_PROXY").or_else(|| lookup("no_proxy"));
         if proxy_in_use && no_proxy.is_some_and(|value| !value.trim().is_empty()) {
             log::warn!(
-                "NO_PROXY is set: it can bypass the proxy for some hosts — verify your \
+                "NO_PROXY is set: it can bypass the proxy for some hosts - verify your \
                  exit IP before a sensitive run"
             );
         }
@@ -768,11 +768,11 @@ impl Client {
     ///
     /// - primary quota exhaustion (403 with `X-RateLimit-Remaining: 0`): the
     ///   token is parked until the instant the `x-ratelimit-reset` header
-    ///   names (capped at one hour), then rotates — the spent allowance is a
+    ///   names (capped at one hour), then rotates - the spent allowance is a
     ///   pause, not a death, so the token rejoins the pool at the reset. When
     ///   the header is absent (a middlebox stripped it), the token is retired
     ///   for the rest of the process instead of being retried on a guessed
-    ///   window — except when the spent quota is the *search* quota: the
+    ///   window - except when the spent quota is the *search* quota: the
     ///   `/search/` endpoints run on a separate, per-minute quota whose
     ///   exhaustion also carries `Remaining: 0`, but the token's hourly core
     ///   quota is untouched there and the search window resets within
@@ -797,7 +797,7 @@ impl Client {
     ///   the primary exhaustion's `X-RateLimit-Remaining: 0` is classified
     ///   as a primary limit first and parks the token until the named reset
     ///   (or retires it without a reset header) even with the `Retry-After`
-    ///   header — the hourly core quota is spent, and sleeping for a
+    ///   header - the hourly core quota is spent, and sleeping for a
     ///   potentially wrong, possibly hour-long window would be worse than
     ///   rotating to a healthy token;
     ///
@@ -808,7 +808,7 @@ impl Client {
     ///
     /// An HTTP 401 means the token itself was rejected by the API (a revoked
     /// or invalid token): it is retired like a spent quota and the request
-    /// rotates to the next live token when one exists — the same token-scoped
+    /// rotates to the next live token when one exists - the same token-scoped
     /// semantics the parallel worker pools apply. With nothing to rotate to,
     /// the rejection surfaces as [`Error::TokenRejected`].
     ///
@@ -951,8 +951,8 @@ impl Client {
                     continue; // rotate to the next live token and retry
                 }
                 // Nothing to rotate to: the rejected token is surfaced as a
-                // crafted error (the raw reqwest message — "HTTP status
-                // client error (401 Unauthorized) for url (…)" — names no
+                // crafted error (the raw reqwest message - "HTTP status
+                // client error (401 Unauthorized) for url (…)" - names no
                 // next step and reads like a tool failure rather than a
                 // credentials problem)
                 return Err(Error::TokenRejected);
@@ -985,7 +985,7 @@ impl Client {
     /// [`MAX_RESPONSE_BODY_BYTES`]): a hostile or broken intermediary must
     /// not be able to exhaust memory inside the request timeout, whatever
     /// the status code. A chunked body with no announced length keeps no
-    /// cap here — the announced-length path is the one a hostile server
+    /// cap here - the announced-length path is the one a hostile server
     /// controls.
     fn ensure_bounded_body(response: &reqwest::blocking::Response) -> Result<(), Error> {
         if let Some(len) = response
@@ -995,7 +995,7 @@ impl Client {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "GitHub response body too large: {len} bytes, the maximum is {MAX_RESPONSE_BODY_BYTES} — check your connection (a proxy or captive portal can inject oversized responses) and try again"
+                    "GitHub response body too large: {len} bytes, the maximum is {MAX_RESPONSE_BODY_BYTES} - check your connection (a proxy or captive portal can inject oversized responses) and try again"
                 ),
             )));
         }
@@ -1055,7 +1055,7 @@ impl Client {
         // quota is transient by the same token (see above), window header
         // or not. A core 403 with both `X-RateLimit-Remaining: 0` and
         // `Retry-After` never reaches this branch: the primary
-        // classification above retires it (the hourly quota is spent —
+        // classification above retires it (the hourly quota is spent -
         // sleeping for the wrong window would be worse).
         let transient_limit = status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || has_retry_after
@@ -1071,7 +1071,7 @@ impl Client {
     /// abuse and secondary-limit messages, or the primary-limit body whose
     /// `X-RateLimit-Remaining` header a middlebox stripped) rather than a
     /// permanent refusal: misclassifying those as a permanent 403 would fail
-    /// the scan while another token still has budget — or, worse, make a
+    /// the scan while another token still has budget - or, worse, make a
     /// fully rate-limited scan skip every repository as resource-scoped
     /// failures and exit 0 with a complete-looking empty report.
     fn body_says_rate_limited(body: &str) -> bool {
@@ -1086,7 +1086,7 @@ impl Client {
     /// listings the crate composes (`/repos/{owner}/{repository}/commits`,
     /// or the `/search/commits` endpoint), so only the listings GitHub
     /// answers 409 on when the repository is empty are classified as
-    /// commits endpoints — a 409 from any other endpoint (a listing that
+    /// commits endpoints - a 409 from any other endpoint (a listing that
     /// holds no repository at all, like `/orgs/{org}/members`, a repository
     /// metadata call, or `/repos/{owner}/commits`, which is the metadata of
     /// a repository *named* `commits`) must not be reported as an "empty
@@ -1206,7 +1206,7 @@ mod tests {
         // the HTTP stack silently IGNORES a set-but-unsupported proxy value
         // and goes direct: for a privacy-sensitive run that is silent
         // de-anonymization, so the startup must name it. Values are never
-        // logged (they can carry credentials) — only the variable name and
+        // logged (they can carry credentials) - only the variable name and
         // the scheme.
         let ((), lines) = crate::test_logger::capture(|| {
             Client::warn_on_proxy_env(|name| {
@@ -1268,7 +1268,7 @@ mod tests {
         // an empty-set uppercase variable SHADOWS the lowercase twin (the
         // stack's get_first_env returns the first SET one, even empty, and
         // never reads the twin): announcing the twin would be a false
-        // assurance — the scope is unusable and the run goes DIRECT
+        // assurance - the scope is unusable and the run goes DIRECT
         let ((), lines) = crate::test_logger::capture(|| {
             Client::warn_on_proxy_env(|name| match name {
                 "HTTPS_PROXY" => Some(String::new()),
@@ -1289,7 +1289,7 @@ mod tests {
             "the shadowed twin must never be announced: {lines:?}"
         );
         // a typo'd primary with a usable ALL_PROXY: the traffic rides the
-        // fallback, so "go DIRECT" would be FALSE — name both
+        // fallback, so "go DIRECT" would be FALSE - name both
         let ((), lines) = crate::test_logger::capture(|| {
             Client::warn_on_proxy_env(|name| match name {
                 "HTTPS_PROXY" => Some("socs5://127.0.0.1:9050".to_string()),
@@ -1822,7 +1822,7 @@ mod tests {
         // Live-captured shape of a hot search minute (real GitHub): a 403
         // with the *search* quota spent (`X-RateLimit-Resource: search`,
         // `X-RateLimit-Remaining: 0`), the primary-limit body, and NO
-        // `Retry-After` header — GitHub's search exhaustion does not always
+        // `Retry-After` header - GitHub's search exhaustion does not always
         // carry a window, so the search exemption cannot key on
         // `Retry-After` alone. The token's hourly core quota is untouched
         // there, so the token must only be parked (a pending deadline):
@@ -1855,7 +1855,7 @@ mod tests {
         assert_eq!(json["ok"], serde_json::json!(true));
 
         // The distinguishing contract: the blipped token is PARKED (a
-        // pending deadline), not RETIRED (a permanent `None` entry) — it
+        // pending deadline), not RETIRED (a permanent `None` entry) - it
         // must come back once the search window passes instead of being
         // lost for the rest of the process.
         let exhausted = client.tokens.exhausted.lock().expect("unpoisoned lock");
@@ -1869,10 +1869,95 @@ mod tests {
     }
 
     #[test]
+    fn a_search_quota_403_with_an_unremarkable_body_still_parks() {
+        use crate::github::mock::serve_requests;
+        // The mutation-resistant pin for the spent-search-quota disjunct:
+        // every OTHER parking path is silent here - the status is 403 (not
+        // a 429), there is no Retry-After header, and the body announces
+        // nothing rate-limit shaped. Only `exhausted + the search
+        // resource` can explain the parking: deleting
+        // `|| spent_search_quota` from the classification retires the
+        // token instead and this test fails.
+        let (address, server) = serve_requests(move |index, _request| {
+            if index == 0 {
+                return (
+                    403,
+                    vec![
+                        ("X-RateLimit-Remaining".to_string(), "0".to_string()),
+                        ("X-RateLimit-Resource".to_string(), "search".to_string()),
+                    ],
+                    "your proxy refused this for its own reasons".to_string(),
+                );
+            }
+            (200, vec![], r#"{"ok": true}"#.to_string())
+        });
+
+        let pool = TokenPool::from_token_file(&crate::github::mock::temp_token_file(
+            r#"{"0": "ghp_a", "1": "ghp_b"}"#,
+            30,
+        ))
+        .expect("token file must load");
+        let client = Client::new(pool).expect("client must build");
+        let json = client
+            .get_json(&format!("{address}/search/repositories?q=x"))
+            .expect("the search-quota blip must rotate to the healthy token");
+        assert_eq!(json["ok"], serde_json::json!(true));
+
+        let exhausted = client.tokens.exhausted.lock().expect("unpoisoned lock");
+        assert!(
+            matches!(exhausted.get(&0), Some(Some(_))),
+            "the unremarkable body must not change the search-exemption contract: {:?}",
+            exhausted.get(&0)
+        );
+        drop(exhausted);
+        server.join();
+    }
+
+    #[test]
+    fn a_core_quota_403_with_an_unremarkable_body_retires() {
+        use crate::github::mock::serve_requests;
+        // The control of the pin above: the same spent headers on a CORE
+        // endpoint, with the same body that announces nothing - the
+        // primary classification must retire the token (the hourly quota
+        // is spent), proving the parking test above comes from the search
+        // exemption and not from anything body- or status-shaped.
+        let (address, server) = serve_requests(move |index, _request| {
+            if index == 0 {
+                return (
+                    403,
+                    vec![("X-RateLimit-Remaining".to_string(), "0".to_string())],
+                    "your proxy refused this for its own reasons".to_string(),
+                );
+            }
+            (200, vec![], r#"{"ok": true}"#.to_string())
+        });
+
+        let pool = TokenPool::from_token_file(&crate::github::mock::temp_token_file(
+            r#"{"0": "ghp_a", "1": "ghp_b"}"#,
+            30,
+        ))
+        .expect("token file must load");
+        let client = Client::new(pool).expect("client must build");
+        let json = client
+            .get_json(&format!("{address}/repos/owner/repo/commits?per_page=100"))
+            .expect("the retired token must rotate to the healthy one");
+        assert_eq!(json["ok"], serde_json::json!(true));
+
+        let exhausted = client.tokens.exhausted.lock().expect("unpoisoned lock");
+        assert!(
+            matches!(exhausted.get(&0), Some(None)),
+            "a spent core quota with an unremarkable body must retire the token: {:?}",
+            exhausted.get(&0)
+        );
+        drop(exhausted);
+        server.join();
+    }
+
+    #[test]
     fn from_token_rejects_internal_whitespace_in_the_value() {
         // a space is a legal header-value byte: a token like `ghp_ abc`
         // used to pass load-time validation, be sent verbatim in the
-        // Authorization header and only fail at request time with a 401 —
+        // Authorization header and only fail at request time with a 401 -
         // the fail-fast validation promise must cover whitespace like it
         // covers control characters
         let error = TokenPool::from_token("ghp_ abc").expect_err("must fail");
@@ -1888,7 +1973,7 @@ mod tests {
         // mispointed huge file must fail fast with a named-file error
         // instead of being fully buffered (a character device like
         // /dev/zero would grow the read without bound until the OOM killer
-        // steps in — not portably testable here, the metadata guard covers
+        // steps in - not portably testable here, the metadata guard covers
         // it with the same check)
         let path = std::env::temp_dir().join(format!(
             "git2mail_token_pool_oversized_test_{}.json",
@@ -1910,7 +1995,7 @@ mod tests {
     fn from_token_file_rejects_a_non_regular_file() {
         // a directory is never a token file: it fails fast with the same
         // named-file error contract as any other structural problem (a
-        // FIFO would block forever — not portably testable here, the
+        // FIFO would block forever - not portably testable here, the
         // metadata guard covers it with the same check)
         let error = TokenPool::from_token_file(&std::env::temp_dir()).expect_err("must fail");
         assert!(
@@ -2032,7 +2117,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         // GitHub names the reset instant on a spent hourly quota: the token
         // is parked until then (it rejoins the pool on its own), NOT retired
-        // for the process — a long parallel scan must get its token back at
+        // for the process - a long parallel scan must get its token back at
         // the reset instead of losing it forever. The retired fallback is
         // pinned by a_core_quota_403_without_a_reset_header_still_retires.
         let resets = std::time::SystemTime::now()

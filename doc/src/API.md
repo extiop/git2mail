@@ -30,6 +30,72 @@ Two guards bound the loop:
   handling below; the loop can never spin: when every token is exhausted,
   the scan fails with an explicit error instead of retrying forever.
 
+## Network egress: proxies and Tor
+
+The HTTP client honors the standard proxy environment variables with the
+same precedence rules the HTTP stack applies, and git2mail checks them
+at startup, announces the proxy actually used, and loudly warns instead
+of silently falling back when a configured proxy is unusable (the check
+mirrors the stack conservatively: a value it cannot vouch for is warned
+about, which only ever over-warns - never the reverse).
+
+### What the stack honors
+
+- `HTTPS_PROXY` (or `https_proxy`) is the primary variable for
+  git2mail's traffic: the tool is HTTPS-only, so an `HTTP_PROXY` value
+  is never used for it (announced as an informational note, since it
+  usually means a proxy is configured but scoped elsewhere).
+- `ALL_PROXY` (or `all_proxy`) is the fallback, used only when the
+  primary variable is absent or unusable.
+- Proxy schemes: the `http` and `https` schemes are accepted
+  case-insensitively (`HTTP://proxy:8080` works); the `socks` schemes
+  (`socks5://`, `socks5h://`, `socks4://`, `socks4a://`) are matched
+  case-**sensitively** and lowercase-only - `SOCKS5://` is not
+  recognized by the stack (a warning names it). A scheme-less bare
+  authority is assumed `http`.
+- A set-but-empty variable counts as set and shadows its lowercase
+  twin: the fallback (if any) is used instead - when no fallback
+  exists, the run goes direct - and the warning names the outcome.
+- A set `NO_PROXY` can bypass the proxy for some hosts: warned about
+  when a proxy is in use.
+- A set `REQUEST_METHOD` (the stack's CGI marker) makes the stack
+  discard every proxy variable: warned about when any proxy variable is
+  set.
+- Proxy values are never logged: a proxy URL can carry embedded
+  credentials.
+
+### Tor
+
+Route a run through Tor with a `socks5h` URL, no flag needed:
+
+```bash
+HTTPS_PROXY=socks5h://127.0.0.1:9050 git2mail scan --url "$TARGET_URL" --token-file tokens.json
+```
+
+`socks5h` asks the proxy to resolve hostnames (verified against the
+bundled HTTP stack: the `socks5h` scheme maps to proxy-side DNS
+resolution); plain `socks5` resolves hostnames locally, which leaks
+every lookup's hostname to the local resolver - prefer `socks5h` for
+Tor.
+
+Two honesty notes, stated plainly:
+
+- **The startup check proves the proxy at launch, not the whole run's
+  path.** It resolves the environment with the stack's own precedence
+  rules and announces the proxy in use, but it is not a continuous
+  guarantee: before a sensitive run, verify your exit IP.
+- **Anonymous runs through Tor are practically unusable**: GitHub's
+  anonymous quota (about 60 requests per hour) is shared by every user
+  of that exit node, so a shared exit is spent before your first scan
+  finishes. With a token, the quota is per token (5,000 requests per
+  hour), but expect more frequent secondary-limit pauses (the tool
+  parks a token until its window passes and rotates to the next one);
+  the park semantics are described in [Rate limits](#rate-limits).
+
+GitHub applies the same rate limits and the same abuse detection
+whatever the request's origin; this guide documents what the stack
+honors, not techniques to avoid either.
+
 ## Rate limits
 
 GitHub rate limits come in two flavors, and the client reacts to each one
@@ -44,7 +110,7 @@ spent, and which quota decides the reaction:
   **parked** until the instant the `x-ratelimit-reset` header names (capped
   at one hour so a hostile header cannot park it indefinitely), then
   returns automatically, and the request is retried with the next available
-  token. A spent allowance is a pause, not a death: a long parallel scan
+  token. A spent quota is a pause, not a death: a long parallel scan
   gets its token back at the reset. When the header is absent (a middlebox
   stripped it), there is no known window to wait for: the token is
   **retired** (removed from the allocation pool for the rest of the run)
@@ -64,8 +130,12 @@ windows stops with the dedicated paused message ("wait a few minutes",
 `RateLimitPaused`).
 
 A `403` with `x-ratelimit-remaining` above `0` is a genuine refusal (for
-example a private or missing resource) and is **not** treated as rate limiting, unless it carries a `Retry-After` header, the secondary-limit body, or a primary-limit body whose quota header a middlebox stripped (the body text "API rate limit exceeded" is treated as transient too, since the missing header makes the two indistinguishable); those cases park the token
-instead (see below).
+example a private or missing resource) and is **not** treated as rate
+limiting, unless it carries a `Retry-After` header, the secondary-limit
+body, or a primary-limit body whose quota header a middlebox stripped
+(the body text "API rate limit exceeded" is treated as transient too,
+since the missing header makes the two indistinguishable). Any of these
+three park the token instead (see below).
 
 ### Secondary limit (abuse detection)
 

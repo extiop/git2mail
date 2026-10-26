@@ -4,13 +4,18 @@ tokens.json
 # build directory
 /target
 /debug
-
 # results directory
 /results
-
 # local agent-scratch directories (never committed)
 .pi-subagents/
-
 # internal release kit (handoff notes, PR drafts, tokens)
 .pi-release/
 /doc/book
+# E2E harness (web/e2e): node tooling is dev-only, never shipped
+web/e2e/node_modules/
+test-results/
+web/e2e/playwright-report/
+web/site/public-*/
+web/site/static/wasm/
+/site/
+web/site/public/

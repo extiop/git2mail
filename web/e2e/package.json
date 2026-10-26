@@ -1,0 +1,11 @@
+{
+  "name": "git2mail-e2e",
+  "private": true,
+  "description": "Headless-browser E2E tests for the git2mail web site (dev-only tooling: never shipped in the artifact).",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1"
+  }
+}

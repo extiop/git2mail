@@ -5,8 +5,9 @@
 //! original Cargo project root: `get_project_root()` is gone.
 
 use crate::errors::Error;
-use crate::sanitize::is_control_or_invisible;
+pub use crate::provenance::Provenance;
 use crate::sanitize::log_safe;
+use git2mail_core::sanitize::sanitize_file_name;
 use log::info;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -14,83 +15,6 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Byte ceiling for one sanitized output path component. The per-component
-/// limit of the common filesystems is 255 bytes; keeping the ceiling well
-/// below it leaves room for the sibling component and any consumer suffix.
-const MAX_FILE_NAME_BYTES: usize = 200;
-
-/// The when and what of a JSON report: the UTC generation timestamp and the
-/// tool version. Flattened into every report, so an archived report can
-/// always be traced back to the run that produced it (the report still does
-/// not know the command line that produced it: archive that next to it for
-/// full reproducibility).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Provenance {
-    /// RFC 3339 UTC timestamp of the moment the report was assembled
-    /// (`YYYY-MM-DDTHH:MM:SSZ`); the run's local time zone is deliberately
-    /// not applied, so two archived reports sort without ambiguity.
-    pub generated_at: String,
-    /// Version of git2mail that wrote the report (the same string
-    /// `git2mail --version` prints).
-    pub tool_version: &'static str,
-}
-
-impl Provenance {
-    /// Stamps the current instant from the system clock. A clock reporting
-    /// before the Unix epoch (a pathological system state) degrades to the
-    /// epoch itself instead of panicking: the timestamp would be wrong, but
-    /// the report must still be written.
-    pub fn now() -> Self {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
-        Self {
-            generated_at: rfc3339_utc(secs),
-            tool_version: env!("CARGO_PKG_VERSION"),
-        }
-    }
-}
-
-impl Default for Provenance {
-    fn default() -> Self {
-        Self::now()
-    }
-}
-
-/// Formats a Unix timestamp (seconds) as RFC 3339 UTC
-/// (`YYYY-MM-DDTHH:MM:SSZ`), hand-rolled so the crate keeps zero date
-/// dependencies: the civil-from-days algorithm (Howard Hinnant) maps the
-/// day count to a proleptic Gregorian calendar date.
-pub fn rfc3339_utc(timestamp_secs: u64) -> String {
-    let days = (timestamp_secs / 86_400) as i64;
-    let secs_of_day = timestamp_secs % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        secs_of_day / 3600,
-        (secs_of_day % 3600) / 60,
-        secs_of_day % 60
-    )
-}
-
-/// The civil-from-days algorithm (Howard Hinnant, "chrono-Compatible
-/// Low-Level Date Algorithms"): a day count since 1970-01-01 to a
-/// proleptic Gregorian `(year, month, day)`.
-fn civil_from_days(day_count: i64) -> (i64, u32, u32) {
-    let z = day_count + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = (z - era * 146_097) as u64; // [0, 146_096]
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365; // [0, 399]
-    let year = year_of_era as i64 + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
-    let mp = (5 * day_of_year + 2) / 153; // [0, 11]
-    let day = (day_of_year - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    (if month <= 2 { year + 1 } else { year }, month as u32, day)
-}
 
 /// The search request a `search` JSON report records next to its findings:
 /// the query, the language filter and every advanced qualifier actually
@@ -178,7 +102,7 @@ const STAGING_ORPHAN_AGE: std::time::Duration = std::time::Duration::from_secs(2
 
 /// Removes the stale staging files an interrupted run left in `directory`
 /// (`.git2mail-stage.<pid>.<serial>.tmp`, modification time older than
-/// [`STAGING_ORPHAN_AGE`]): best-effort housekeeping — a removal failure is
+/// [`STAGING_ORPHAN_AGE`]): best-effort housekeeping - a removal failure is
 /// silently ignored (the file may be swept on a later publish) and a live
 /// publisher's staging file (milliseconds old) can never match the age
 /// bound.
@@ -191,7 +115,7 @@ fn sweep_stale_staging(directory: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // the exact staging shape a crashed run can leave — only the
+        // the exact staging shape a crashed run can leave - only the
         // tool's own `.git2mail-stage.<pid>.<serial>.tmp` files match
         // (digit-checked counters), never a user file that happens to end
         // in .tmp
@@ -234,7 +158,7 @@ fn sweep_stale_staging(directory: &Path) {
 /// replaces an existing target on every supported platform (Unix `rename(2)`,
 /// Windows `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`) and is atomic
 /// within a filesystem, so a concurrent reader observes either the previous
-/// or the new complete content — never a truncated or interleaved file — and
+/// or the new complete content - never a truncated or interleaved file - and
 /// two concurrent publishers of the same target each publish their own
 /// complete run (last complete publisher wins) instead of tearing each
 /// other's lines (the previous direct `File::create` + per-line write left
@@ -260,7 +184,7 @@ fn publish_atomically(target: &Path, staging: &Path, content: &str) -> Result<()
     // rename(2) replaces a symlink, it never follows one: a target that
     // happens to be a symlink (a user convenience link like
     // `latest.json -> run-2024.json`, or a system device link like
-    // `/dev/stdout`) would be silently replaced by a regular file — the
+    // `/dev/stdout`) would be silently replaced by a regular file - the
     // report would neither reach the link's target nor the stdout device,
     // and the link itself would be destroyed, all while reporting success.
     // Refuse instead: the link and its target are left untouched, and the
@@ -277,7 +201,7 @@ fn publish_atomically(target: &Path, staging: &Path, content: &str) -> Result<()
     }
     // the staging file is created OWNER-ONLY (0600 on Unix): the results
     // hold personal data (harvested email addresses), so "safe by default"
-    // beats the umask's usual 0644 world-readable default — a user-tightened
+    // beats the umask's usual 0644 world-readable default - a user-tightened
     // or relaxed mode on an EXISTING target is still preserved below
     #[cfg(unix)]
     let staged = {
@@ -331,8 +255,12 @@ fn publish_atomically(target: &Path, staging: &Path, content: &str) -> Result<()
 }
 
 /// Writes the legacy text output: one email per line, into
-/// `results/<directory>/<file_name>` relative to the current working
-/// directory. The text format is unchanged.
+/// `results/<directory>/<file_name>.log` relative to the current working
+/// directory. The `.log` extension is always appended (after
+/// [`sanitize_file_name`], so every sanitizer invariant holds on the stem
+/// and the extension rides on top): the plain-text deliverable must
+/// open natively in a default editor (Windows Notepad opens `.log` files
+/// without an *Open with* dance). The text format is unchanged.
 ///
 /// # Errors
 ///
@@ -358,6 +286,15 @@ pub fn write_text(
     // (`..\\x`) or Windows reserved device names (`CON`)
     let directory = sanitize_file_name(directory);
     let file_name = sanitize_file_name(file_name);
+    // the deliverable is always `<sanitized name>.log` (a double-clickable
+    // file for the tool's non-developer audience): the extension is appended
+    // after sanitization, so the reserved-device-name prefix, the 200-byte
+    // stem cap and the anti-clobber hash stay on the stem and the name of an
+    // unchanged target keeps its exact stem (`octocat_Hello-World` becomes
+    // exactly `octocat_Hello-World.log`). A raw name already ending in
+    // `.log` ends in `.log.log`: harmless and pinned, never stripped - the
+    // printed path is authoritative either way.
+    let file_name = format!("{file_name}.log");
 
     info!("--------------------------------");
     if emails.len() > 1 {
@@ -387,114 +324,6 @@ pub fn write_text(
     Ok(Some(file_path))
 }
 
-/// Windows reserves device names for itself, with or without extension and
-/// case-insensitively: a query like `CON` or `com1` would create a file
-/// Windows refuses to open.
-const WINDOWS_RESERVED_DEVICE_NAMES: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-];
-
-/// Sanitizes a user- or API-derived name for use as an output file name:
-/// path separators, Windows-reserved characters and control characters
-/// become `_`, and trailing dots and spaces (also illegal on Windows) are
-/// trimmed, so a raw query like `a/b` or `language:rust` can never escape
-/// `results/<directory>/` or fail only after a full scan completed. A name
-/// whose stem is a Windows reserved device name (`CON`, `NUL`, `COM1`…,
-/// with or without extension, like `CON.txt`) is prefixed with `_`.
-/// Because the replacement is lossy, a name the sanitizer changed also
-/// carries a hash of the raw name: distinct raw queries that collapse onto
-/// the same sanitized file name (`a/b`, `a:b`, `a\\b` → `a_b`) must not
-/// silently overwrite each other's result file.
-fn sanitize_file_name(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if is_control_or_invisible(c)
-                || matches!(c, '/' | '\\' | ':' | '?' | '*' | '"' | '<' | '>' | '|')
-            {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let trimmed = sanitized.trim_end_matches(['.', ' ']);
-    let candidate = if trimmed.is_empty() { "_" } else { trimmed };
-    // Windows reserves the device names with or without extension: the
-    // check is on the stem before the first dot, so `CON.txt` or `nul.json`
-    // are caught as well as the bare names.
-    let stem = candidate.split('.').next().unwrap_or(candidate);
-    let mut candidate = if WINDOWS_RESERVED_DEVICE_NAMES
-        .iter()
-        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
-    {
-        format!("_{candidate}")
-    } else {
-        candidate.to_string()
-    };
-    // Sanitization is lossy: distinct raw names (`a/b`, `a:b`, `a\\b`, a
-    // control-bearing name…) collapse onto the same sanitized file name, and
-    // each run would silently overwrite the previous one's result file. A
-    // name the sanitizer CHANGED therefore carries a hash of the raw name,
-    // so the collapsed class is disambiguated — the same anti-clobber
-    // suffix the length cap below uses. A byte-unchanged name keeps its
-    // exact file name (`hello` stays `hello`, `Rust` stays `Rust`): the
-    // suffix only answers a real loss, it never decorates an untouched
-    // name. Two runs of the same query still overwrite each other by
-    // design (a rerun refreshes the results); note that on a
-    // case-insensitive filesystem (macOS APFS, Windows NTFS) two targets
-    // differing only by case (`rust lang` vs `Rust Lang`) share one file
-    // name — the target and its case are visible in every report line, and
-    // the JSON report carries the exact target.
-    if candidate != name {
-        candidate = format!("{candidate}-{:016x}", stable_hash(name));
-    }
-    // A filesystem path component is limited to 255 bytes: a long multibyte
-    // search query (GitHub caps queries at 256 *characters*, so a 110-CJK-
-    // character query is accepted by the API but its raw file name weighs
-    // 269 bytes) used to make the whole output write fail with
-    // ENAMETOOLONG *after* the scan had completed, discarding the results.
-    // The sanitized name is therefore capped at [`MAX_FILE_NAME_BYTES`],
-    // cut on a char boundary; when the cap applies, a hash of the full RAW
-    // name is appended so two distinct long queries cannot silently clobber
-    // each other's result file (hashing the truncated candidate instead
-    // would discard any earlier suffix and collide two long names sharing
-    // the same prefix — the raw name is what makes the targets distinct)
-    if candidate.len() > MAX_FILE_NAME_BYTES {
-        // the cap announces itself: a silent truncation would leave the
-        // analyst guessing why the printed path differs from the target
-        // (same caps-say-so convention as the commit and search ceilings)
-        log::info!(
-            "result file name capped at {MAX_FILE_NAME_BYTES} bytes with a hash suffix (the target name was longer)"
-        );
-        let mut end = MAX_FILE_NAME_BYTES;
-        while !candidate.is_char_boundary(end) {
-            end -= 1;
-        }
-        return format!("{}-{:016x}", &candidate[..end], stable_hash(name));
-    }
-    candidate.to_string()
-}
-
-/// FNV-1a over the raw name bytes: the anti-clobber suffix must be stable
-/// across Rust releases. std's `DefaultHasher` is documented as having an
-/// unspecified algorithm, so a toolchain upgrade could change the suffix:
-/// a rerun of the same query would then write a new file and leave the
-/// previous result stale instead of refreshing it, silently breaking the
-/// documented rerun-overwrite contract. FNV-1a is self-contained, stable,
-/// and only needs to distinguish names, not resist adversaries.
-fn stable_hash(name: &str) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x100_0000_01b3;
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in name.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
 /// The conventional stdout path marker: `--json -` writes the report to the
 /// standard output instead of a literal file named `-`, following the
 /// universal CLI convention (the same as `gzip -c`, `curl -o -`…).
@@ -505,7 +334,7 @@ const STDOUT_PATH_MARKER: &str = "-";
 /// write (it would fail with `Is a directory`), so the check would only
 /// fire after the whole run's API budget was spent on a report that cannot
 /// be written. The `-` stdout marker and a non-existing or file path are
-/// accepted (the report may also target a path created mid-run — this is
+/// accepted (the report may also target a path created mid-run - this is
 /// only a pre-flight, not a reservation).
 ///
 /// # Errors
@@ -608,9 +437,9 @@ pub fn write_report_json<T: Serialize>(path: &Path, report: &T) -> Result<(), Er
         // so joining the sanitized lines back with newlines preserves a
         // parseable document while stripping the hostile characters
         // serde_json leaves raw inside string values (bidi overrides,
-        // zero-width, C1/DEL) — sanitizing the whole body would destroy
+        // zero-width, C1/DEL) - sanitizing the whole body would destroy
         // the structural newlines and write invalid JSON (the file path
-        // stays lossless — a JSON reader renders, it does not interpret)
+        // stays lossless - a JSON reader renders, it does not interpret)
         let safe = sanitize_json_for_stdout(&body);
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
@@ -733,18 +562,6 @@ mod tests {
     use crate::test_logger::in_temp_cwd;
 
     #[test]
-    fn rfc3339_utc_formats_known_timestamps() {
-        // the epoch, a leap day, and a "round" modern timestamp: pin the
-        // civil-from-days conversion on dates a reader can verify by hand
-        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339_utc(86_399), "1970-01-01T23:59:59Z");
-        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
-        assert_eq!(rfc3339_utc(951_868_800), "2000-03-01T00:00:00Z");
-        assert_eq!(rfc3339_utc(1_000_000_000), "2001-09-09T01:46:40Z");
-        assert_eq!(rfc3339_utc(1_700_000_000), "2023-11-14T22:13:20Z");
-    }
-
-    #[test]
     fn the_search_request_is_recorded_in_the_report_and_qualifiers_omitted_when_unset() {
         // the search-report provenance: two runs with different qualifiers
         // must write distinguishable reports
@@ -776,7 +593,7 @@ mod tests {
                 partial: false,
             },
             correlation: &correlation,
-            provenance: Provenance::now(),
+            provenance: Provenance::now(env!("CARGO_PKG_VERSION")),
         };
         write_report_json(&path, &report).expect("json output must write");
 
@@ -794,93 +611,6 @@ mod tests {
             serde_json::json!(["a@b.c"])
         );
         fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn sanitize_file_name_neuters_invisible_characters() {
-        // output file names derive from user-typed queries: invisible
-        // characters surviving the sanitizer would make two visually
-        // identical queries land in two different files, and a carried RTL
-        // override could visually spoof the name in directory listings
-        for c in [
-            '\u{200B}', '\u{200E}', '\u{202E}', '\u{2060}', '\u{FEFF}', '\u{2028}', '\u{2029}',
-            '\u{0600}',
-        ] {
-            assert!(
-                sanitize_file_name(&format!("a{c}b")).starts_with("a_b"),
-                "U+{:04X} must be neutralized in file names",
-                c as u32
-            );
-        }
-        // sampled sweep over the same invisible ranges the log-safety tests
-        // pin exhaustively (file names share `is_control_or_invisible`)
-        for cp in [
-            0x202A, 0x202E, 0x2066, 0x2069, 0x200D, 0x2064, 0x06DD, 0x070F, 0x180E, 0x206F,
-            0x110BD, 0x110CD, 0x13430, 0x1343F, 0x1BCA0, 0x1BCA3, 0x1D173, 0x1D17A, 0xFE00, 0xFE0F,
-            0xE0100, 0xE01EF, 0xFFF9, 0xFFFB, 0xE0000, 0xE007F,
-        ] {
-            let c = char::from_u32(cp).expect("a valid scalar");
-            assert!(
-                sanitize_file_name(&format!("q{c}x")).starts_with("q_x"),
-                "U+{cp:05X} must be neutralized in file names"
-            );
-        }
-    }
-
-    #[test]
-    fn distinct_raw_names_that_sanitize_alike_get_distinct_result_files() {
-        // the sanitization is lossy: `a/b`, `a:b` and `a\\b` all collapse
-        // onto `a_b`, and each run used to silently overwrite the previous
-        // one's result file (live repro: three distinct queries, one file,
-        // only a generic "available at" line between them). A changed name
-        // must carry a hash of the raw name, so the collapsed class is
-        // disambiguated; a name the sanitizer did not change keeps its
-        // exact file name
-        assert_eq!(sanitize_file_name("a_b"), "a_b");
-        assert_eq!(sanitize_file_name("hello"), "hello");
-        let collapsed: Vec<String> = ["a/b", "a:b", "a\\b"]
-            .into_iter()
-            .map(sanitize_file_name)
-            .collect();
-        for name in &collapsed {
-            assert!(
-                name.starts_with("a_b-"),
-                "a changed name must carry the disambiguating hash: {name}"
-            );
-            assert!(
-                name.len() <= 255,
-                "the disambiguated name must stay one filesystem component: {name}"
-            );
-        }
-        // ... and distinct raw names must never collapse onto one file
-        assert_ne!(collapsed[0], collapsed[1]);
-        assert_ne!(collapsed[1], collapsed[2]);
-        assert_ne!(collapsed[0], collapsed[2]);
-        // deterministic across runs (the length-cap suffix already relies
-        // on the same stable hasher)
-        assert_eq!(collapsed[0], sanitize_file_name("a/b"));
-        // the same raw name always keeps the same file (a rerun overwrites
-        // its own results by design)
-        assert_eq!(sanitize_file_name("a:b"), collapsed[1]);
-        // trailing-dot trimming is a change too: `a.` must not collapse
-        // onto `a`
-        assert_ne!(sanitize_file_name("a."), sanitize_file_name("a"));
-    }
-
-    #[test]
-    fn the_anti_clobber_hash_is_stable_across_rust_releases() {
-        // std's DefaultHasher has an unspecified algorithm: a toolchain
-        // upgrade used to change the suffix, so a rerun of the same query
-        // wrote a new file and left the previous result stale instead of
-        // refreshing it. The suffix is now a self-contained FNV-1a, pinned
-        // here by its exact value: if this test fails, the suffix changed
-        // and old result files will no longer be overwritten by reruns
-        assert_eq!(format!("{:016x}", stable_hash("a/b")), "e620c3190468cf61");
-        assert_eq!(format!("{:016x}", stable_hash("a:b")), "e661911904a01160");
-        assert_eq!(format!("{:016x}", stable_hash("Rust")), "ea8ce02b70d73b07");
-        // both suffix sites (case-fold and length cap) derive from the
-        // same hash: the disambiguation test above keeps them coherent,
-        // this pin keeps them stable
     }
 
     #[test]
@@ -951,7 +681,7 @@ mod tests {
         // `--json latest.json` where latest.json is a symlink (or a system
         // device link like /dev/stdout): the atomic publish would replace the
         // link instead of following it, so the report would neither reach the
-        // link's target nor the device — the rejection must happen pre-flight,
+        // link's target nor the device - the rejection must happen pre-flight,
         // before the run's API budget is spent (live repro: --json /dev/stdout
         // replaced the system's stdout device link with a regular file)
         let dir = std::env::temp_dir().join(format!(
@@ -991,7 +721,7 @@ mod tests {
         // the publish-time guard, `write_report_json` over a symlink silently
         // destroyed the link, delivered the report to a new regular file at
         // the link's path, and still reported success (the link's target was
-        // never updated) — the writer must refuse loudly instead
+        // never updated) - the writer must refuse loudly instead
         in_temp_cwd(|| {
             let real = Path::new("real.json");
             fs::write(real, "sentinel").expect("the temp file must be writable");
@@ -1027,7 +757,9 @@ mod tests {
             fs::create_dir_all("results/keyword").expect("the results dir must be creatable");
             let real = Path::new("results/keyword/real.txt");
             fs::write(real, "sentinel").expect("the temp file must be writable");
-            let link = Path::new("results/keyword/acme.txt");
+            // the writer targets `<sanitized name>.log`: the symlink must sit
+            // exactly on the path the rename would take
+            let link = Path::new("results/keyword/acme.txt.log");
             std::os::unix::fs::symlink(real, link).expect("the symlink must be creatable");
 
             let error = write_text("keyword", "acme.txt", &["dev@acme.com".to_string()])
@@ -1085,7 +817,7 @@ mod tests {
     fn a_first_publish_creates_the_result_file_owner_only() {
         // the results hold personal data: a FIRST publish (no previous
         // target whose permissions could be inherited) must not fall back
-        // to the umask's world-readable 0644 default — the staging file is
+        // to the umask's world-readable 0644 default - the staging file is
         // created 0600, so "safe by default" needs no user awareness
         in_temp_cwd(|| {
             use std::os::unix::fs::PermissionsExt;
@@ -1107,7 +839,7 @@ mod tests {
     // the hostile path embeds raw C0 control characters: legal to *reject*
     // on every platform but impossible to create as a real file on Windows
     // (Win32 reserves U+0001..U+001F in path components), so the
-    // create-then-log assertion is unix-only — the log-sanitization
+    // create-then-log assertion is unix-only - the log-sanitization
     // contract itself is covered platform-independently elsewhere
     #[cfg(unix)]
     #[test]
@@ -1116,7 +848,7 @@ mod tests {
             // the success log prints the user-typed --json path: a path
             // carrying control characters (a hostile
             // `--json $'ev\n\x1b[31m.json'`) would forge and recolor a log
-            // line — it must be sanitized like every terminal-printed string
+            // line - it must be sanitized like every terminal-printed string
             let (result, lines) = crate::test_logger::capture(|| {
                 write_report_json(
                     Path::new("git2mail_json_log_test")
@@ -1129,7 +861,7 @@ mod tests {
             // per-line assertion: the process-wide capture logger can also
             // carry lines from a concurrent test that logs without capture
             // (the harness serializes captures, not unrelated logs), so the
-            // lines must not be joined into one string here — a join would
+            // lines must not be joined into one string here - a join would
             // inject a control-character newline of its own
             let line = lines
                 .iter()
@@ -1243,8 +975,8 @@ mod tests {
                 .expect("the file must be written");
             assert_eq!(
                 plain.file_name().and_then(|name| name.to_str()),
-                Some("a_b"),
-                "a name the sanitizer did not change keeps its exact file name"
+                Some("a_b.log"),
+                "a name the sanitizer did not change keeps its exact stem, with the .log extension"
             );
             assert_ne!(plain, path, "a/b and a_b must land in distinct files");
 
@@ -1399,7 +1131,7 @@ mod tests {
                 partial,
             },
             correlation,
-            provenance: Provenance::now(),
+            provenance: Provenance::now(env!("CARGO_PKG_VERSION")),
         }
     }
 
@@ -1478,7 +1210,7 @@ mod tests {
     #[test]
     fn the_hash_suffix_is_added_only_on_a_real_loss() {
         // the anti-clobber suffix answers a real sanitization loss: a byte-
-        // unchanged name keeps its exact file name, whatever its case — the
+        // unchanged name keeps its exact file name, whatever its case - the
         // suffix never decorates an untouched name (the JSON report and the
         // log lines carry the exact target, so nothing is silently hidden;
         // on a case-insensitive filesystem two case-only variants share one
@@ -1599,7 +1331,7 @@ mod tests {
     #[test]
     fn write_json_flags_a_token_death_truncation_in_the_machine_readable_marker() {
         // the CHANGELOG contract: `scanned.partial` is the machine-readable
-        // truncation marker of the `search`/`scan` JSON report — a mutation
+        // truncation marker of the `search`/`scan` JSON report - a mutation
         // hardcoding `false` at the wiring site must fail the suite, so the
         // `true` path is pinned here too, not only at the reducer level
         let path = std::env::temp_dir().join(format!(
@@ -1736,7 +1468,7 @@ mod tests {
     fn a_failed_publish_removes_the_staging_file_and_keeps_the_previous_report() {
         // the target cannot be replaced (a directory sits on its path): the
         // publish must fail with the target's error, remove its staging
-        // file, and leave any previous complete file unharmed — the old
+        // file, and leave any previous complete file unharmed - the old
         // direct write could leave the target truncated
         let base = std::env::temp_dir().join(format!(
             "git2mail_output_test_failed_publish_{}",
@@ -1752,7 +1484,7 @@ mod tests {
         // publish_atomically derives its own unique staging name, so the
         // deterministic blocker is the target itself: make the rename fail
         // by replacing the target with a directory AFTER writing a first,
-        // complete report — rename(file -> existing dir) fails on every
+        // complete report - rename(file -> existing dir) fails on every
         // platform, and the previous content (the directory here) plus the
         // staging hygiene are what the test pins
         let target = base.join("blocked.json");
@@ -1818,8 +1550,12 @@ mod tests {
                 );
                 handle_a.join().expect("writer A must not panic");
                 handle_b.join().expect("writer B must not panic");
-                let content = fs::read_to_string(Path::new("results").join(&directory).join(&name))
-                    .expect("result must be readable");
+                let content = fs::read_to_string(
+                    Path::new("results")
+                        .join(&directory)
+                        .join(format!("{name}.log")),
+                )
+                .expect("result must be readable");
                 let all_a = content.lines().all(|line| line.starts_with("writerA-"));
                 let all_b = content.lines().all(|line| line.starts_with("writerB-"));
                 assert!(
@@ -1852,7 +1588,7 @@ mod tests {
         // the target lives in a private directory: the staging sibling of
         // the target is `.git2mail-stage.<pid>.<serial>.tmp`, and other
         // tests of this suite publish reports from the shared temp root
-        // with the same pid and stem — scanning the shared root for
+        // with the same pid and stem - scanning the shared root for
         // leftovers could observe a CONCURRENT test's in-flight staging
         // file and fail spuriously (observed once in ~15 full-suite runs)
         let directory = std::env::temp_dir().join(format!(
@@ -1906,7 +1642,7 @@ mod tests {
     #[test]
     fn write_text_plain_output_stays_byte_identical_for_any_email_set() {
         // property (byte-identity compatibility gate): whatever the scan found,
-        // the legacy text file is exactly one email per line — the
+        // the legacy text file is exactly one email per line - the
         // correlation report changes nothing to the plain output
         let mut state = 0x1234_5678_u32;
         for _case in 0..8 {
@@ -1937,40 +1673,6 @@ mod tests {
     /// capped below the limit, deterministically and without collisions
     /// between distinct long names.
     #[test]
-    fn sanitize_file_name_caps_long_multibyte_names_below_the_filesystem_limit() {
-        let long = "日".repeat(110);
-        let name = sanitize_file_name(&long);
-        assert!(
-            name.len() <= 255,
-            "capped name must fit one filesystem component: {} bytes",
-            name.len()
-        );
-        // deterministic across runs, valid UTF-8 (cut on a char boundary)
-        assert_eq!(name, sanitize_file_name(&long));
-        // the cap announces itself (no silent truncation)
-        let (_, lines) = crate::test_logger::capture(|| {
-            let _ = sanitize_file_name(&long);
-        });
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("result file name capped")),
-            "the cap must be announced: {lines:?}"
-        );
-        // two distinct long names must not collapse into one result file
-        let other = "語".repeat(110);
-        assert_ne!(name, sanitize_file_name(&other));
-        // a long ASCII name is capped the same way
-        let ascii = "a".repeat(400);
-        assert!(sanitize_file_name(&ascii).len() <= 255);
-        // short names are untouched by the cap
-        assert_eq!(sanitize_file_name("hello"), "hello");
-    }
-
-    /// End-to-end pin of the live ENAMETOOLONG repro: a scan whose query
-    /// builds a 330-byte result file name must write its results instead of
-    /// failing the whole run after the scan completed.
-    #[test]
     fn write_text_survives_a_multibyte_name_exceeding_255_bytes() {
         in_temp_cwd(|| {
             let directory = format!("git2mail_output_test_cjk_{}", std::process::id());
@@ -1981,6 +1683,80 @@ mod tests {
             assert!(path.exists());
             let content = fs::read_to_string(&path).expect("result must be readable");
             assert_eq!(content, "a@b.c\n");
+        });
+    }
+
+    /// The plain-text deliverable always carries the `.log` extension, so a
+    /// double-click opens it natively (Windows Notepad). The extension is
+    /// appended AFTER sanitization: the reserved-device-name prefix, the
+    /// 200-byte stem cap and the anti-clobber hash stay on the stem, and the
+    /// whole path component stays far below the filesystem's 255-byte limit.
+    #[test]
+    fn write_text_always_appends_the_log_extension_after_sanitization() {
+        in_temp_cwd(|| {
+            let directory = format!("git2mail_output_test_log_{}", std::process::id());
+            let emails = vec!["a@b.c".to_string()];
+
+            // an unchanged name keeps its exact stem, plus the extension
+            let path = write_text(&directory, "octocat_Hello-World", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
+            assert_eq!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("octocat_Hello-World.log"),
+                "the extension must be the ONLY change to an unchanged name"
+            );
+
+            // a Windows reserved device name stays prefixed WITH the
+            // extension: `CON.log` would still be reserved, so the result
+            // must be `_CON.log`, never `CON.log`
+            let path = write_text(&directory, "CON", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("a UTF-8 result file name");
+            assert!(
+                name.starts_with("_CON-"),
+                "reserved stems keep their lossy-hash disambiguation: {name}"
+            );
+            assert!(
+                name.ends_with(".log"),
+                "the reserved name still carries the extension: {name}"
+            );
+
+            // a raw name already ending in `.log` is not stripped: the
+            // doubled extension is harmless and the printed path is
+            // authoritative
+            let path = write_text(&directory, "report.log", &emails)
+                .expect("text output must write")
+                .expect("the file must be written");
+            assert_eq!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("report.log.log"),
+                "an existing .log suffix is never stripped nor doubled into the stem"
+            );
+
+            // the capped multibyte stem carries the extension too, and the
+            // full component stays below the 255-byte filesystem limit:
+            // stem (<= 200) + hash suffix (17) + ".log" (4)
+            let path = write_text(&directory, &"日".repeat(110), &emails)
+                .expect("the 330-byte multibyte name must still write")
+                .expect("the file must be written");
+            let component = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("a UTF-8 result file name");
+            assert!(
+                component.len() <= 255,
+                "the full component must fit one filesystem entry: {} bytes",
+                component.len()
+            );
+            assert!(
+                component.ends_with(".log"),
+                "the capped name still carries the extension: {component}"
+            );
         });
     }
 

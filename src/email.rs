@@ -1,4 +1,4 @@
-//! Reverse email lookup (100% API — no new
+//! Reverse email lookup (100% API - no new
 //! dependency, hand-made errors, zero runtime panics).
 //!
 //! GitHub has no email search API, so the lookup is a **documented
@@ -9,7 +9,7 @@
 //!    with the tokens of the email local part (split on `.`, `_`, `-` and
 //!    `+`, e.g. `jane.dupont` → `jane dupont`), with the raw local part when
 //!    it differs (e.g. `janedupont`) and with the domain itself
-//!    (`acme.com`) — at most three queries. The repositories whose name,
+//!    (`acme.com`) - at most three queries. The repositories whose name,
 //!    description or topics mention these tokens become candidates, with
 //!    no local cap: every repository the search serves (bounded by GitHub's
 //!    1000-result search window per query) is a candidate.
@@ -29,7 +29,7 @@
 //!    confidence, never overstated).
 //!
 //! Anti-false-positive rules: GitHub noreply addresses are rejected upfront
-//! (they never carry a real mailbox — the `user` subcommand's noreply
+//! (they never carry a real mailbox - the `user` subcommand's noreply
 //! technique covers them), a malformed address is rejected client-side
 //! before any request, the email match is exact, and the `confidence`
 //! field states only what the API payload actually proved. An unmatched
@@ -44,7 +44,7 @@
 //! - the `repo-owner-weak` attribution is a heuristic: the repository owner
 //!   committed the matching email but the commit carries no GitHub author
 //!   object, so the login behind it is only presumed (and a repository
-//!   owner may be an organization rather than a user — resolve the account
+//!   owner may be an organization rather than a user - resolve the account
 //!   type before acting on a weak attribution);
 
 use crate::consts::GITHUB_API_BASE;
@@ -97,7 +97,7 @@ pub struct Account {
     pub id: Option<u64>,
     /// How the account was attributed: `commit-author` (the matching commit
     /// embedded this GitHub author object) or `repo-owner-weak` (the
-    /// repository owner, a heuristic candidate only — and a repository
+    /// repository owner, a heuristic candidate only - and a repository
     /// owner may be an organization rather than a user: resolve the
     /// account type before acting on a weak attribution).
     pub confidence: String,
@@ -159,7 +159,7 @@ pub struct BulkSummary {
 /// The bulk (`emails <file>`) reverse-lookup report: one result per
 /// processed address, in file order, plus the matched/unmatched/skipped
 /// summary (an address a stopped worker never reached is skipped, not
-/// unmatched — see [`BulkSummary::skipped`]).
+/// unmatched - see [`BulkSummary::skipped`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct BulkReport {
     /// The when/what of the report (generation timestamp, tool version).
@@ -170,7 +170,7 @@ pub struct BulkReport {
     /// [`BulkReport::skipped_addresses`], counted in
     /// [`BulkSummary::skipped`] and warned about in the log).
     pub results: Vec<EmailReport>,
-    /// The addresses a stopped worker never reached, in file order — the
+    /// The addresses a stopped worker never reached, in file order - the
     /// inventory behind [`BulkSummary::skipped`]: an operator re-running the
     /// interrupted lookups must not have to diff two files to find them.
     pub skipped_addresses: Vec<String>,
@@ -201,8 +201,8 @@ pub fn reverse(scanner: &Scanner, address: &str) -> Result<EmailReport, Error> {
 }
 
 /// Runs the bulk reverse lookup of the addresses of `path` (one address per
-/// line, `#` comments and blank lines ignored) over the token pool — the
-/// same worker-per-token parallelism as the parallel `search` — and logs the
+/// line, `#` comments and blank lines ignored) over the token pool - the
+/// same worker-per-token parallelism as the parallel `search` - and logs the
 /// terminal report.
 ///
 /// Noreply and malformed lines are skipped with a warning (they cannot be
@@ -218,8 +218,8 @@ pub fn reverse(scanner: &Scanner, address: &str) -> Result<EmailReport, Error> {
 /// draining the queue; the addresses it never reached are reported as
 /// skipped with a warning (counted in the summary's `skipped`, absent from
 /// `results`: never-processed work is never counted as unmatched). Any
-/// other worker failure — including the OS refusing to spawn a worker
-/// ([`Error::WorkerFailed`]) — aborts the bulk run.
+/// other worker failure - including the OS refusing to spawn a worker
+/// ([`Error::WorkerFailed`]) - aborts the bulk run.
 pub fn reverse_bulk(scanner: &Scanner, path: &Path) -> Result<BulkReport, Error> {
     // library convenience over [`reverse_bulk_with_partial`]: on an abort
     // the partial report is logged, then only the error propagates (the
@@ -248,7 +248,7 @@ pub fn reverse_bulk_with_partial(
     };
     // name the shape of the spend before it starts: three candidate
     // searches per address (each bounded by GitHub's 1000-result search
-    // window) and a full history walk per candidate repository — the only
+    // window) and a full history walk per candidate repository - the only
     // ceilings are GitHub's, so the honest cost statement is the shape,
     // not a fabricated number
     if !addresses.is_empty() {
@@ -304,7 +304,7 @@ fn reverse_at(client: &Client, base: &str, address: &str) -> Result<(EmailReport
         // stay available to the next query
         let seen = RefCell::new(seen_urls.clone());
         // raw listed items of this query, counted as the pages stream in:
-        // the sibling listings' honesty rule — when a query fails mid-walk,
+        // the sibling listings' honesty rule - when a query fails mid-walk,
         // the skip warning must say how many listed candidates it discarded
         let listed = Cell::new(0usize);
         // raw items of this query INCLUDING repeats, to detect the
@@ -354,7 +354,7 @@ fn reverse_at(client: &Client, base: &str, address: &str) -> Result<(EmailReport
             // a rejected or unavailable search query costs its candidates,
             // not the whole lookup: the next query may still run. The hits
             // its earlier pages already fetched cannot be recovered from the
-            // paginated loop, so they are discarded — but the warning must
+            // paginated loop, so they are discarded - but the warning must
             // say how many were thrown away (same honesty rule as the
             // sibling search/user listings)
             Err(Error::NotFound | Error::PrivateOrUnavailable) => {
@@ -428,7 +428,7 @@ fn reverse_at(client: &Client, base: &str, address: &str) -> Result<(EmailReport
             PER_PAGE,
         ) {
             Ok(commits) => commits,
-            // resource-scoped failure (deleted, private or empty candidate —
+            // resource-scoped failure (deleted, private or empty candidate -
             // GitHub answers 409 on /commits for a repository with no
             // commits): skip it and keep verifying the remaining candidates
             Err(err @ (Error::NotFound | Error::PrivateOrUnavailable | Error::EmptyRepository)) => {
@@ -499,7 +499,7 @@ fn reverse_at(client: &Client, base: &str, address: &str) -> Result<(EmailReport
     };
     Ok((
         EmailReport {
-            provenance: crate::output::Provenance::now(),
+            provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
             email: address.trim().to_string(),
             account,
             evidence,
@@ -573,7 +573,7 @@ fn candidate_queries(local: &str, domain: &str) -> Vec<String> {
 
 /// Whether a commit email matches the target: the local part ASCII
 /// case-insensitively, the domain matched exactly (full-string ASCII
-/// case-insensitive equality — no subdomain look-alike). Quoted emails are
+/// case-insensitive equality - no subdomain look-alike). Quoted emails are
 /// unwrapped first, like everywhere else in the crate.
 fn email_matches(candidate_email: &str, local: &str, domain: &str) -> bool {
     let candidate_email = candidate_email.trim_matches('"');
@@ -624,7 +624,7 @@ fn parse_candidate_commit_page(json: &Value) -> Result<(Vec<CommitEntry>, usize)
         .iter()
         .map(|item| {
             // the embedded author object: absent, null (deleted account) or
-            // a full GitHub user payload — `Value::get` on a null returns
+            // a full GitHub user payload - `Value::get` on a null returns
             // `None`
             let author = item.get("author");
             CommitEntry {
@@ -769,7 +769,7 @@ fn log_bulk_report(report: &BulkReport) {
 /// one address per line (100k addresses are a realistic OSINT input, a few
 /// megabytes at most). A FIFO (`--emails mypipe`) would block forever with
 /// no diagnostic and a character device like `/dev/zero` (valid UTF-8 NUL
-/// bytes) grows the read without bound until the process is killed —
+/// bytes) grows the read without bound until the process is killed -
 /// neither is ever an address list, so both fail fast like any other
 /// invalid input.
 const MAX_ADDRESSES_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -820,7 +820,7 @@ fn read_addresses(path: &Path) -> Result<Vec<String>, Error> {
     let mut addresses: Vec<String> = Vec::new();
     // the lookup is case-insensitive: the same address with a different
     // casing is one target, not two. The lowercased keys live in a set so
-    // the dedup stays linear — a linear scan over the accumulated addresses
+    // the dedup stays linear - a linear scan over the accumulated addresses
     // per line made large bulk lists (100k lines are a realistic OSINT
     // input) freeze the run in quadratic parsing before the first network
     // call.
@@ -852,7 +852,7 @@ fn read_addresses(path: &Path) -> Result<Vec<String>, Error> {
 
 /// Whether a per-email failure of a bulk worker is a token-scoped death
 /// (the worker's token died: spent quota, or the API rejected the token
-/// with nothing to rotate to) — the worker then stops and keeps its
+/// with nothing to rotate to) - the worker then stops and keeps its
 /// findings while the other tokens drain the queue. Per-repository and
 /// per-query resource-scoped failures are already handled inside
 /// [`reverse_at`], so anything else that escapes is a scan-wide condition
@@ -866,7 +866,7 @@ fn bulk_failure_is_token_death(err: &Error) -> bool {
 
 /// What one bulk worker reports back: the per-address results it produced
 /// (with their file indexes), how many successful requests its client made,
-/// and the failure that ended it (if any) — a worker keeps its partial
+/// and the failure that ended it (if any) - a worker keeps its partial
 /// findings even when it failed.
 struct BulkWorkerReport {
     results: Vec<(usize, EmailReport)>,
@@ -897,7 +897,7 @@ fn reverse_bulk_at(
     // exactly-one-report-per-worker collection live in the shared
     // [`crate::github::pool`] runner (the same seam as the parallel scan):
     // a token the pool already retired or parked must not own a worker slot
-    // while healthy tokens sit beyond the worker range — with fewer
+    // while healthy tokens sit beyond the worker range - with fewer
     // addresses than tokens, every spawned worker could otherwise own a
     // dead token and abort the whole bulk run without a single request.
     let reports: Vec<BulkWorkerReport> = crate::github::pool::run_token_worker_pool(
@@ -952,7 +952,7 @@ fn reverse_bulk_at(
         skipped: skipped_addresses.len(),
     };
     let report = BulkReport {
-        provenance: crate::output::Provenance::now(),
+        provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
         skipped_addresses,
         results,
         summary,
@@ -1097,7 +1097,7 @@ fn reduce_bulk_reports(
         Some(_) if only_token_deaths && any_progress => {
             if slots.iter().any(Option::is_none) {
                 log::warn!(
-                    "some addresses were not checked: one of the tokens ran out or was refused mid-run — rerun the command to cover the rest"
+                    "some addresses were not checked: one of the tokens ran out or was refused mid-run - rerun the command to cover the rest"
                 );
             }
             (slots, None)
@@ -1346,7 +1346,7 @@ mod tests {
         // the url crate normalizes `{base}/repos/../X/commits` into
         // `{base}/X/commits`: a hostile `html_url` carrying one would
         // silently re-target the authenticated request to another
-        // api.github.com path — the exact re-targeting the caller's
+        // api.github.com path - the exact re-targeting the caller's
         // documented invariant forbids (rejected at the parse boundary by
         // the parsers' dot-segment guard)
         for url in [
@@ -1456,7 +1456,7 @@ mod tests {
     fn read_addresses_rejects_a_non_regular_file() {
         // a directory is never an address list: it fails fast with the
         // same named-file error contract as any other read problem (a FIFO
-        // would block forever — not portably testable here, the metadata
+        // would block forever - not portably testable here, the metadata
         // guard covers it with the same check)
         let path = std::env::temp_dir();
         let error = read_addresses(&path).expect_err("a directory must be rejected");
@@ -1512,7 +1512,7 @@ mod tests {
         (
             index,
             EmailReport {
-                provenance: crate::output::Provenance::now(),
+                provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
                 email: "jane@acme.com".to_string(),
                 account: login.map(|login| Account {
                     login: login.to_string(),
@@ -1636,7 +1636,7 @@ mod tests {
         // the bulk twin of the parallel scan's positional worker→token
         // mapping bug: with fewer addresses than tokens, the only worker
         // slot must go to a live token, not to the token the pool already
-        // retired during the run — otherwise the whole bulk run aborts
+        // retired during the run - otherwise the whole bulk run aborts
         // without a single request while a healthy token sits unused
         let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
             if crate::github::mock::request_header(request, "Authorization") == Some("token ghp_a")
@@ -1723,7 +1723,7 @@ mod tests {
     #[test]
     fn email_report_serializes_the_documented_json_shape() {
         let report = EmailReport {
-            provenance: crate::output::Provenance::now(),
+            provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
             email: "jane@acme.com".to_string(),
             account: Some(Account {
                 login: "janedoe".to_string(),
@@ -1762,7 +1762,7 @@ mod tests {
 
         // the weak attribution carries a null id and never overstates
         let weak = EmailReport {
-            provenance: crate::output::Provenance::now(),
+            provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
             email: "jane@acme.com".to_string(),
             account: Some(Account {
                 login: "acme".to_string(),
@@ -1778,7 +1778,7 @@ mod tests {
 
         // unmatched: account and evidence are null
         let unmatched = EmailReport {
-            provenance: crate::output::Provenance::now(),
+            provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
             email: "jane@acme.com".to_string(),
             account: None,
             evidence: None,
@@ -1793,10 +1793,10 @@ mod tests {
     #[test]
     fn bulk_report_serializes_the_list_plus_summary_shape() {
         let report = BulkReport {
-            provenance: crate::output::Provenance::now(),
+            provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
             skipped_addresses: Vec::new(),
             results: vec![EmailReport {
-                provenance: crate::output::Provenance::now(),
+                provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
                 email: "jane@acme.com".to_string(),
                 account: None,
                 evidence: None,
@@ -1836,7 +1836,7 @@ mod tests {
         // at the sanitizer helper: a dropped `log_safe()` call must fail
         // this test (capturing logger, see `crate::test_logger`)
         let report = EmailReport {
-            provenance: crate::output::Provenance::now(),
+            provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
             email: "jane@acme.com".to_string(),
             account: Some(Account {
                 login: "ev\u{1b}[31mil\n".to_string(),
@@ -2045,7 +2045,7 @@ mod tests {
     fn a_404_deleted_candidate_repository_is_skipped_and_the_lookup_continues() {
         // mirror of the 409 test: a candidate whose /commits listing answers
         // 404 (a deleted repository, or a stale search-index entry) is
-        // resource-scoped too — it must be skipped with a warning and the
+        // resource-scoped too - it must be skipped with a warning and the
         // remaining candidates still verified, not abort the whole reverse
         // lookup with a raw HTTP error
         let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
@@ -2305,7 +2305,7 @@ mod tests {
         // listing without the empty page) plus 1 commits page with the match,
         // which is short too: its listing ends on the short page and the
         // trailing empty-page request is never spent (the page-size-aware
-        // walk — up to one wasted request per candidate is material against
+        // walk - up to one wasted request per candidate is material against
         // the anonymous hourly budget)
         assert_eq!(handled, 3);
     }
@@ -2314,7 +2314,7 @@ mod tests {
     fn a_candidate_query_that_fills_the_1000_result_window_warns_about_it() {
         // the documented search window: a query whose raw items fill it
         // (10 full pages of 100) stops on the window cut, not on a listing
-        // end — the warning must say candidates beyond it were never seen
+        // end - the warning must say candidates beyond it were never seen
         // instead of ending silently
         let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
             let line = request.first().map(String::as_str).unwrap_or("");
@@ -2530,7 +2530,7 @@ mod tests {
                 if line.contains("q=jane.dupont") {
                     // second query: the page leads with the two
                     // already-collected candidates, then 98 distinct new
-                    // ones: all 98 fresh candidates are kept — the page
+                    // ones: all 98 fresh candidates are kept - the page
                     // leads with duplicates but no cap throws anything away
                     let mut items: Vec<String> = vec![
                         r#"{"html_url": "https://github.com/acme/one"}"#.to_string(),
@@ -2654,7 +2654,7 @@ mod tests {
         // address's three queries (the folded name, the raw local part, the
         // domain): 30 distinct candidates on the first page (the rest are
         // its own repeats), then 70 distinct ones on the second (plus
-        // repeats): NO cap truncates anything — all 100 distinct candidates
+        // repeats): NO cap truncates anything - all 100 distinct candidates
         // are kept, and each query's walk continues to the short page that
         // ends the listing
         let (address, server) = crate::github::mock::serve_requests(move |_index, request| {
@@ -2731,7 +2731,7 @@ mod tests {
             // the other worker's thread is first scheduled (loopback
             // processing takes milliseconds, a thread start under a loaded
             // test runner can take tens or hundreds): every request of this
-            // test — searches included — is issued by a bulk worker's own
+            // test - searches included - is issued by a bulk worker's own
             // client, so parking every response except the very first gives
             // the fast worker a long hold on its address and leaves the
             // second worker time to claim the other one

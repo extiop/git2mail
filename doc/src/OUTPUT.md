@@ -40,29 +40,30 @@ scripting can tell "live but empty" apart from a real failure.
 
 | Scan | Path |
 |------|------|
-| Repository (`scan --url …/repo`) | `results/repository/<owner>[_<repo>]` |
-| Profile (`scan --url https://github.com/<user>`) | `results/profile/<user>` |
-| Search (`search --query …`) | `results/keyword/<query>[_<language>]` |
-| User investigation (`user <username>`) | `results/user/<username>` |
-| Organization investigation (`org <org>`) | `results/org/<org>` |
+| Repository (`scan --url …/repo`) | `results/repository/<owner>[_<repo>].log` |
+| Profile (`scan --url https://github.com/<user>`) | `results/profile/<user>.log` |
+| Search (`search --query …`) | `results/keyword/<query>[_<language>].log` |
+| User investigation (`user <username>`) | `results/user/<username>.log` |
+| Organization investigation (`org <org>`) | `results/org/<org>.log` |
+
+Every text result file carries the `.log` extension so a double-click opens
+it natively (Notepad, TextEdit, VS Code); the name before the extension is
+the sanitized target name (see "File names" below). Each `.log` file is a
+complete snapshot of its run, not an append-only log: a rerun replaces it
+atomically.
 
 ## Startup proxy check
 
 Before the first request, the run resolves the environment's proxy
-variables exactly the way the HTTP stack resolves them (scope precedence
-with the `ALL_PROXY` fallback, case-sensitive `socks` schemes, a
-set-but-empty variable shadowing its lowercase twin, full URI
-validation). What is actually used is announced in the log, and a
-set-but-unusable variable (a typo'd scheme, a stray character, an empty
-value) is named with a loud warning instead of the stack's silent
-fallback to a direct connection: a privacy-sensitive run must never
-believe it is behind Tor while leaving from the real IP. A set
-`REQUEST_METHOD` (the stack's CGI marker, which discards every proxy
-variable, warned when any proxy variable is set) and a set `NO_PROXY`
-(which can bypass the proxy for some hosts, warned when a proxy is in
-use) are warned about too. Proxy variable values are never logged
-(a proxy URL can carry embedded credentials); only names and schemes
-are.
+variables with the same precedence rules as the HTTP stack, mirrored
+conservatively: a value the check cannot vouch for is warned about
+rather than trusted. What is actually
+used is announced in the log, and a set-but-unusable variable is named
+with a loud warning instead of the stack's silent fallback to a direct
+connection; proxy variable values are never logged (a proxy URL can
+carry embedded credentials), only names and schemes are. The full
+semantics (variables, schemes, Tor, caveats) live in
+[Network egress](API.md#network-egress-proxies-and-tor).
 
 ## Text format (default)
 
@@ -96,7 +97,7 @@ write to a timestamped file name and swap the symlink yourself.
   "per_repository": { "owner/repo": ["email@example.com"] },
   "scanned": { "repos": 12, "pages": 30, "partial": false },
   "generated_at": "2026-02-14T18:22:33Z",
-  "tool_version": "0.7.0",
+  "tool_version": "0.8.0",
   "correlation": {
     "authors": [
       {
@@ -117,7 +118,8 @@ write to a timestamped file name and swap the symlink yourself.
 ```
 
 `request` appears only on a `search` report (the query provenance: the
-qualifiers that were not provided are omitted, not `null`);
+qualifiers that were not provided are omitted, not `null`).
+
 Forked repositories are skipped on the `user`, `org` and `search` subcommands (a warning names the
 `--include-forks` opt-in when the skip fires). The reverse-email candidate search keeps forks: it
 wants any repository carrying the address, including forks of the subject's own work.
@@ -137,7 +139,7 @@ multi-token scan this follows worker completion order and may vary between
 runs), and the total number of hits. `last_commit_date` is the most
 recent commit author date seen for the author (the raw ISO 8601 UTC stamp
 of the API payload): a freshness indicator for the exposure (self-declared,
-forgeable commit metadata, exactly like the author name — never a proof).
+forgeable commit metadata, exactly like the author name - never a proof).
 `scan`, `search` and `org` can also
 export this same per-author report as a CSV spreadsheet with `--csv
 <path>` (one row per author: `author_name, emails, repositories,
@@ -159,13 +161,13 @@ own warnings and do not set the flag.
 
 The investigation subcommands write a JSON report to the path given by
 `--json` (`org` and `user` also write the same one-email-per-line text file
-as the scan subcommands, at `results/org/<org>` and
-`results/user/<username>`):
+as the scan subcommands, at `results/org/<org>.log` and
+`results/user/<username>.log`):
 
 - `user`: identity history, external contributions, generated email
   variants and the addresses they matched, potential secondary accounts,
   public SSH keys (full example blocks with every field in
-  [the README's investigation section](https://github.com/extiop/git2mail#full-profile-investigation-api-only));
+  [the user investigation guide](USER.md));
 - `org`: the report also carries a `correlation` object with the
   same per-author shape as the scan reports (person, emails, repositories
   and commit counts): the remediation view attributing an exposure to a
@@ -179,7 +181,7 @@ as the scan subcommands, at `results/org/<org>` and
   surfaces the candidate repositories, each verified over its full
   default-branch history, until a `commit-author` match ends the lookup
   early); `org` additionally writes a
-  text file `results/org/<org>` with one found email per line,
+  text file `results/org/<org>.log` with one found email per line,
   ready to paste into a spreadsheet or outreach tool. An `emails` (bulk)
   report carries `skipped_addresses` (an empty list on a clean run): on an
   interrupted run it is the file-order list of the addresses a stopped
@@ -187,7 +189,78 @@ as the scan subcommands, at `results/org/<org>` and
   length), so re-running the interrupted lookups needs no diff of two
   files. Every report carries `generated_at` and `tool_version`. The bulk
   run has no CSV deliverable (its report carries no per-author
-  correlation): the `--json` report is its file output.
+  correlation): the `--json` report is its file output. On the other
+  subcommands (`user`, `email`, `emails`) `--csv` is accepted, warned
+  about, and ignored.
+
+## Developer correlation
+
+Every scan also aggregates its results per author: for each author found
+in the scanned commits, it correlates the attributes git2mail already
+collects: the emails they used, the repositories they were seen in with
+their primary language, the first repository where they appeared and
+their total commit count. Authors are sorted by commit count and each
+author's languages are ordered dominant first, so the report answers
+"who are the main developers behind this topic, and what do they write
+in?". With a parallel multi-token scan, the repository order (and the
+"first seen" field) follows worker completion and may vary between runs;
+the email sets and counts do not.
+
+For a copy-paste list of addresses, use the plain-text `results/` file
+(one email per line, ready for a spreadsheet); the names, languages and
+per-repository counts live in the JSON report, or as a `--csv`
+spreadsheet (one row per developer: name, emails, repositories,
+dominant language, commit count).
+
+The report lives in the opt-in `--json` output, as a `correlation` object
+added on top of the unchanged legacy fields (the plain-text result files
+stay byte-identical):
+
+```bash
+git2mail search --query nmap --language rust --token-file tokens.json --json report.json
+```
+
+```json
+{
+  "target": "nmap",
+  "mode": "search",
+  "emails": ["alice@example.com"],
+  "scanned": { "repos": 2, "pages": 3, "partial": false },
+  "correlation": {
+    "authors": [
+      {
+        "author": "Alice",
+        "emails": ["alice@example.com"],
+        "repos": [
+          { "name": "a/one", "language": "Rust" },
+          { "name": "b/two", "language": "Go" }
+        ],
+        "languages": ["Rust", "Go"],
+        "first_seen_repo": "a/one",
+        "total_hits": 3,
+        "last_commit_date": "2024-06-01T12:00:00Z"
+      }
+    ]
+  }
+}
+```
+
+`scanned.partial` is `true` when the parallel scan kept its findings
+although a dedicated token died mid-scan (whole listed repositories may
+then have been left unscanned): the JSON report keeps `partial: true`
+even when the run itself exits 0.
+
+The primary language comes free with the repository-search metadata, so
+`search` runs attribute a language to every repository that has a
+detected primary language (GitHub reports `language: null` when it has
+none, and the report passes it through, like `scan` (repository/profile)
+runs which do not spend an extra API call on it). The same author seen
+in several repositories (across pages, workers or scan stages) is
+merged: emails deduplicated, hit counts summed. The terminal log also
+prints a short summary of the top 5 authors (by commit count) with their
+dominant language; the full author list lives in the JSON report's
+`correlation.authors`, and the plain-text result files keep the legacy
+one-email-per-line format, byte-identical.
 
 ## File permissions
 
@@ -210,7 +283,7 @@ Scan targets become file names after sanitization:
   still refreshes its own file by design). An unchanged name keeps its
   exact file name, whatever its case; on a case-insensitive filesystem
   (macOS APFS, Windows NTFS) two targets differing only by case share one
-  file name — the exact target is visible in every report line and in the
+  file name - the exact target is visible in every report line and in the
   JSON report;
 - a name longer than 200 bytes is cut on a character boundary and carries
   the same hash (taken over the full raw name, so two distinct long queries sharing a prefix stay distinct), and the write can no longer fail after

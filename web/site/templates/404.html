@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{% block title %}Page not found - git2mail{% endblock title %}
+{% block description %}The anonymous web scan of the git2mail command-line tool.{% endblock description %}
+
+{% block content %}
+<section class="card-surface">
+  <h1>Page not found</h1>
+  <ul>
+    <li>Looking for the anonymous scan?
+        <a href="{{ config.base_url }}">Start here</a>.</li>
+    <li>Looking for the documentation?
+        <a href="{{ config.base_url }}guide/">Open the command-line tool's documentation</a>.</li>
+  </ul>
+</section>
+{% endblock content %}

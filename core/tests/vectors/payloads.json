@@ -1,0 +1,104 @@
+[
+  {
+    "name": "normal page",
+    "input": [
+      {
+        "commit": {
+          "author": {
+            "name": "Jane Doe",
+            "email": "jane@example.com",
+            "date": "2024-06-01T12:00:00Z"
+          },
+          "committer": {
+            "name": "Jane Doe",
+            "email": "jane@example.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Old Alias",
+            "email": "42+oldname@users.noreply.github.com",
+            "date": "2019-01-02T03:04:05Z"
+          },
+          "committer": {
+            "name": "Old Alias",
+            "email": "old@example.com"
+          }
+        }
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Spoofed\nNewline",
+            "email": "evil@x.com\n evil@x.com"
+          },
+          "committer": {
+            "name": "S",
+            "email": "s@example.com"
+          }
+        }
+      }
+    ],
+    "raw_count": 3,
+    "expect": [
+      {
+        "email": "jane@example.com",
+        "name": "Jane Doe",
+        "date": "2024-06-01T12:00:00Z"
+      }
+    ],
+    "note": "the noreply author is dropped by the usable-email rule, the newline-carrying email is dropped (line injection)"
+  },
+  {
+    "name": "authorless commits",
+    "input": [
+      {
+        "commit": {
+          "committer": {
+            "name": "Only Committer",
+            "email": "c@example.com"
+          }
+        }
+      },
+      {
+        "sha": "abc123",
+        "no": "commit object"
+      }
+    ],
+    "raw_count": 2,
+    "expect": [],
+    "note": "the scan paths read the AUTHOR email only: a committer-only commit contributes nothing, and a commit-less entry is counted raw but carries no identity"
+  },
+  {
+    "name": "quoted email and missing fields",
+    "input": [
+      {
+        "commit": {
+          "author": {
+            "email": "\"dev@example.com\""
+          }
+        }
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "No Email",
+            "email": "",
+            "date": "2024-01-01T00:00:00Z"
+          }
+        }
+      }
+    ],
+    "raw_count": 2,
+    "expect": [
+      {
+        "email": "dev@example.com",
+        "name": null,
+        "date": null
+      }
+    ],
+    "note": "the git-permitted quoting is trimmed like the CLI reports it; a nameless, dateless author still yields the null-shape result, and an empty email is dropped by the usable rule"
+  }
+]

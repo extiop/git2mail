@@ -10,15 +10,15 @@ use std::thread::ThreadId;
 
 /// Log lines grouped by the thread that emitted them. Grouping is what
 /// makes parallel captures possible: `cargo test` runs test modules in
-/// parallel, and a capture must only see its own test's lines — including
-/// the lines its spawned scan workers emitted — never a sibling test's.
+/// parallel, and a capture must only see its own test's lines - including
+/// the lines its spawned scan workers emitted - never a sibling test's.
 static RECORDS: std::sync::LazyLock<Mutex<HashMap<ThreadId, Vec<String>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Serializes whole captures: the logger is process-wide, and `cargo test`
 /// runs test modules in parallel, so concurrent captures would read each
 /// other's lines (or wipe them mid-run). The lock is held across the whole
-/// capture — it cannot be [`RECORDS`] itself, which the logger locks inside
+/// capture - it cannot be [`RECORDS`] itself, which the logger locks inside
 /// `f` (holding it here would deadlock).
 static CAPTURE_SERIALIZATION: Mutex<()> = Mutex::new(());
 
@@ -51,10 +51,10 @@ impl log::Log for Capture {
 /// returns its result together with the log lines it emitted: the calling
 /// thread's lines plus the lines of threads that first logged during this
 /// capture (the scan workers `f` spawned). Threads that had already logged
-/// before the capture started — a sibling test's threads running in
-/// parallel — are excluded, so a sibling's "capped at the…" warning can
+/// before the capture started - a sibling test's threads running in
+/// parallel - are excluded, so a sibling's "capped at the…" warning can
 /// never leak into this capture's assertions.
-pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+pub fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
     INSTALL.call_once(|| {
         // one logger per process: installed once, before any capture
         let _ = log::set_boxed_logger(Box::new(Capture));
@@ -100,7 +100,7 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
 ///
 /// Test-only, but compiled with the crate: callers are `#[cfg(test)]`
 /// modules of the lib and the bin.
-pub(crate) fn in_temp_cwd<T>(f: impl FnOnce() -> T) -> T {
+pub fn in_temp_cwd<T>(f: impl FnOnce() -> T) -> T {
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
     static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();

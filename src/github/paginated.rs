@@ -61,7 +61,7 @@ where
 /// - a page holding fewer raw items than `per_page` is the last page of the
 ///   listing (a total that is not a multiple of the page size used to keep
 ///   the walk alive up to the out-of-window request);
-/// - the user `limit` counts **raw** listed items, not parsed ones — a
+/// - the user `limit` counts **raw** listed items, not parsed ones - a
 ///   parser that drops listed items must not keep the walk alive past the
 ///   window either (the kept items are still truncated to `limit`).
 ///
@@ -137,7 +137,7 @@ where
         // would only risk the search API's out-of-window 422. (GitHub's
         // search index can shift items between pages between requests, so a
         // transiently short middle page ends the listing early and a few
-        // trailing results can be missed under index churn — an accepted
+        // trailing results can be missed under index churn - an accepted
         // tradeoff: the condition preserves the hits already collected over
         // a lossy out-of-window walk, and the default small limits make it
         // immaterial.)
@@ -476,8 +476,8 @@ mod tests {
     fn fetch_paginated_maps_a_409_on_a_commits_listing_to_empty_repository() {
         // GitHub answers 409 Conflict on a `/commits` listing when the
         // repository has no commits ("Git Repository is empty"): it must
-        // surface as the dedicated EmptyRepository error — the resource-
-        // scoped skip condition of every scan — not as a raw HTTP failure
+        // surface as the dedicated EmptyRepository error - the resource-
+        // scoped skip condition of every scan - not as a raw HTTP failure
         let (address, server) =
             serve_requests(move |_index, _request| (409, vec![], String::new()));
 
@@ -921,7 +921,7 @@ mod tests {
         // GitHub's primary-limit body ("API rate limit exceeded…") can reach
         // the client without its `X-RateLimit-Remaining` header (stripped by
         // a middlebox or a proxy) and without `Retry-After`: the response is
-        // still a rate limit, not a permanent refusal — misclassifying it as
+        // still a rate limit, not a permanent refusal - misclassifying it as
         // one would make a fully rate-limited scan skip every repository as
         // a resource-scoped failure and exit 0 with an empty report
         let (address, server) = serve_requests(move |_index, request| {
@@ -963,7 +963,7 @@ mod tests {
     #[test]
     fn an_anonymous_request_sends_no_authorization_header() {
         // the Authorization header is injected only when the token
-        // is non-empty — an anonymous client must not leak an empty
+        // is non-empty - an anonymous client must not leak an empty
         // `Authorization: token ` header (GitHub would 401 it, the mock
         // would not, so it is pinned explicitly here), and the centralized
         // User-Agent/Accept headers must be present
@@ -997,7 +997,7 @@ mod tests {
     fn a_secondary_limit_with_no_other_live_token_ends_the_fetch_immediately() {
         // single token: a 429 with a pending Retry-After window has nothing
         // to rotate to, so the fetch must end with RateLimitExhausted after
-        // exactly one request — no doomed retry, no sleep
+        // exactly one request - no doomed retry, no sleep
         let (address, server) = serve_requests(move |_index, _request| {
             (
                 429,
@@ -1036,7 +1036,7 @@ mod tests {
         .expect_err("a malformed body must fail");
 
         // reqwest decodes the JSON body itself, so the failure surfaces as an
-        // HTTP decode error (Error::Http with is_decode), not Error::Json —
+        // HTTP decode error (Error::Http with is_decode), not Error::Json -
         // the page must not be silently swallowed either way
         assert!(
             matches!(
@@ -1106,7 +1106,7 @@ mod tests {
         // quota's) and a `Retry-After` window that resets within seconds,
         // while the token's hourly core quota is untouched. Such a response
         // must park the token (transient), never retire it for the rest of
-        // the process — a retirement would kill single-token runs and burn
+        // the process - a retirement would kill single-token runs and burn
         // multi-token pools one token per hot search minute.
         let (address, server) = serve_requests(move |index, request| {
             if index == 0 {
@@ -1150,7 +1150,7 @@ mod tests {
         // quota is untouched, the window resets within seconds), so the
         // token is only parked. A sole parked token has nothing to rotate
         // to and sleeping would only delay the failure, so the fetch still
-        // ends promptly with `RateLimitExhausted` — but the token itself
+        // ends promptly with `RateLimitExhausted` - but the token itself
         // must survive the blip instead of being retired for the process.
         let (address, server) = serve_requests(move |_index, _request| {
             (

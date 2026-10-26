@@ -1,7 +1,7 @@
 //! Per-author attribute correlation: aggregates
 //! the scan results per author with the attributes git2mail already
-//! collects — the repositories scanned, their primary language (when the
-//! search API metadata reports it) and the commit counts — into a
+//! collects: the repositories scanned, their primary language (when the
+//! search API metadata reports it) and the commit counts, into a
 //! per-author correlation report.
 //!
 //! The report is exposed in the opt-in `--json` output (the `correlation`
@@ -33,7 +33,7 @@ pub struct CommitAuthor {
     /// The most recent commit author date seen for this pair (the raw
     /// `commit.author.date` string of the API payload, GitHub's ISO 8601
     /// UTC stamp). Self-declared, forgeable commit metadata exactly like
-    /// the name itself, reported for data-freshness assessment only — the
+    /// the name itself, reported for data-freshness assessment only; the
     /// report must let a DPO judge how old an exposure is without re-scanning.
     /// `None` when no page carried a date. Merged across pages and
     /// repositories by lexicographic max (chronological on ISO 8601 UTC;
@@ -106,7 +106,7 @@ impl Correlation {
         }
         // one line per author, not one joined line: a single ";"-joined
         // line is unscannable once the terminal wraps it, and hostile to
-        // screen readers — each author gets its own `[+] Top author N:`
+        // screen readers; each author gets its own `[+] Top author N:`
         // line, so the reader navigates entry by entry
         for (index, entry) in self.summary_entries().iter().enumerate() {
             info!("[+] Top author {}: {}", index + 1, entry);
@@ -194,7 +194,7 @@ pub struct AuthorReport {
 struct AuthorAggregate {
     emails: Vec<String>,
     /// Exact-match membership set mirroring `emails`: the per-author email
-    /// dedup must stay O(1) — the reduce is single-threaded and the email
+    /// dedup must stay O(1) (the reduce is single-threaded and the email
     /// list is unbounded across repositories (commit metadata is fully
     /// attacker-controlled), so the previous linear `Vec::any` scan made a
     /// hostile multi-repository scan quadratic in the analyst's CPU
@@ -237,7 +237,7 @@ impl CorrelationBuilder {
 
     /// Merges one repository's contribution into the aggregates: the same
     /// author seen in several repositories (across pages, workers or scan
-    /// stages) is merged — emails deduplicated, repositories deduplicated
+    /// stages) is merged: emails deduplicated, repositories deduplicated
     /// and hit counts summed.
     pub fn add_repo(&mut self, contribution: RepoContribution) {
         for author in contribution.authors {

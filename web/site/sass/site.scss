@@ -1,0 +1,455 @@
+// ============================================================
+// git2mail site styles. Hand-written design system: no web font,
+// no third-party asset - the visitor's investigation reaches no
+// origin but api.github.com. Layout ids/classes are load-bearing
+// (scan.js and the E2E suite pin them): change together or not at
+// all.
+// ============================================================
+
+// 1. Design tokens
+// ------------------------------------------------------------
+:root {
+  --brand-blue: #004aad;
+  --brand-blue-dark: #062e63;
+  --brand-orange: #ac5709;
+  --brand-orange-hover: #8f4606;
+  --background: #f6f8fc;
+  --surface: #ffffff;
+  --text: #1c2434;
+  --text-muted: #5f6b7a;
+  --border: #dde3ec;
+  --focus: #9a5b00;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-pill: 50rem;
+  --box-shadow: 0 18px 45px rgba(17, 36, 72, 0.08);
+  --box-shadow-soft: 0 14px 34px rgba(17, 36, 72, 0.06);
+  --header-h: 4.75rem;
+}
+
+// 2. Base
+// ------------------------------------------------------------
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding-top: var(--header-h);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 1rem;
+  line-height: 1.7;
+  color: var(--text);
+  background-color: var(--background);
+}
+
+::selection {
+  color: #fff;
+  background: var(--brand-blue);
+  text-shadow: none;
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+p {
+  margin: 1rem 0;
+  line-height: 1.8;
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+  margin-top: 0;
+  margin-bottom: 0.9rem;
+}
+
+a {
+  color: var(--brand-blue);
+  text-decoration: none;
+
+  &:hover {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+}
+
+.skip-link {
+  position: absolute;
+  top: -3.5rem;
+  left: 1rem;
+  z-index: 9999;
+  padding: 0.75rem 1rem;
+  background: var(--brand-blue);
+  color: #fff;
+  font-weight: 700;
+  border-radius: var(--radius-sm);
+  text-decoration: none;
+  transition: top 0.25s ease, opacity 0.25s ease;
+
+  &:focus,
+  &:hover {
+    top: 1rem;
+    opacity: 1;
+    color: #fff;
+    text-decoration: none;
+  }
+}
+
+main {
+  width: min(46rem, 100% - 2rem);
+  margin: 0 auto;
+  flex: 1;
+}
+
+// 3. Header: translucent, blurred, quietly fixed
+// ------------------------------------------------------------
+header {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1030;
+  height: var(--header-h);
+  background-color: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid rgba(0, 74, 173, 0.1);
+  box-shadow: 0 10px 30px rgba(17, 36, 72, 0.06);
+}
+
+header nav {
+  max-width: 46rem;
+  height: 100%;
+  margin: 0 auto;
+  padding: 0 1rem;
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+}
+
+header nav a {
+  color: var(--brand-blue);
+  font-weight: 500;
+
+  &:hover {
+    color: var(--brand-blue-dark);
+    text-decoration: none;
+  }
+}
+
+// 4. Hero
+// ------------------------------------------------------------
+.hero {
+  padding: 3rem 0 2rem;
+}
+
+.hero h1 {
+  font-size: clamp(2rem, 5vw, 3.1rem);
+}
+
+.hero-sub {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 1.12rem;
+  line-height: 1.8;
+  max-width: 40rem;
+}
+
+// 5. Cards: white surface, discreet shadow
+// ------------------------------------------------------------
+.card-surface {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--box-shadow);
+  padding: clamp(1.5rem, 2.5vw, 2.25rem);
+  margin-bottom: 1.6rem;
+}
+
+// 6. The scan form: the URL must be readable while typing
+// ------------------------------------------------------------
+.scan-box {
+  padding: 1.6rem clamp(1.25rem, 3vw, 2.25rem);
+}
+
+#scan-form {
+  display: flex;
+  gap: 0.75rem;
+  align-items: stretch;
+}
+
+#scan-form label {
+  @extend .visually-hidden;
+}
+
+#target-url {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 1.12rem;
+  padding: 0.85rem 1.1rem;
+  color: var(--text);
+  background: var(--surface);
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+
+  &::placeholder {
+    color: var(--text-muted);
+  }
+
+  &:focus-visible {
+    outline: none;
+    border-color: var(--brand-blue);
+    // a solid, high-contrast ring: the faint wash this replaced sat far
+    // below the 3:1 non-text contrast bar on the page's main control
+    box-shadow: 0 0 0 3px rgba(0, 74, 173, 0.55);
+  }
+}
+
+#scan-form button {
+  font: inherit;
+  font-weight: 600;
+  font-size: 1rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #fff;
+  background-color: var(--brand-orange);
+  border: none;
+  border-radius: 10px;
+  padding: 0.85rem 1.7rem;
+  min-height: 48px;
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.1);
+  transition: background-color 0.2s ease, transform 0.2s ease,
+    box-shadow 0.2s ease;
+  touch-action: manipulation;
+
+  &:hover {
+    background-color: var(--brand-orange-hover);
+    transform: translateY(-1px);
+    box-shadow: 0 18px 38px rgba(0, 0, 0, 0.14);
+  }
+
+  &:active {
+    transform: translateY(0);
+  }
+
+  // a disabled Scan button must look dead, not merely ignore clicks: on
+  // the prefill-click path the wasm warm-up never ran, so the button
+  // waits on a 420 KiB fetch that the visitor cannot see
+  &:disabled {
+    background-color: var(--text-muted);
+    cursor: not-allowed;
+    box-shadow: none;
+    transform: none;
+  }
+}
+
+.scan-note {
+  color: var(--text-muted);
+  font-size: 0.95rem;
+}
+
+// the one-click examples: pill links, obviously tappable
+.scan-note a {
+  display: inline-block;
+  margin: 0.2rem 0.1rem;
+  padding: 0.28rem 0.9rem;
+  border: 1px solid var(--brand-blue);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  color: var(--brand-blue);
+  font-weight: 500;
+  transition: background-color 0.2s ease, color 0.2s ease,
+    transform 0.2s ease;
+
+  &:hover {
+    background: var(--brand-blue);
+    color: #fff;
+    text-decoration: none;
+    transform: translateY(-1px);
+  }
+}
+
+// 7. Warnings and the quota line
+// ------------------------------------------------------------
+.warning {
+  border-left: 4px solid var(--brand-orange);
+  background: #fdf6ec;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  padding: 0.7rem 1rem;
+  color: var(--text);
+  font-size: 0.97rem;
+}
+
+#attribution-warning {
+  border-left-color: var(--brand-blue);
+  background: rgba(0, 74, 173, 0.05);
+}
+
+.quota {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  font-size: 0.95rem;
+  min-height: 1.4em;
+  margin: 0.7rem 0 0;
+}
+
+.status-line {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}
+
+// 8. Author cards and chips
+// ------------------------------------------------------------
+.author-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--box-shadow-soft);
+  padding: 1.2rem 1.4rem;
+  margin-bottom: 1.1rem;
+  break-inside: avoid;
+}
+
+.author-head {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  margin-bottom: 0.6rem;
+}
+
+.monogram {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: 50%;
+  background: var(--brand-blue);
+  color: #fff;
+  font-weight: 600;
+  flex: none;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.chip {
+  display: inline-block;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 0.14rem 0.75rem;
+  font-size: 0.87rem;
+  color: var(--text-muted);
+  background: #f1f4f9;
+}
+
+// 9. Actions and the funnel
+// ------------------------------------------------------------
+.actions button {
+  font: inherit;
+  font-weight: 500;
+  padding: 0.6rem 1.2rem;
+  margin-right: 0.5rem;
+  border: 1px solid var(--brand-blue);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--brand-blue);
+  cursor: pointer;
+  transition: background-color 0.2s ease, color 0.2s ease,
+    transform 0.2s ease;
+
+  &:hover {
+    background: var(--brand-blue);
+    color: #fff;
+    transform: translateY(-1px);
+  }
+}
+
+.funnel-command {
+  display: block;
+  padding: 0.6rem 0.9rem;
+  margin: 0 0 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #f1f4f9;
+  font-family: ui-monospace, "Cascadia Mono", monospace;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+// 10. Trust, footer
+// ------------------------------------------------------------
+.trust {
+  h2 {
+    font-size: 1.15rem;
+    margin-top: 0;
+  }
+
+  ul {
+    margin: 0;
+    padding-left: 1.25rem;
+  }
+
+  li {
+    margin-bottom: 0.55rem;
+  }
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+footer {
+  margin-top: 3rem;
+  padding: 1.4rem 1rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.92rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+// the one-line role above each funnel command: documentation sites
+// introduce a code block with prose, and the reader must know what a
+// command does BEFORE the boxed command invites the copy
+.funnel-role {
+  display: block;
+  margin: 0.45rem 0 0.2rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}

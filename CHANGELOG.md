@@ -5,6 +5,80 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-10-26
+
+A documentation release, one breaking output change, and a new anonymous
+web scan: the README becomes a short landing page and the user guide
+(the mdBook) grows to one page per subject, so every deep topic has
+exactly one home; and the repository's API is now reachable without a
+terminal at all - a static web interface runs the repository scan from
+the browser, anonymously, under GitHub's own anonymous quota.
+
+### Added
+
+- an anonymous web scan, shipped as a static GitHub Pages site - no
+  backend, no account, nothing stored: paste a repository or profile
+  URL at <https://extiop.github.io/git2mail/> and the page walks the
+  target's commit history through GitHub's REST API from your own IP,
+  under GitHub's anonymous ~60-requests-per-hour quota (shown live). The rules are the CLI's: the same usable-email rule,
+  the same quoted-email trimming, the same noreply discipline, compiled
+  to WebAssembly from the shared `git2mail-core` crate (parity pinned
+  by shared test vectors replayed on both sides). A quota death
+  mid-walk yields an honestly labeled PARTIAL page, and the
+  results page names what a finding proves and what it does not (old
+  or faked metadata, squash-merged invisibility) before funneling to
+  the exact CLI commands for the full-power modes. The result
+  downloads as the same one-email-per-line `.log` snapshot the CLI
+  writes (the `#`-prefixed provenance header is the web page's own
+  addition - the CLI documents its run elsewhere). The page ships its
+  own guards: a strict
+  Content-Security-Policy with no third-party origin beyond
+  GitHub's API (the only external destination the scan talks to),
+  zero storage APIs (no localStorage, no cookies), and no auto-run
+  from URL parameters;
+- `git2mail-core`: the pure, dependency-clean core crate the CLI and
+  the web bindings both consume (parsers, sanitization, rules,
+  correlation, variant engine - no HTTP stack unless the opt-in `http`
+  feature is enabled);
+- the `user` investigation's repositories walk applies the org scan's
+  URL-corruption contract: a listing entry whose name carries a dot
+  segment, a stray separator or a query fragment is skipped with a
+  warning instead of being scanned
+- the E2E harness for the web page: twenty-three headless-browser scenarios
+  over a loopback mock of the GitHub API (dev-only tooling, never
+  shipped).
+
+### Changed
+
+- **BREAKING:** every plain-text result file now carries a `.log`
+  extension, so it opens natively in the default text editor (Windows
+  Notepad included): `results/repository/<owner>[_<repo>].log`,
+  `results/profile/<user>.log`, `results/keyword/<query>[_<language>].log`,
+  `results/user/<login>.log` and `results/org/<org>.log` replace the
+  extensionless names. The extension is appended after sanitization, so
+  the reserved-device-name prefix (`_CON.log`, never `CON.log`), the
+  200-byte stem cap and the anti-clobber hash are unchanged, and an
+  unchanged target keeps its exact name plus the extension
+  (`octocat_Hello-World` becomes exactly `octocat_Hello-World.log`).
+  Old extensionless files are not migrated: new runs write `<name>.log`
+  and the stale file stays behind - the path the run prints is
+  authoritative. The file remains a complete snapshot of the run, not an
+  append-only log. `--json` and `--csv` paths stay exactly as you name
+  them, and the exit codes (0/1/2/3) and the `[!]` stderr marker are
+  unchanged: pipelines keying on them are unaffected.
+- The README shrinks to a short landing (pitch, subcommand table,
+  quickstart, one measured performance number, condensed examples) and
+  the user guide grows from three pages to one page per subject:
+  Scanning (scan & search), User investigation, Organization
+  investigation, Reverse email lookup, Reports & files on disk, Data
+  quality, prevention & limitations, GitHub API usage - the latter with
+  a new "Network egress: proxies and Tor" section (verified against the
+  bundled HTTP stack: socks proxy schemes matched case-sensitively
+  while `http`/`https` are accepted case-insensitively, `socks5h`
+  resolves hostnames proxy-side, anonymous runs through Tor share the
+  exit's 60-requests-per-hour quota, and the startup check proves the
+  proxy at launch, not the whole run's path).
+
 ## [0.7.0] - 2026-10-26
 
 git2mail grows from 2 to 6 subcommands: the tool now investigates whole
@@ -63,7 +137,7 @@ GitHub's own).
 ### Fixed
 
 - The noreply filter matches the exact `users.noreply.github.com` domain instead of any address containing the substring `noreply`, which wrongly excluded legitimate third-party addresses (a data-quality regression: old releases silently discarded real, reachable addresses)
-- A missing token or addresses file now reads `cannot read the file "tokens.json": … — check the path …` instead of a bare `I/O error: … (os error 2)`, and an intercepted or captive-portal connection gets its own "could not read GitHub's response" guidance instead of "check your internet connection"
+- A missing token or addresses file now reads `cannot read the file "tokens.json": … - check the path …` instead of a bare `I/O error: … (os error 2)`, and an intercepted or captive-portal connection gets its own "could not read GitHub's response" guidance instead of "check your internet connection"
 - Tokens pasted with a leading or trailing space no longer fail every request with a misleading "rejected token" error: paste artifacts are trimmed at load time
 
 ## [0.6.0] - 2026-10-25

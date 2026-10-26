@@ -90,7 +90,7 @@ fn serve_connection(
             // the auto Content-Length reflects the body
             // actually written, except when a test explicitly
             // overrides it (e.g. a huge announced length to
-            // exercise the client's body-size cap — the
+            // exercise the client's body-size cap - the
             // mismatching body is never read then)
             let declares_length = headers
                 .iter()
@@ -236,7 +236,7 @@ pub(crate) fn request_header<'a>(request_lines: &'a [String], name: &str) -> Opt
 
 /// Extracts the `page=` query parameter of a mock request's request line
 /// (0 when absent or unparsable). The query is split on `&` parameters, so
-/// `per_page=100&page=2` yields `2` — splitting on the `page=` substring
+/// `per_page=100&page=2` yields `2` - splitting on the `page=` substring
 /// would grab the `per_page` value instead.
 pub(crate) fn request_line_page(request_lines: &[String]) -> u16 {
     request_lines

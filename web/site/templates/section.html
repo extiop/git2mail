@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+
+{% block title %}{{ section.title }} - git2mail{% endblock title %}
+{% block description %}{{ section.description | default(value=config.description) }}{% endblock description %}
+
+{% block content %}
+<article>
+    {{ section.content | safe }}
+  </article>
+{% endblock content %}

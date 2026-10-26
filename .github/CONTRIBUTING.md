@@ -43,7 +43,7 @@ Do you just want to file an issue for the project? Please do so in GitHub under 
     cargo test --locked
     cargo fmt -- --check
     cargo clippy --locked --all-targets -- -D warnings
-    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked --workspace
     ```
 4. **Commit your changes**: write conventional, atomic commit messages
    (one behavioral change per commit, subject like `feat(scope):`, `fix(scope):`,

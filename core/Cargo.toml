@@ -1,0 +1,24 @@
+[package]
+name = "git2mail-core"
+version = "0.8.0"
+authors = ["extiop"]
+edition = "2024"
+rust-version = "1.88"
+license = "LGPL-3.0-only"
+description = "Pure std-only core of git2mail: URL parsing, email/noreply rules, sanitization, correlation, variant engine and payload parsing - shared by the CLI crate and the WASM bindings, compiles to wasm32-unknown-unknown."
+
+[dependencies]
+regex = { version = "1.13", default-features = false, features = ["std"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+log = { version = "0.4", default-features = false, features = ["std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+# The transport variant of the error type (`http` feature): the CLI crate
+# enables it, the web build compiles the core without it, so the wasm
+# artifact never carries an HTTP stack.
+reqwest = { version = "0.13", default-features = false, optional = true }
+
+[features]
+http = ["dep:reqwest"]
+
+[lints]
+workspace = true

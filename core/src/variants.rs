@@ -10,14 +10,63 @@
 use crate::errors::Error;
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::report::{VariantMatch, Variants};
-use super::{fold_name, folded_commit_name};
+use crate::report::{VariantMatch, Variants};
+
+/// Upper bound on a commit author/committer name fed to the folded-name
+/// map: git permits arbitrarily long names, and a hostile commit can plant
+/// a multi-megabyte field that would amplify into memory, report and logs
+/// (every count in the engine is capped against hostile metadata - so are
+/// the lengths). 4096 bytes is far above any real name.
+pub const MAX_COMMIT_NAME_BYTES: usize = 4096;
+
+/// ASCII-folds a name for email-variant generation: lowercased, and the
+/// accents stripped **only for the common Latin-1 range** (hand-rolled, no
+/// unicode crate), plus the Latin digraphs `ß`→`ss`, `æ`→`ae` and
+/// `œ`→`oe` and the stroke letters `ø`→`o`. Any other script (Cyrillic,
+/// CJK, …) is kept raw: the variants generated from it simply will not
+/// match ASCII emails, which is the honest behavior.
+pub fn fold_name(name: &str) -> String {
+    let mut folded = String::with_capacity(name.len());
+    for c in name.to_lowercase().chars() {
+        match c {
+            'à'..='å' => folded.push('a'),
+            'ç' => folded.push('c'),
+            'è'..='ë' => folded.push('e'),
+            'ì'..='ï' => folded.push('i'),
+            'ñ' => folded.push('n'),
+            'ò'..='ö' => folded.push('o'),
+            'ø' => folded.push('o'),
+            'ù'..='ü' => folded.push('u'),
+            'ý' | 'ÿ' => folded.push('y'),
+            'ß' => folded.push_str("ss"),
+            'æ' => folded.push_str("ae"),
+            'œ' => folded.push_str("oe"),
+            other => folded.extend(other.to_lowercase()),
+        }
+    }
+    folded
+}
+
+/// Folds one commit name for the report, trimmed (a hostile whitespace-only
+/// name like `"   "` must not plant noise in the histories) and dropped when
+/// nothing remains.
+pub fn folded_commit_name(name: &str) -> Option<String> {
+    // git permits arbitrarily long author names: a hostile commit can plant
+    // a multi-megabyte name that would amplify into the folded-name map and
+    // the report. 4096 bytes is far above any real name, so the skip is
+    // silent like the other unusable-identity skips
+    if name.len() > MAX_COMMIT_NAME_BYTES {
+        return None;
+    }
+    let folded = fold_name(name.trim());
+    (!folded.is_empty()).then_some(folded)
+}
 
 /// Upper bound on one caller-supplied `--variant-pattern` template: a
 /// longer pattern can only be pathological (the generated local-part must
 /// fit RFC 5321's 64-byte bound anyway), and every count in the engine is
-/// capped against hostile input — so is this one.
-pub(crate) const MAX_VARIANT_PATTERN_BYTES: usize = 128;
+/// capped against hostile input - so is this one.
+pub const MAX_VARIANT_PATTERN_BYTES: usize = 128;
 
 /// The variant engine's input caps. Commit names and commit emails are
 /// attacker-forgeable and uncapped (one merged PR can plant thousands of
@@ -30,27 +79,27 @@ pub(crate) const MAX_VARIANT_PATTERN_BYTES: usize = 128;
 /// spellings and mail domains; beyond the caps the extra inputs are
 /// attacker noise, so the engine is bounded deterministically (sorted
 /// pairs, most-sighted domains first) with a warning when a cap bites.
-pub(crate) const MAX_VARIANT_NAME_PAIRS: usize = 64;
+pub const MAX_VARIANT_NAME_PAIRS: usize = 64;
 
 /// See [`MAX_VARIANT_NAME_PAIRS`]: the per-scan cap on the distinct email
 /// domains fed to the variant engine (most-sighted domains first, ties
 /// broken alphabetically, noreply excluded as before).
-pub(crate) const MAX_VARIANT_DOMAINS: usize = 64;
+pub const MAX_VARIANT_DOMAINS: usize = 64;
 
 /// See [`MAX_VARIANT_NAME_PAIRS`]: the cap on the report's generated-variant
 /// list. Matching is unaffected: every capped combination is still tested
 /// against the observed emails, so a variant beyond the list cap can still
 /// be reported as matched.
-pub(crate) const MAX_GENERATED_VARIANTS: usize = 1000;
+pub const MAX_GENERATED_VARIANTS: usize = 1000;
 
 /// The cap on the caller-supplied custom variant patterns
 /// (`user --variant-pattern`): the patterns are analyst input, not forgeable
-/// commit metadata, but the same combinatorics warning applies — every
+/// commit metadata, but the same combinatorics warning applies - every
 /// pattern multiplies every capped name pair by every capped domain, so an
 /// absurd pattern count would only slow the analyst's own machine down and
 /// bloat the report past the generated-list cap. 64 keeps the useful
 /// conventions of a whole team and fails fast beyond.
-pub(crate) const MAX_CUSTOM_VARIANT_PATTERNS: usize = 64;
+pub const MAX_CUSTOM_VARIANT_PATTERNS: usize = 64;
 
 /// Validates one caller-supplied custom variant pattern
 /// (`user --variant-pattern`). A pattern is a template with `{first}`,
@@ -71,7 +120,7 @@ pub fn validate_variant_pattern(pattern: &str) -> Result<(), Error> {
     // every count in the engine is capped against hostile metadata: a
     // pattern is CLI input, so the cap is a client-side rejection (the
     // generated local-part fits well under RFC 5321's 64-byte local-part
-    // bound anyway — a longer pattern can only be pathological)
+    // bound anyway - a longer pattern can only be pathological)
     if pattern.len() > MAX_VARIANT_PATTERN_BYTES {
         return Err(Error::InvalidVariantPattern(format!(
             "the pattern is {} bytes, the maximum is {MAX_VARIANT_PATTERN_BYTES}",
@@ -145,7 +194,7 @@ pub fn validate_variant_pattern(pattern: &str) -> Result<(), Error> {
 /// collapse several patterns onto the same email). With no last name, only
 /// the bare `{first}` pattern makes sense among the built-ins, and the
 /// custom patterns requiring a last name are skipped.
-pub(crate) fn generate_variants(
+pub fn generate_variants(
     first: &str,
     last: &str,
     domain: &str,
@@ -195,12 +244,7 @@ pub(crate) fn generate_variants(
 /// the observed `j.dupont@acme.com`, not miss it). A template requiring a
 /// last name is skipped (not an error) when the pair carries none, exactly
 /// like the built-ins collapse in that case.
-pub(crate) fn expand_pattern(
-    template: &str,
-    first: &str,
-    last: &str,
-    initial: &str,
-) -> Option<String> {
+pub fn expand_pattern(template: &str, first: &str, last: &str, initial: &str) -> Option<String> {
     if template.contains("{last}") && last.is_empty() {
         return None;
     }
@@ -213,7 +257,7 @@ pub(crate) fn expand_pattern(
 }
 
 /// Folds one already-folded name into its `(first, last)` variant pair.
-pub(crate) fn pair_from_folded_name(folded: &str) -> Option<(String, String)> {
+pub fn pair_from_folded_name(folded: &str) -> Option<(String, String)> {
     let tokens: Vec<&str> = folded.split_whitespace().collect();
     if tokens.is_empty() {
         return None;
@@ -226,7 +270,10 @@ pub(crate) fn pair_from_folded_name(folded: &str) -> Option<(String, String)> {
     Some((tokens[0].to_string(), last.to_string()))
 }
 
-pub(crate) fn build_variants(
+/// Expands the capped variant candidates: the built-in patterns (plus the
+/// caller's custom ones) applied to the ranked name pairs and domains, the
+/// generated list capped, the observed ones matched back.
+pub fn build_variants(
     known_names: BTreeSet<String>,
     name_weights: &BTreeMap<String, usize>,
     profile_name: Option<&str>,
@@ -237,13 +284,13 @@ pub(crate) fn build_variants(
     // One O(N) pass: fold every name once and accumulate its raw
     // sighting weight into its (first, last) pair. The previous
     // per-pair ranking re-scanned and re-folded ALL known names for
-    // EVERY distinct pair — quadratic in the uncapped, target-forgeable
+    // EVERY distinct pair - quadratic in the uncapped, target-forgeable
     // commit-name count (the per-repository walk cap bounds one
     // repository, but the target's own repositories multiply it), all
     // paid BEFORE the MAX_VARIANT_NAME_PAIRS truncation below
     // a BTreeMap keeps the pair iteration deterministic (pair asc), so
     // the stable weight sort below resolves equal weights
-    // deterministically — a dropped tie-break cannot hide behind
+    // deterministically - a dropped tie-break cannot hide behind
     // HashMap's randomized order
     let mut pair_weights: BTreeMap<(String, String), usize> = BTreeMap::new();
     for name in &known_names {
@@ -314,5 +361,24 @@ pub(crate) fn build_variants(
     Variants {
         matched,
         generated: generated.into_iter().collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Tests may unwrap, expect and panic freely: a failing assertion must
+    // be loud, so the zero-panic lints do not apply to the test modules.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    #[test]
+    fn fold_name_strips_common_latin_accents_and_keeps_other_scripts() {
+        assert_eq!(fold_name("Jérôme Dupont"), "jerome dupont");
+        assert_eq!(fold_name("ÀÉÎÕÜ"), "aeiou");
+        assert_eq!(fold_name("Straße"), "strasse");
+        assert_eq!(fold_name("Œuvre ærø"), "oeuvre aero");
+        assert_eq!(fold_name("Søren"), "soren");
+        // non-Latin scripts are kept raw (documented delta, no unicode crate)
+        assert_eq!(fold_name("山田"), "山田");
     }
 }

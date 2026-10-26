@@ -16,6 +16,13 @@ pub enum Error {
     /// JSON (de)serialization failure.
     Json(serde_json::Error),
     /// HTTP request failure (transport, non-success status, body decoding).
+    /// A transport-level failure reaching GitHub (connection refused or
+    /// dropped, timeout, an intercepted or captive-portal connection).
+    /// Present only when the crate is built with the `http` feature: the
+    /// pure core (the web build) never carries an HTTP stack, so the
+    /// variant - and the `reqwest` dependency - disappear from the wasm
+    /// artifact. The CLI crate enables the feature.
+    #[cfg(feature = "http")]
     Http(reqwest::Error),
     /// A GitHub URL could not be parsed.
     InvalidUrl(String),
@@ -24,7 +31,7 @@ pub enum Error {
     InvalidTokenFormat(String),
     /// A `--token-file` is structurally unusable: not a JSON object of
     /// numeric indexes to token strings, or holding no usable token. The
-    /// payload describes the structural problem — it is deliberately a
+    /// payload describes the structural problem - it is deliberately a
     /// different variant from [`Error::InvalidTokenFormat`], whose display
     /// message points at the token *value* format (a hint that would send
     /// the user looking at a perfectly fine token when the file's *shape*
@@ -36,7 +43,7 @@ pub enum Error {
     /// secondary rate limit (GitHub's per-minute search quota or an abuse
     /// window): the allowances are not spent, the tokens come back on their
     /// own within minutes. Distinct from [`Error::RateLimitExhausted`],
-    /// whose display names an hourly allowance and a one-hour wait — the
+    /// whose display names an hourly allowance and a one-hour wait - the
     /// wrong advice after a per-minute search storm, and a misdiagnosis of
     /// a healthy pool.
     RateLimitPaused,
@@ -49,7 +56,7 @@ pub enum Error {
     /// jargon with no next step.
     TokenRejected,
     /// GitHub answered HTTP 422 on the first page of a repository search:
-    /// the query itself was rejected by the API — most often a nonexistent
+    /// the query itself was rejected by the API - most often a nonexistent
     /// or inaccessible `--user`/`--org` login, otherwise an invalid
     /// qualifier combination or an over-long `q`. The raw reqwest message
     /// for this case reads like a tool failure while GitHub's own response
@@ -111,6 +118,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(err) => write!(f, "{err}"),
             Error::Json(err) => write!(f, "JSON error: {err}"),
+            #[cfg(feature = "http")]
             Error::Http(err) => {
                 if err.is_decode() {
                     // a response arrived but is not the JSON GitHub sends:
@@ -120,7 +128,7 @@ impl fmt::Display for Error {
                     // "check your internet connection" advice would mislead
                     write!(
                         f,
-                        "could not read GitHub's response: {err} — the \
+                        "could not read GitHub's response: {err} - the \
                          connection may be intercepted or filtered (captive \
                          portal, corporate proxy): try again, possibly on \
                          another network"
@@ -128,7 +136,7 @@ impl fmt::Display for Error {
                 } else {
                     write!(
                         f,
-                        "could not reach GitHub: {err} — check your internet \
+                        "could not reach GitHub: {err} - check your internet \
                          connection and try again (on a corporate network, a \
                          proxy or firewall may have refused the request)"
                     )
@@ -156,7 +164,7 @@ impl fmt::Display for Error {
                     // terminal, so control characters (an ESC opener in the
                     // first four characters) must not pass raw
                     "invalid token format (expected `ghp_…` or \
-                     `github_pat_…`): {masked:?} — copy a fresh token from \
+                     `github_pat_…`): {masked:?} - copy a fresh token from \
                      github.com/settings/tokens"
                 )
             }
@@ -173,7 +181,7 @@ impl fmt::Display for Error {
                     f,
                     "GitHub allowed no more requests: every token's allowance \
                      is used up (without --token: the shared anonymous \
-                     allowance is spent) — wait up to one hour for the \
+                     allowance is spent) - wait up to one hour for the \
                      limit to reset, or add more tokens with --token / \
                      --token-file; emails found before the limit may \
                      not be saved"
@@ -184,7 +192,7 @@ impl fmt::Display for Error {
                     f,
                     "GitHub paused every token with a secondary rate limit (too many \
                      requests in a short window): the allowances are not spent and \
-                     the tokens come back within minutes — wait a few minutes and \
+                     the tokens come back within minutes - wait a few minutes and \
                      rerun the command; results found before the pause may not be \
                      saved"
                 )
@@ -193,7 +201,7 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "GitHub refused the token (HTTP 401 Unauthorized): it is revoked, \
-                     expired or mistyped — create a new token \
+                     expired or mistyped - create a new token \
                      on GitHub and check your --token or --token-file value"
                 )
             }
@@ -202,14 +210,14 @@ impl fmt::Display for Error {
                     f,
                     // single-line string, like the TokenRejected arm above
                     "GitHub rejected the search (HTTP 422): the `--user`/`--org` login may not \
-                     exist or be accessible, or a filter is invalid — check the target and the \
+                     exist or be accessible, or a filter is invalid - check the target and the \
                      search filters"
                 )
             }
             Error::NotFound => {
                 write!(
                     f,
-                    "GitHub resource not found — check the spelling of the \
+                    "GitHub resource not found - check the spelling of the \
                      user, organization or repository name (a URL ending in \
                      .git also produces this: drop the suffix)"
                 )
@@ -217,7 +225,7 @@ impl fmt::Display for Error {
             Error::PrivateOrUnavailable => {
                 write!(
                     f,
-                    "GitHub resource is private or unavailable — the repository may be \
+                    "GitHub resource is private or unavailable - the repository may be \
                      private, the token lacks access to it, or a network intermediary \
                      refused the request"
                 )
@@ -229,7 +237,7 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "no email found: this target's public GitHub activity shows no \
-                     address — for a person, try git2mail user <username>; \
+                     address - for a person, try git2mail user <username>; \
                      for an address you already have, git2mail email <address>"
                 )
             }
@@ -240,7 +248,7 @@ impl fmt::Display for Error {
             Error::WorkerFailed(details) => {
                 write!(
                     f,
-                    "an unexpected internal error stopped the scan: {details} — \
+                    "an unexpected internal error stopped the scan: {details} - \
                      please run the command again"
                 )
             }
@@ -265,7 +273,7 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "GitHub returned an unusable payload for this account: \
-                     {details} — try again later"
+                     {details} - try again later"
                 )
             }
             Error::InvalidEmail(details) => write!(f, "invalid email address: {details}"),
@@ -296,9 +304,17 @@ impl std::error::Error for Error {
         match self {
             Error::Io(err) => Some(err),
             Error::Json(err) => Some(err),
+            #[cfg(feature = "http")]
             Error::Http(err) => Some(err),
             _ => None,
         }
+    }
+}
+
+#[cfg(feature = "http")]
+impl From<reqwest::Error> for Error {
+    fn from(err: reqwest::Error) -> Self {
+        Error::Http(err)
     }
 }
 
@@ -315,14 +331,14 @@ impl From<io::Error> for Error {
 /// a Windows editor cannot be read as UTF-8). The path is Debug-escaped
 /// like every user-typed payload echoed to the terminal (control
 /// characters must not pass raw).
-pub(crate) fn read_file_error(path: &Path, err: io::Error, missing_hint: &str) -> Error {
+pub fn read_file_error(path: &Path, err: io::Error, missing_hint: &str) -> Error {
     let hint = if err.kind() == io::ErrorKind::NotFound {
         // the most common first-run mistake: the highest-frequency case
-        // gets the most explicit guidance — each caller names its own
+        // gets the most explicit guidance - each caller names its own
         // remedy (a token file and a bulk addresses file are set up
         // differently, and the same reader serves both)
         format!(
-            " — check the path: the file must exist in the folder you ran \
+            " - check the path: the file must exist in the folder you ran \
              the command from ({missing_hint})"
         )
     } else if err.kind() == io::ErrorKind::InvalidData {
@@ -341,12 +357,6 @@ pub(crate) fn read_file_error(path: &Path, err: io::Error, missing_hint: &str) -
 impl From<serde_json::Error> for Error {
     fn from(err: serde_json::Error) -> Self {
         Error::Json(err)
-    }
-}
-
-impl From<reqwest::Error> for Error {
-    fn from(err: reqwest::Error) -> Self {
-        Error::Http(err)
     }
 }
 
@@ -389,7 +399,7 @@ mod tests {
             "unexpected message: {paused}"
         );
         // the rejected-token variant carries the status and the next step
-        // (create a new token), not raw reqwest jargon — and stays on one
+        // (create a new token), not raw reqwest jargon - and stays on one
         // terminal line (`eprintln!("[-] {err}")` cannot re-indent an
         // embedded newline, which would raggedly hard-wrap the message)
         let token_rejected = Error::TokenRejected.to_string();
@@ -445,7 +455,7 @@ mod tests {
         );
         assert_eq!(
             Error::InvalidTokenFormat("ghp_***".to_string()).to_string(),
-            "invalid token format (expected `ghp_…` or `github_pat_…`): \"ghp_***\" — copy a fresh token from github.com/settings/tokens"
+            "invalid token format (expected `ghp_…` or `github_pat_…`): \"ghp_***\" - copy a fresh token from github.com/settings/tokens"
         );
         // the --variant-pattern payload is user-typed and echoed raw inside
         // the details sentence: the whole payload must be Debug-escaped ONCE
@@ -474,7 +484,7 @@ mod tests {
         // the terminal: control characters are Debug-escaped, not printed raw
         assert_eq!(
             Error::InvalidTokenFormat("\x1b[31***".to_string()).to_string(),
-            "invalid token format (expected `ghp_…` or `github_pat_…`): \"\\u{1b}[31***\" — copy a fresh token from github.com/settings/tokens"
+            "invalid token format (expected `ghp_…` or `github_pat_…`): \"\\u{1b}[31***\" - copy a fresh token from github.com/settings/tokens"
         );
         assert_eq!(
             Error::OutputWrite("results/x".to_string()).to_string(),
@@ -482,7 +492,7 @@ mod tests {
         );
         assert_eq!(
             Error::WorkerFailed("did not report".to_string()).to_string(),
-            "an unexpected internal error stopped the scan: did not report — please run the command again"
+            "an unexpected internal error stopped the scan: did not report - please run the command again"
         );
         assert!(
             Error::Organization("acme".to_string())
@@ -507,7 +517,7 @@ mod tests {
         assert_eq!(
             Error::InvalidProfile("missing `id`".to_string()).to_string(),
             "GitHub returned an unusable payload for this account: missing \
-             `id` — try again later"
+             `id` - try again later"
         );
         assert_eq!(
             Error::InvalidEmail("no at sign".to_string()).to_string(),
@@ -545,7 +555,7 @@ mod tests {
         );
         assert_eq!(
             missing.to_string(),
-            "cannot read the file \"nope.json\": entity not found — check the \
+            "cannot read the file \"nope.json\": entity not found - check the \
              path: the file must exist in the folder you ran the command from \
              (for tokens: copy tokens.example.json to tokens.json and paste \
              your tokens from github.com/settings/tokens)"
@@ -559,7 +569,7 @@ mod tests {
         );
         assert_eq!(
             missing_addresses.to_string(),
-            "cannot read the file \"addresses.txt\": entity not found — check \
+            "cannot read the file \"addresses.txt\": entity not found - check \
              the path: the file must exist in the folder you ran the command \
              from (one email address per line, # comments allowed)"
         );
@@ -592,11 +602,13 @@ mod tests {
 
         // an invalid URL fails at request-build time, deterministically and
         // without any I/O (no loopback connection needed in tests)
+        #[cfg(feature = "http")]
         let http_error: Error = reqwest::blocking::Client::new()
             .get("not a valid url")
             .build()
             .expect_err("invalid URL must fail before any I/O")
             .into();
+        #[cfg(feature = "http")]
         assert!(matches!(http_error, Error::Http(_)));
     }
 }

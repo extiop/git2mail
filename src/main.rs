@@ -20,12 +20,12 @@ struct SharedArgs {
     /// Authenticate with your GitHub token (raises the limit from 60 to
     /// 5000 requests/hour). Create one at github.com/settings/tokens.
     /// Typing it here leaves it visible in your shell history and to other
-    /// programs — prefer `--token-file`; when both are given, the --token
+    /// programs - prefer `--token-file`; when both are given, the --token
     /// value is used unless it is empty or only spaces (then --token-file
     /// is read). `--token ""` on its own runs anonymously
     #[arg(short, long)]
     token: Option<String>,
-    /// File holding one or more GitHub tokens, e.g. {"0": "ghp_…"} — each
+    /// File holding one or more GitHub tokens, e.g. {"0": "ghp_…"} - each
     /// token adds 5000 requests/hour; copy tokens.example.json to get
     /// started (create tokens at github.com/settings/tokens)
     #[arg(long, value_name = "TOKENS_JSON")]
@@ -49,7 +49,7 @@ struct SharedArgs {
     name = "git2mail",
     author,
     version,
-    about = "Find developers' public email addresses on GitHub — from repositories, profiles, organizations and keyword searches",
+    about = "Find developers' public email addresses on GitHub - from repositories, profiles, organizations and keyword searches",
     arg_required_else_help = true,
     after_help = "Examples:
   git2mail scan --url https://github.com/denoland/deno
@@ -87,7 +87,7 @@ enum Command {
     /// up to 3 candidate searches (duplicates collapse; a rejected query
     /// costs its candidates, not the lookup) and walks the full history of
     /// every candidate repository the search serves (until a
-    /// `commit-author` match ends the lookup early) — the cost is bounded
+    /// `commit-author` match ends the lookup early) - the cost is bounded
     /// only by GitHub's own limits, so a token is strongly recommended. The
     /// result prints on screen; add `--json <path>` (or `--json -`) to
     /// save it
@@ -116,7 +116,7 @@ enum Command {
     ///
     /// The full report prints on screen (add `--json <path>` or `--json -`
     /// to save it): past usernames and names found in the account's commit
-    /// noreply addresses (like 12345+jane@users.noreply.github.com — the
+    /// noreply addresses (like 12345+jane@users.noreply.github.com - the
     /// address GitHub puts in commits when you keep your email private),
     /// real email addresses used, likely addresses guessed from the
     /// person's name, other accounts that may belong to the same person,
@@ -138,15 +138,15 @@ enum Command {
     },
     /// Investigate a GitHub organization: its public members, its public
     /// repositories and the developers' emails found scanning them (the
-    /// emails are also saved to the file results/org/<org>; add `--json`
+    /// emails are also saved to the file results/org/<org>.log; add `--json`
     /// for the full report). A token is strongly recommended: the walk
     /// covers every listed repository and aborts on a spent anonymous
     /// allowance.
     Org {
-        /// GitHub organization name — the word in its page address, e.g.
+        /// GitHub organization name - the word in its page address, e.g.
         /// `acme` in github.com/acme
         org: String,
-        /// Scan only the first N repositories (default: every one — big
+        /// Scan only the first N repositories (default: every one - big
         /// organizations take a long time, so try `--limit 10` first)
         #[arg(
             long,
@@ -163,7 +163,7 @@ enum Command {
     /// Search GitHub repositories by keyword and scan them for developers' emails
     Search {
         /// Keywords describing the repositories you want (GitHub matches
-        /// them against repository names, descriptions and topics — to
+        /// them against repository names, descriptions and topics - to
         /// investigate one person, use the `user` subcommand)
         #[arg(short, long, value_parser = non_empty_query)]
         query: String,
@@ -250,6 +250,43 @@ fn variant_pattern_value(pattern: &str) -> Result<String, String> {
 /// Writes one JSON report when a `--json` path was requested, warning (not
 /// failing) on a write error: the caller surfaces its own primary error
 /// instead (the findings must not vanish from both outputs at once).
+/// Whether an aborted bulk run's partial report carries anything worth
+/// preserving: a run stopped before its FIRST lookup completed has an
+/// empty `results` and an empty `skipped_addresses`, and writing it over
+/// a previous good report would destroy the user's earlier deliverable.
+fn should_preserve_partial_report(report: &email::BulkReport) -> bool {
+    !report.results.is_empty() || !report.skipped_addresses.is_empty()
+}
+
+/// The process exit code a failed run ends with: `3` distinguishes a live
+/// target that simply exposed nothing (an empty `scan` or `search` - the
+/// JSON report is still written when `--json` was requested) from a real
+/// failure (`1`), so scripting can branch on it (the guide's exit-code
+/// section documents the contract). `0` is success and `2` is clap's own
+/// argument-error code, neither of which runs through this map.
+fn exit_code_for(error: &Error) -> i32 {
+    if matches!(error, Error::NoResults) {
+        3
+    } else {
+        1
+    }
+}
+
+/// The `--csv` no-effect notice for the subcommands whose reports carry no
+/// per-author correlation, or `None` when the flag applies (scan, search,
+/// org) or was not requested.
+fn csv_no_effect_notice(requested: bool, command: &Command) -> Option<&'static str> {
+    if !requested {
+        return None;
+    }
+    match command {
+        Command::Scan { .. } | Command::Search { .. } | Command::Org { .. } => None,
+        _ => Some(
+            "--csv has no effect here: the CSV export applies to scan, search and org only (use --json for this subcommand's report)",
+        ),
+    }
+}
+
 fn write_json_best_effort<T: serde::Serialize>(path: Option<&PathBuf>, report: &T) {
     if let Some(path) = path
         && let Err(json_err) = output::write_report_json(path, report)
@@ -306,14 +343,8 @@ fn run() -> Result<(), Error> {
     // a per-author correlation): on the other subcommands the flag is
     // pre-validated above but never written, so say so instead of a silent
     // no-op
-    let csv_supported = matches!(
-        cli.command,
-        Command::Scan { .. } | Command::Search { .. } | Command::Org { .. }
-    );
-    if csv.is_some() && !csv_supported {
-        log::warn!(
-            "--csv has no effect here: the CSV export applies to scan, search and org only (use --json for this subcommand's report)"
-        );
+    if let Some(notice) = csv_no_effect_notice(csv.is_some(), &cli.command) {
+        log::warn!("{}", notice);
     }
 
     match cli.command {
@@ -364,7 +395,7 @@ fn run() -> Result<(), Error> {
                     // FIRST lookup completed has nothing to preserve, and
                     // overwriting a previous good report with an empty one
                     // would destroy the user's earlier deliverable
-                    if !report.results.is_empty() || !report.skipped_addresses.is_empty() {
+                    if should_preserve_partial_report(&report) {
                         write_json_best_effort(Some(path), &report);
                     }
                 } else {
@@ -518,12 +549,12 @@ fn write_report_deliverable<T: serde::Serialize>(
 }
 
 /// Runs the `org` subcommand: the investigation, the paste-able
-/// `results/org/<org>` text file, and the JSON deliverable.
+/// `results/org/<org>.log` text file, and the JSON deliverable.
 ///
 /// An empty result is a successful run (user/email parity): `log_summary`
 /// already printed the org-scoped `[-]` no-results line, and `NoResults`'
 /// person-oriented advice does not apply to an org the user chose
-/// deliberately — only a real write failure surfaces (handled by
+/// deliberately - only a real write failure surfaces (handled by
 /// [`write_report_deliverable`]). The JSON report is attempted in EVERY
 /// case: the org scan spends the most API budget of any subcommand, so an
 /// explicit `--json` deliverable must not vanish on the empty run.
@@ -579,7 +610,7 @@ fn write_outputs(
                     partial: outcome.partial,
                 },
                 correlation: &outcome.correlation,
-                provenance: output::Provenance::now(),
+                provenance: output::Provenance::now(env!("CARGO_PKG_VERSION")),
             },
         )
     };
@@ -594,7 +625,7 @@ fn write_outputs(
                 // the legacy text write failed: the user-requested JSON report
                 // must still be written, so a successful scan's findings do not
                 // vanish from both outputs at once (the JSON write itself would
-                // have succeeded — e.g. a stray file blocking the `results/`
+                // have succeeded - e.g. a stray file blocking the `results/`
                 // layout, or a read-only CWD). The text failure stays the
                 // surfaced error; if the JSON write fails too, it is warned
                 // about on top of it
@@ -659,7 +690,7 @@ fn build_logger_with_ambient_filter(
     let mut builder = pretty_env_logger::formatted_builder();
     // The terminal report vocabulary is `[+]` success / `[-]` error /
     // `[!]` warning / `[.]` informational listing, so a
-    // warning must carry its own scannable marker (`[!]`) — otherwise a
+    // warning must carry its own scannable marker (`[!]`) - otherwise a
     // partial-scan warning looks like progress chatter once colors are
     // stripped (redirect, screen reader, plain terminal). The marker is
     // applied here at the format level (one site) instead of editing every
@@ -695,13 +726,8 @@ fn main() {
         // exit code 3 is the "completed but found nothing" code (an empty
         // scan/search result): scripting branches on it to tell a live but
         // email-less target apart from a real failure (documented in the
-        // README's scripting notes)
-        let code = if matches!(err, Error::NoResults) {
-            3
-        } else {
-            1
-        };
-        std::process::exit(code);
+        // user guide's exit-code and scripting-notes sections)
+        std::process::exit(exit_code_for(&err));
     }
 }
 
@@ -997,7 +1023,7 @@ mod tests {
     #[test]
     fn a_malformed_variant_pattern_is_rejected_at_parse_time() {
         // the clap value_parser must carry the client-side validation: a
-        // reverted value_parser would only fail later (or never) — this pins
+        // reverted value_parser would only fail later (or never) - this pins
         // the parse-time rejection (exit 2, usage error, no network)
         for pattern in ["{first", "{unknown}", "{first} {last}", "a}b{first}"] {
             let cli =
@@ -1180,7 +1206,7 @@ mod tests {
         }
         // the value names are part of the help contract too: `--size` is
         // named by its range syntax (`--size <RANGE>`, like `--stars` and
-        // `--forks`) and the date flags by theirs (`<DATE_RANGE>`) — a
+        // `--forks`) and the date flags by theirs (`<DATE_RANGE>`) - a
         // reverted `value_name` falls back to clap's default placeholder
         // (a bare `<SIZE>`), which this pins against
         for flag_value in ["--stars <RANGE>", "--forks <RANGE>", "--size <RANGE>"] {
@@ -1259,12 +1285,221 @@ mod tests {
         std::fs::remove_file(&json_path).ok();
     }
 
+    #[test]
+    fn write_outputs_writes_the_csv_deliverable_and_the_header_only_when_empty() {
+        // the CSV contract is scan/search/org only: the correlation lands
+        // as `;`-joined rows under the pinned header, and an empty
+        // correlation still writes the file (header alone) - a missing file
+        // would read as a crash, not as "no authors found"
+        // `write_text` lays out `results/` relative to the process CWD, and
+        // sibling tests chdir the whole process (the blocked-text-write test
+        // even plants a file named `results`): the run must hold the same
+        // CWD lock, or the relative layout races their temp directory
+        in_temp_cwd(|| {
+            let scanner = Scanner::new(None, None).expect("anonymous scanner must build");
+            let mut outcome = ScanOutcome {
+                emails: vec!["dev@example.com".to_string()],
+                repos_scanned: 1,
+                ..ScanOutcome::default()
+            };
+            outcome.correlation = git2mail::correlate::Correlation {
+                authors: vec![git2mail::correlate::AuthorReport {
+                    author: "Jane Doe".to_string(),
+                    emails: vec!["jane@example.com".to_string()],
+                    repos: vec![],
+                    languages: vec![],
+                    first_seen_repo: "owner/repo".to_string(),
+                    total_hits: 1,
+                    last_commit_date: None,
+                }],
+            };
+            let csv_path = std::env::temp_dir().join(format!(
+                "git2mail_main_test_{}_correlation.csv",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&csv_path);
+            let json_path = std::env::temp_dir().join(format!(
+                "git2mail_main_test_{}_correlation.json",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&json_path);
+
+            write_outputs(
+                OutputNaming {
+                    target: "target",
+                    mode: "repository",
+                    directory: "repository",
+                    file_name: "acme_lib".to_string(),
+                    request: None,
+                },
+                outcome,
+                Some(json_path),
+                Some(csv_path.clone()),
+                &scanner,
+            )
+            .expect("a non-empty scan with both deliverables must succeed");
+
+            let csv = std::fs::read_to_string(&csv_path).expect("the CSV must exist");
+            let mut lines = csv.lines();
+            assert_eq!(
+                lines.next(),
+                Some("author_name,emails,repositories,dominant_language,commits"),
+                "the pinned header row must open the file"
+            );
+            assert!(
+                lines
+                    .next()
+                    .expect("the correlation row")
+                    .contains("Jane Doe"),
+                "the author row must follow"
+            );
+            std::fs::remove_file(&csv_path).ok();
+
+            // the empty scan: the CSV exists, header alone
+            let outcome = ScanOutcome::default();
+            let error = write_outputs(
+                OutputNaming {
+                    target: "target",
+                    mode: "search",
+                    directory: "keyword",
+                    file_name: "query".to_string(),
+                    request: None,
+                },
+                outcome,
+                None,
+                Some(csv_path.clone()),
+                &scanner,
+            )
+            .expect_err("an empty scan must still report no result");
+            assert!(matches!(error, Error::NoResults));
+            let csv = std::fs::read_to_string(&csv_path).expect("the header-only CSV must exist");
+            assert_eq!(
+                csv.lines().collect::<Vec<_>>(),
+                vec!["author_name,emails,repositories,dominant_language,commits"],
+                "an empty correlation writes the header alone"
+            );
+            std::fs::remove_file(&csv_path).ok();
+        });
+    }
+
+    fn shared_args() -> SharedArgs {
+        SharedArgs {
+            token: None,
+            token_file: None,
+            json: None,
+            csv: None,
+        }
+    }
+
+    #[test]
+    fn the_csv_no_effect_notice_names_the_subcommands_that_carry_it() {
+        // byte-exact: the notice is the only place the visitor learns the
+        // flag was accepted but will not produce a file
+        assert_eq!(
+            csv_no_effect_notice(
+                true,
+                &Command::Email {
+                    shared: shared_args(),
+                    address: "a@b.c".to_string(),
+                }
+            ),
+            Some(
+                "--csv has no effect here: the CSV export applies to scan, search and org only (use --json for this subcommand's report)"
+            )
+        );
+        // not requested: silent, whatever the subcommand
+        assert_eq!(
+            csv_no_effect_notice(
+                false,
+                &Command::Email {
+                    shared: shared_args(),
+                    address: "a@b.c".to_string(),
+                }
+            ),
+            None
+        );
+        // the deliverable subcommands: silent even when requested
+        assert_eq!(
+            csv_no_effect_notice(
+                true,
+                &Command::Scan {
+                    url: "https://github.com/o/r".to_string(),
+                    shared: shared_args(),
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_exit_code_map_separates_a_live_empty_target_from_a_failure() {
+        // the scripting contract (guide, exit-code section): 3 is "the run
+        // completed but found nothing", 1 is everything else - clap owns 2
+        // and success is 0, neither runs through this map
+        assert_eq!(exit_code_for(&Error::NoResults), 3);
+        assert_eq!(
+            exit_code_for(&Error::InvalidUrl("not a url".to_string())),
+            1
+        );
+    }
+
+    #[test]
+    fn an_aborted_bulk_report_is_preserved_only_when_it_carries_something() {
+        // the guard behind the bulk --json best-effort write: a report with
+        // results or skipped addresses is worth the file, an empty one
+        // would overwrite a previous good deliverable with nothing
+        let carried = email::BulkReport {
+            provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
+            results: vec![email::EmailReport {
+                provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
+                email: "a@b.c".to_string(),
+                account: None,
+                evidence: None,
+                candidate_accounts: vec![],
+            }],
+            skipped_addresses: vec![],
+            summary: email::BulkSummary {
+                total: 1,
+                matched: 0,
+                unmatched: 1,
+                skipped: 0,
+            },
+        };
+        assert!(should_preserve_partial_report(&carried));
+
+        let skipped_only = email::BulkReport {
+            provenance: carried.provenance.clone(),
+            results: vec![],
+            skipped_addresses: vec!["never-reached@b.c".to_string()],
+            summary: email::BulkSummary {
+                total: 1,
+                matched: 0,
+                unmatched: 0,
+                skipped: 1,
+            },
+        };
+        assert!(should_preserve_partial_report(&skipped_only));
+
+        let empty = email::BulkReport {
+            provenance: carried.provenance.clone(),
+            results: vec![],
+            skipped_addresses: vec![],
+            summary: email::BulkSummary {
+                total: 0,
+                matched: 0,
+                unmatched: 0,
+                skipped: 0,
+            },
+        };
+        assert!(!should_preserve_partial_report(&empty));
+    }
+
     /// A CWD-isolated body for the tests that exercise the legacy
     /// `results/` layout: the text writer writes relative to the current
     /// directory, so the blocker-file scenarios must not touch the real
     /// workspace. Local copy, not a shared fixture: the bin tests run in
     /// their own process (cargo test builds one test binary per target),
-    /// so the lib's test fixture and its lock never coexist with this one —
+    /// so the lib's test fixture and its lock never coexist with this one -
     /// the chdir is process-wide but the two fixtures never coexist in a
     /// process. The lock still serializes the parallel tests of this
     /// module, which share the process.
@@ -1305,7 +1540,7 @@ mod tests {
         // a stray file named `results` (planted by a previous `--json
         // results` run, or a read-only CWD) blocks the legacy text layout:
         // the scan itself succeeded, so the user-requested JSON report must
-        // still be written — a hard text-write failure used to abort before
+        // still be written - a hard text-write failure used to abort before
         // `write_report_json`, discarding the successful scan's findings from both
         // outputs at once. The text failure stays the surfaced error
         in_temp_cwd(|| {

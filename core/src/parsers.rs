@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 
 /// Cuts a pasted URL down to its address: leading/trailing whitespace is
 /// trimmed and the github.com page-navigation paste artifacts (`?query`,
-/// `#fragment` — `?tab=repositories`, `?plain=1#L12`, `#readme`…) are
+/// `#fragment` - `?tab=repositories`, `?plain=1#L12`, `#readme`…) are
 /// stripped, before either regex runs. Applied to both URL shapes so a
 /// `?tab=repositories` suffix on a profile URL is classified as a profile
 /// (no repository part) instead of a repository whose name holds the whole
@@ -52,7 +52,7 @@ const WEB_URL_HOSTS: [&str; 2] = ["github.com", "www.github.com"];
 /// github.com, before any regex or API work. The parsers used to accept any host: a pasted
 /// `https://gitlab.com/a/b` was silently re-targeted onto api.github.com
 /// and the scan reported "GitHub resource not found" after a guaranteed-404
-/// run — telling the user a *GitHub* resource was missing when the actual
+/// run - telling the user a *GitHub* resource was missing when the actual
 /// problem is that the URL was never a GitHub one (live repro). The
 /// documented `ssh://git@github.com/...` form keeps parsing; any other
 /// `ssh://` host is rejected with the same named error (the API base is
@@ -123,19 +123,50 @@ fn check_url_host(github_url: &str) -> Result<(), Error> {
     )))
 }
 
-/// Whether a URL part is a dot segment: never a valid GitHub login or
-/// repository name, and normalized away by the url crate when the API path
-/// is built, which would silently re-target the authenticated request to
-/// another api.github.com path (a hostile or malformed listing-derived
-/// `html_url` can carry one).
+/// Single-pass percent decoding, byte-faithful: the url crate decodes
+/// `%XX` exactly once when the API path is built, so a hostile part must
+/// be judged on its decoded form (`%2e%2e` is a dot segment by the time
+/// the request re-targets). A `%` not followed by two hex digits decodes
+/// literally, and decoded non-UTF-8 bytes become the replacement
+/// character - both are still judged on their decoded form by the name
+/// checks that call this, and neither can smuggle a dot segment.
+fn percent_decode_once(part: &str) -> String {
+    let bytes = part.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && bytes[index + 1].is_ascii_hexdigit()
+            && bytes[index + 2].is_ascii_hexdigit()
+        {
+            let hex = |byte: u8| (byte as char).to_digit(16).unwrap_or(0) as u8;
+            decoded.push(hex(bytes[index + 1]) * 16 + hex(bytes[index + 2]));
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// Whether a URL part is a dot segment, raw or percent-encoded: never a
+/// valid GitHub login or repository name, and normalized away by the url
+/// crate when the API path is built, which would silently re-target the
+/// request to another api.github.com path (a hostile or malformed
+/// listing-derived `html_url` can carry one, encoded or not - the
+/// browser's fetch and the url crate both collapse `%2e%2e` exactly like
+/// a literal `..`).
 fn is_dot_segment(part: &str) -> bool {
-    part == "." || part == ".."
+    let decoded = percent_decode_once(part);
+    decoded == "." || decoded == ".."
 }
 
 /// Rejects a shape-valid URL whose target is not GitHub. Two gaps the
 /// host check cannot see, because they hide one regex group deeper:
 /// a scheme-less paste naming another forge (`gitlab.com/octocat/hello-world`) is
-/// scanned against the github.com namesake of its path — the same
+/// scanned against the github.com namesake of its path - the same
 /// wrong-target class [`check_url_host`] closes for scheme'd URLs (its own
 /// guard only runs on a `://`); and a dot segment (`.`/`..`) in the author
 /// or repository slot survives every check, then the url crate collapses
@@ -178,7 +209,7 @@ fn check_url_target(github_url: &str, captures: &regex::Captures<'_>) -> Result<
 /// and desynchronize the per-repository report keys). GitHub listing
 /// names never carry any of these: an entry that does is a broken or
 /// hostile payload, skipped with a warning by the composing caller.
-pub(crate) fn is_safe_repository_name(name: &str) -> bool {
+pub fn is_safe_repository_name(name: &str) -> bool {
     !name.is_empty() && !is_dot_segment(name) && !name.contains(['/', '?', '#'])
 }
 
@@ -236,7 +267,7 @@ pub fn parse_github_url(github_url: &str) -> Result<(String, Option<String>), Er
             .map(|item| item.as_str().to_string())
             .ok_or_else(|| {
                 Error::InvalidUrl(
-                    "this URL does not point to a GitHub repository or profile — use \
+                    "this URL does not point to a GitHub repository or profile - use \
                      https://github.com/owner/repository or https://github.com/owner"
                         .to_string(),
                 )
@@ -261,7 +292,7 @@ pub fn parse_github_url(github_url: &str) -> Result<(String, Option<String>), Er
             // is still unusable
             .ok_or_else(|| {
                 Error::InvalidUrl(
-                    "this URL does not point to a GitHub repository or profile — use a URL like https://github.com/owner/repository".to_string(),
+                    "this URL does not point to a GitHub repository or profile - use a URL like https://github.com/owner/repository".to_string(),
                 )
             })?;
         return Ok((author, Some(repository)));
@@ -284,7 +315,7 @@ pub fn parse_github_url(github_url: &str) -> Result<(String, Option<String>), Er
                 .to_string(),
         )),
         None => Err(Error::InvalidUrl(
-            "this URL does not point to a GitHub repository or profile — use \
+            "this URL does not point to a GitHub repository or profile - use \
              https://github.com/owner/repository or https://github.com/owner"
                 .to_string(),
         )),
@@ -559,7 +590,7 @@ mod tests {
     fn get_author_and_get_repository_reject_a_non_github_host_in_a_scheme_less_url() {
         // the scheme'd host guard cannot see a scheme-less paste: its
         // judgment only runs on a `://`, so `gitlab.com/octocat/hello-world` used to
-        // be scanned against the github.com namesake of its path — the same
+        // be scanned against the github.com namesake of its path - the same
         // wrong-target class, hidden one regex group deeper (the guard's
         // own test only covered scheme'd URLs)
         for url in [
@@ -597,7 +628,7 @@ mod tests {
             "https://github.com/owner/..",
             "git@github.com:../octocat/hello-world",
             // EMBEDDED dot segments: the repository capture is `(.+)`, so a
-            // hostile `a/../b` rides inside a shape-valid name — and
+            // hostile `a/../b` rides inside a shape-valid name - and
             // percent_encode leaves `.` untouched (RFC 3986 unreserved), so
             // the url crate still collapses it at request-build time
             "https://github.com/octocat/a/../b",
@@ -621,7 +652,7 @@ mod tests {
 
     #[test]
     fn is_safe_repository_name_rejects_url_corrupting_names() {
-        for name in ["", ".", "..", "a/b", "x?y", "x#y"] {
+        for name in ["", ".", "..", "%2e%2e", ".%2e", "%2e.", "a/b", "x?y", "x#y"] {
             assert!(!is_safe_repository_name(name), "{name:?} must be rejected");
         }
         for name in ["hello-world", "my.repo", "git2mail"] {
@@ -704,7 +735,7 @@ mod tests {
             Err(Error::InvalidUrl(details)) => {
                 assert_eq!(
                     details,
-                    "this URL does not point to a GitHub repository or profile — use \
+                    "this URL does not point to a GitHub repository or profile - use \
                      https://github.com/owner/repository or https://github.com/owner"
                 );
             }
@@ -812,7 +843,7 @@ mod tests {
         // github.com page-navigation paste artifacts (`?tab=readme-ov-file`,
         // `?plain=1#L12`, `#readme`) are never part of a repository name:
         // left in, they are percent-encoded into an unresolvable
-        // `/repos/octocat/Hello-World%3Ftab%3D…` request — a misleading
+        // `/repos/octocat/Hello-World%3Ftab%3D…` request - a misleading
         // "GitHub resource not found" on an existing repository (live
         // repro). No GitHub repository name contains `?` or `#`.
         for url in [
@@ -899,7 +930,7 @@ mod tests {
 
     // the single most-pasted profile URL suffix (`?tab=repositories`) and
     // its fragment cousin must classify the URL as a profile (no repository
-    // part), not as a repository named after the artifact-stripped author —
+    // part), not as a repository named after the artifact-stripped author -
     // the pre-fix behavior sent `/repos/{author}/{author}/commits` and
     // failed with a misleading "GitHub resource not found" on an existing
     // profile (live repro)

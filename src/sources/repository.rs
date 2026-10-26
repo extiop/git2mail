@@ -288,7 +288,7 @@ mod tests {
             { "commit": { "author": { "email": "real@x.com" } } },
             // git permits any author-email string: a domainless value (a
             // bare username, seen live in real commit payloads) is not a
-            // mailbox and must never be reported as a found email — the
+            // mailbox and must never be reported as a found email - the
             // `email` subcommand itself rejects it as invalid
             { "commit": { "author": { "name": "Thomas", "email": "jdoe" } } }
         ]);
@@ -401,7 +401,7 @@ mod tests {
         // a repository whose history spans more than the old built-in
         // budget (10 pages) must be walked to the END: the only ceilings
         // are GitHub's (pagination ends on a short page), never a local
-        // constant — 11 full pages plus the short 12th are all scanned
+        // constant - 11 full pages plus the short 12th are all scanned
         let (address, server) = crate::github::mock::serve_requests(move |index, _request| {
             let page = index + 1;
             let per_page = if page < 12 { 100 } else { 37 };

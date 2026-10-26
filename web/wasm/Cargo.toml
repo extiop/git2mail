@@ -1,0 +1,25 @@
+[package]
+name = "git2mail-wasm"
+version = "0.8.0"
+authors = ["extiop"]
+edition = "2024"
+rust-version = "1.88"
+license = "LGPL-3.0-only"
+description = "WebAssembly bindings for the git2mail web site: exposes the pure core (URL rules, email/noreply discipline, payload parsing) to the browser, so the site applies exactly the same rules as the CLI."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+git2mail-core = { path = "../../core" }
+# The bindings glue is confined to this crate: the core stays dependency-clean
+# and the GUI stays in web languages (ANSSI-FR/MLA issue #138's recommended
+# shape; WASI 0.3 + jco remains the documented escape route). Two external
+# dependencies only: the surface is string-typed (JSON in, JSON out), so no
+# JS-object bridge is needed.
+wasm-bindgen = { version = "0.2", default-features = false }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

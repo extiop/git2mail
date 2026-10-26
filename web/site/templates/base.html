@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- GitHub Pages serves no custom response headers: the Content-Security-Policy
+       travels in this meta tag. No third-party origin may ever appear here
+       beyond api.github.com - the page leaks the investigation to nobody but
+       GitHub's API (and its own origin: connect-src needs 'self' for the
+       browser to fetch the wasm module itself). -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https://api.github.com; style-src 'self'; img-src 'self' data:; base-uri 'self'; form-action 'self'">
+  <meta name="referrer" content="no-referrer">
+  <meta name="description" content="{% block description %}{{ config.description }}{% endblock %}">
+  <title>{% block title %}{{ config.title }}{% endblock title %}</title>
+  <link rel="stylesheet" href="{{ get_url(path="site.css", cachebust=true) }}">
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header>
+    <nav aria-label="Main">
+      <a href="{{ config.base_url }}">Scan</a>
+      <a href="{{ config.base_url }}guide/">Command-line tool</a>
+      <a href="{{ get_url(path="@/about/_index.md") }}">About</a>
+    </nav>
+  </header>
+  <main id="content">
+    {% block content %}{% endblock content %}
+  </main>
+  <footer>
+    <p>
+      Found yourself in a result? Those addresses live in public
+      repositories. Nothing is stored on this site. Ask each repository's
+      owner to fix or remove the commit
+      (<a href="https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository">GitHub explains how</a>)
+      and
+      <a href="{{ config.base_url }}guide/QUALITY.html#prevention">protect your own commits</a>.
+    </p>
+    <p>
+      This page is part of the open-source
+      <a href="https://github.com/extiop/git2mail">git2mail</a> project:
+      its source and maintainers live there.
+    </p>
+  </footer>
+  <script type="module" src="{{ get_url(path='js/scan.js', cachebust=true) }}"></script>
+</body>
+</html>

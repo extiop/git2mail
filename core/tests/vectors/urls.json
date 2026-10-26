@@ -1,0 +1,77 @@
+[
+ {
+  "input": "https://github.com/octocat/Hello-World",
+  "expect": {
+   "owner": "octocat",
+   "repository": "Hello-World"
+  }
+ },
+ {
+  "input": "https://github.com/denoland",
+  "expect": {
+   "owner": "denoland",
+   "repository": null
+  }
+ },
+ {
+  "input": "https://github.com/some-user/my-repo/",
+  "expect": {
+   "owner": "some-user",
+   "repository": "my-repo"
+  }
+ },
+ {
+  "input": "https://github.com/octocat/Hello-World?tab=repositories",
+  "expect": {
+   "owner": "octocat",
+   "repository": "Hello-World"
+  }
+ },
+ {
+  "input": "https://github.com/octocat/Hello-World#readme",
+  "expect": {
+   "owner": "octocat",
+   "repository": "Hello-World"
+  }
+ },
+ {
+  "input": "git@github.com:some-user/my-repo.git",
+  "expect": {
+   "owner": "some-user",
+   "repository": "my-repo.git"
+  }
+ },
+ {
+  "input": "HTTPS://GITHUB.COM/some-user/my-repo",
+  "expect": {
+   "owner": "some-user",
+   "repository": "my-repo"
+  }
+ },
+ {
+  "input": "https://gitlab.com/owner/repo",
+  "expect_error": true
+ },
+ {
+  "input": "https://github.com/octocat/Hello-World/tree/main/sub/folder",
+  "expect": {
+   "owner": "octocat",
+   "repository": "Hello-World/tree/main/sub/folder"
+  }
+ },
+ {
+  "input": "https://github.com/%2e%2e/repos/victim/repo",
+  "expect_error": true
+ },
+ {
+  "input": "https://github.com/octocat/%2e%2e",
+  "expect_error": true
+ },
+ {
+  "input": "https://github.com/octocat/re%2e%2e",
+  "expect": {
+   "owner": "octocat",
+   "repository": "re%2e%2e"
+  }
+ }
+]

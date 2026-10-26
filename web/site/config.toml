@@ -1,0 +1,10 @@
+# The git2mail web site: the anonymous scan front door. Deployed by
+# publish_doc.yml at the project Pages root; the mdBook user guide lives
+# beside it under /guide/.
+base_url = "https://extiop.github.io/git2mail/"
+title = "git2mail"
+description = "Find the email addresses developers leave in GitHub's public commit history - the anonymous web scan of the git2mail OSINT tool."
+compile_sass = true
+build_search_index = false
+generate_feeds = false
+
