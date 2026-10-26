@@ -1,4 +1,4 @@
-name: Deploy mdBook to GitHub Pages
+name: Deploy the site (zola + the guide + the wasm scan) to GitHub Pages
 
 permissions: {}
 
@@ -18,16 +18,77 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Install zola (tarball pinned by sha256 - no zola crate exists, the 0.0.0 one is a third-party shim)
+        run: |
+          cd "$(mktemp -d)"
+          curl --fail --location --silent --show-error \
+            --output zola.tar.gz \
+            https://github.com/getzola/zola/releases/download/v0.23.6/zola-v0.23.6-x86_64-unknown-linux-gnu.tar.gz
+          echo "8f5132b3522412d04e395e0b25f6d68613ad272a873e54a2b3ebf664873024a4  zola.tar.gz" | sha256sum --check
+          tar -xzf zola.tar.gz
+          sudo install -m 0755 zola /usr/local/bin/zola
+
+      - name: Install wasm-bindgen-cli at the lockfile's version
+        run: |
+          WASM_BINDGEN_VERSION=$(awk '/name = "wasm-bindgen"/ { getline; gsub(/version = "|"/, ""); print; exit }' Cargo.lock)
+          echo "lockfile pins wasm-bindgen ${WASM_BINDGEN_VERSION}"
+          cargo install wasm-bindgen-cli --locked --version "${WASM_BINDGEN_VERSION}"
+          INSTALLED=$(wasm-bindgen --version | awk '{ print $2 }')
+          if [ "${INSTALLED}" != "${WASM_BINDGEN_VERSION}" ]; then
+            echo "::error::wasm-bindgen-cli (${INSTALLED}) does not match the wasm-bindgen crate version in Cargo.lock (${WASM_BINDGEN_VERSION}) - a mismatch produces wasm glue the runtime module rejects"
+            exit 1
+          fi
+
+      - name: Build the wasm bindings
+        run: cargo build --locked -p git2mail-wasm --target wasm32-unknown-unknown --release
+
+      - name: Shrink the wasm module (binaryen's wasm-opt, a CI tool, no crate budget impact)
+        run: |
+          sudo apt-get install -y --no-install-recommends binaryen
+          wasm-opt -Oz \
+            --enable-bulk-memory --enable-reference-types \
+            -o target/wasm32-unknown-unknown/release/git2mail_wasm.wasm \
+            target/wasm32-unknown-unknown/release/git2mail_wasm.wasm
+
+      - name: Generate the wasm glue into the site's static tree
+        run: |
+          wasm-bindgen --target web \
+            --out-dir web/site/static/wasm \
+            target/wasm32-unknown-unknown/release/git2mail_wasm.wasm
+          WC=$(stat -c '%s' web/site/static/wasm/git2mail_wasm_bg.wasm)
+          echo "git2mail_wasm_bg.wasm: ${WC} bytes ($(( WC / 1024 )) KiB) - generated at deploy time (page load weight)"
+
       - name: Install mdbook
         run: cargo install mdbook --locked --version 0.5.4
 
-      - name: Build the book
+      - name: Build the guide (the mdbook, mounted under /guide/)
         run: mdbook build ./doc
+
+      - name: "Build the site: zola (scan page, about page and 404 at the root)"
+        run: zola build
+        working-directory: web/site
+
+      - name: Merge the Pages artifact (zola at the root, the guide under /guide/, the wasm inside the site tree)
+        run: |
+          mkdir -p site/guide
+          cp -a web/site/public/. site/
+          cp -a doc/book/. site/guide/
+          test -f site/index.html
+          test -f site/404.html
+          test -f site/site.css
+          test -f site/guide/index.html
+          test -f site/js/scan.js
+          test -f site/wasm/git2mail_wasm_bg.wasm
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
-          path: ./doc/book
+          path: ./site
 
   deploy:
     needs: build

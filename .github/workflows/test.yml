@@ -49,6 +49,20 @@ jobs:
         name: ${{ matrix.build }}
         path: ${{ matrix.target && format('./target/{0}/release/git2mail{1}', matrix.target, matrix.extension || '') || format('./target/release/git2mail{0}', matrix.extension || '') }}
 
+  wasm:
+    # The web bindings' acceptance gate: the pure core and the bindings must
+    # compile to wasm32-unknown-unknown without the HTTP stack (the site's
+    # browser logic depends on it; core/src/lib.rs pins this claim).
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - name: Check the wasm compilation of the core and the bindings
+        run: cargo check --locked -p git2mail-core -p git2mail-wasm --target wasm32-unknown-unknown
+
   fmt:
     runs-on: ubuntu-26.04
     steps:
@@ -70,7 +84,7 @@ jobs:
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --no-deps --all-features
+        run: cargo doc --locked --no-deps --all-features --workspace
 
   audit:
     permissions:
