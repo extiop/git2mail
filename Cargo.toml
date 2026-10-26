@@ -15,7 +15,7 @@ categories = ["command-line-utilities"]
 # std-only logic (compiles to wasm32-unknown-unknown, consumed by the web
 # bindings); `web/wasm` holds the WASM bindings of the site.
 [workspace]
-members = ["core"]
+members = ["core", "web/wasm"]
 
 # MLA-style strict workspace lints: the panic-family lints enforce the zero-panic
 # runtime path of the hand-made error handling, `missing_docs` makes the

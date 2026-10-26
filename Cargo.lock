@@ -351,6 +351,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "git2mail-wasm"
+version = "0.8.0"
+dependencies = [
+ "git2mail-core",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
