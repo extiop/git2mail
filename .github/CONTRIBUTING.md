@@ -37,11 +37,20 @@ Do you just want to file an issue for the project? Please do so in GitHub under 
     git checkout -b feature/your-feature-name
     ```
 2. **Make your changes**: edit the code or documentation as needed.
-3. **Test your changes**: ensure your changes do not break existing functionality by running tests.
-4. **Commit your changes**: write clear and concise commit messages:
+3. **Test your changes**: run the full gate suite with the lockfile:
+    ```bash
+    cargo build --locked
+    cargo test --locked
+    cargo fmt -- --check
+    cargo clippy --locked --all-targets -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
+    ```
+4. **Commit your changes**: write conventional, atomic commit messages
+   (one behavioral change per commit, subject like `feat(scope):`, `fix(scope):`,
+   `docs:` or `test:`, the body explaining the why):
     ```bash
     git add .
-    git commit -m "Add a brief description of your changes"
+    git commit -m "fix(sources): describe the change and why it matters"
     ```
 
 ### Submitting your changes

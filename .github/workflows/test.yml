@@ -19,11 +19,11 @@ jobs:
         build: [linux, macos, windows]
         include:
           - build: linux
-            os: ubuntu-latest
+            os: ubuntu-26.04
           - build: macos
-            os: macos-latest
+            os: macos-26
           - build: windows
-            os: windows-latest
+            os: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
             extension: .exe
 
@@ -50,7 +50,7 @@ jobs:
         path: ${{ matrix.target && format('./target/{0}/release/git2mail{1}', matrix.target, matrix.extension || '') || format('./target/release/git2mail{0}', matrix.extension || '') }}
 
   fmt:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
@@ -61,7 +61,7 @@ jobs:
         run: cargo fmt --all -- --check
 
   doc:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
@@ -76,7 +76,7 @@ jobs:
     permissions:
       contents: read
       checks: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Security audit
@@ -85,7 +85,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1

@@ -1,4 +1,9 @@
 [book]
 title = "git2mail"
 authors = ["extiop"]
+description = "Find developers' email addresses on GitHub: repository, profile and keyword scans, reverse email lookup and full user/organization investigations - 100% REST API."
 src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/extiop/git2mail"
+edit-url-template = "https://github.com/extiop/git2mail/edit/main/doc/{path}"

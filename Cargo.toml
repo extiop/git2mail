@@ -1,13 +1,14 @@
 [package]
 name = "git2mail"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["extiop"]
 edition = "2024"
+rust-version = "1.88"
 license = "LGPL-3.0-only"
-description = "OSINT tool that finds developers' email addresses from GitHub repositories and profiles"
+description = "Pure Rust OSINT CLI: uncover the email addresses behind GitHub activity: repository, profile and keyword scans, reverse email lookup, and full user/organization investigations. 100% GitHub REST API, no scraping."
 repository = "https://github.com/extiop/git2mail"
 readme = "README.md"
-keywords = ["github", "osint", "rust", "leak"]
+keywords = ["github", "osint", "rust", "leak", "email"]
 categories = ["command-line-utilities"]
 
 # MLA-style strict lints (single-crate equivalent of the MLA workspace
@@ -24,23 +25,25 @@ missing_docs = "deny"
 # `clippy::all` is denied through the `-D warnings` convention (CI and the
 # verification gate run `cargo clippy --all-targets -- -D warnings`), so the
 # table only pins the restriction-group lints that `-D warnings` would leave
-# allow-by-default: the runtime path must never unwrap, expect, panic, or
-# stub out code. The allowances are the two static regex `LazyLock` inits of
-# `src/parsers.rs` (a static regex failing to compile is a programming
-# error), the `clippy::large_enum_variant` on the CLI `Command` enum (the
-# search subcommand legitimately carries nine optional qualifier flags;
-# boxing them would only obscure the definition), plus the test modules,
+# allow-by-default: the runtime path must never unwrap, expect, panic,
+# hit an `unreachable!` fallback, or stub out code. The only allowances are the two static regex `LazyLock`
+# inits of `src/parsers.rs` (a static regex failing to compile is a
+# programming error) and the one justified production-code expect
+# (`#[expect(clippy::large_enum_variant)]` on the CLI `Command` enum in
+# `src/main.rs` — `expect` instead of `allow`, so the
+# build fails when it stops applying), and the test modules,
 # where failing loudly is the point.
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
 
 [dependencies]
 clap = { version = "4.6", default-features = false, features = ["wrap_help", "derive", "std", "usage", "error-context"] }
 regex = { version = "1.13", default-features = false, features = ["std"] }
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "socks"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 # logging
