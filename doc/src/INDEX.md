@@ -11,10 +11,9 @@ of clicking buttons.
 > through the GitHub REST API. Use it solely for lawful, authorized OSINT
 > research, in accordance with the GitHub Terms of Service and applicable
 > laws: email addresses are personal data in many jurisdictions, and the
-> `results/` and report files this tool writes hold them. The README's
-> [responsible-use note](https://github.com/extiop/git2mail#readme) and
-> [Prevention section](https://github.com/extiop/git2mail#prevention) cover
-> the handling duties in detail.
+> `results/` and report files this tool writes hold them. The handling
+> duties are covered in detail in
+> [Data quality, prevention & limitations](QUALITY.md).
 
 ```
 git2mail scan   --url <github URL> [--token …|--token-file …] [--json <path>]
@@ -47,6 +46,25 @@ variants, secondary accounts, SSH keys); `org` investigates an
 organization's members and repositories. The investigation commands (`user`, `email`, `emails`, `org`) report on
 screen like the scan commands, and through the opt-in JSON report
 (`--json <path>`) when you want to save them (see [Results](OUTPUT.md)).
+
+## What is in this guide
+
+- [Scanning: scan & search](SCANNING.md) — the two core subcommands: URL
+  rules, keyword search, advanced qualifiers, scripting notes.
+- [User investigation](USER.md) — the `user` subcommand: identity
+  history via the noreply technique, email variants, secondary accounts,
+  SSH keys, external contributions.
+- [Organization investigation](ORG.md) — the `org` subcommand: members,
+  repositories, per-repository emails.
+- [Reverse email lookup](EMAIL.md) — the `email`/`emails` subcommands:
+  the candidate-search heuristic, confidence grades, bulk mode.
+- [Reports & files on disk](OUTPUT.md) — terminal output, exit codes,
+  JSON report shapes, developer correlation, result file layout,
+  sanitization and permissions.
+- [Data quality, prevention & limitations](QUALITY.md) — what the
+  findings can prove, how to harden your own exposure, coverage limits.
+- [GitHub API usage](API.md) — requests, pagination, egress (proxies and
+  Tor), rate-limit semantics, caps, search behavior.
 
 ## Installation
 
@@ -104,6 +122,13 @@ aborts the run before any request is sent.
 All tokens are managed by a token pool that allocates them round-robin and
 reacts to rate limiting; [GitHub API usage](API.md) specifies the exact
 behavior.
+
+For unattended jobs (CI, cron), write the token to a `0600` file at
+runtime and pass it with `--token-file`
+(`( umask 077; printf '{"0": "%s"}' "$GH_TOKEN" > tokens.json )`; the
+umask is what makes the file `0600` when it is created; if `tokens.json`
+already exists, `chmod 600 tokens.json` instead), rather than leaking it
+through a process list.
 
 ## Interrupting a run
 

@@ -30,6 +30,66 @@ Two guards bound the loop:
   handling below; the loop can never spin: when every token is exhausted,
   the scan fails with an explicit error instead of retrying forever.
 
+## Network egress: proxies and Tor
+
+The HTTP client honors the standard proxy environment variables exactly
+the way the HTTP stack resolves them, and git2mail checks them at
+startup, announces the proxy actually used, and loudly warns instead of
+silently falling back when a configured proxy is unusable.
+
+### What the stack honors
+
+- `HTTPS_PROXY` (or `https_proxy`) is the primary variable for
+  git2mail's traffic: the tool is HTTPS-only, so an `HTTP_PROXY` value
+  is never used for it (announced as an informational note, since it
+  usually means a proxy is configured but scoped elsewhere).
+- `ALL_PROXY` (or `all_proxy`) is the fallback, used only when the
+  primary variable is absent or unusable.
+- Proxy schemes are **case-sensitive** and lowercase-only: `socks5://`,
+  `socks5h://`, `socks4://`, `socks4a://`, `http://`, `https://` work;
+  `SOCKS5://` is not recognized by the stack (a warning names it).
+- A set-but-empty variable counts as set and shadows its lowercase
+  twin: the run goes direct and the warning says so.
+- A set `NO_PROXY` can bypass the proxy for some hosts: warned about
+  when a proxy is in use.
+- A set `REQUEST_METHOD` (the stack's CGI marker) makes the stack
+  discard every proxy variable: warned about when any proxy variable is
+  set.
+- Proxy values are never logged: a proxy URL can carry embedded
+  credentials.
+
+### Tor
+
+Route a run through Tor with a `socks5h` URL, no flag needed:
+
+```bash
+HTTPS_PROXY=socks5h://127.0.0.1:9050 git2mail scan --url "$TARGET_URL" --token-file tokens.json
+```
+
+`socks5h` asks the proxy to resolve hostnames (verified against the
+bundled HTTP stack: the `socks5h` scheme maps to proxy-side DNS
+resolution); plain `socks5` resolves hostnames locally, which leaks
+every lookup's hostname to the local resolver — prefer `socks5h` for
+Tor.
+
+Two honesty notes, stated plainly:
+
+- **The startup check proves the proxy at launch, not the whole run's
+  path.** It resolves the environment exactly like the HTTP stack and
+  announces the proxy in use, but it is not a continuous guarantee:
+  before a sensitive run, verify your exit IP.
+- **Anonymous runs through Tor are practically unusable**: GitHub's
+  anonymous quota (about 60 requests per hour) is shared by every user
+  of that exit node, so a shared exit is spent before your first scan
+  finishes. With a token, the quota is per token (5,000 requests per
+  hour), but expect more frequent secondary-limit pauses (the tool
+  parks a token until its window passes and rotates to the next one);
+  the park semantics are described in [Rate limits](#rate-limits).
+
+GitHub applies the same rate limits and the same abuse detection
+whatever the request's origin; this guide documents what the stack
+honors, not techniques to avoid either.
+
 ## Rate limits
 
 GitHub rate limits come in two flavors, and the client reacts to each one
