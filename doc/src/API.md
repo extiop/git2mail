@@ -37,7 +37,7 @@ same precedence rules the HTTP stack applies, and git2mail checks them
 at startup, announces the proxy actually used, and loudly warns instead
 of silently falling back when a configured proxy is unusable (the check
 mirrors the stack conservatively: a value it cannot vouch for is warned
-about, which only ever over-warns — never the reverse).
+about, which only ever over-warns - never the reverse).
 
 ### What the stack honors
 
@@ -50,12 +50,12 @@ about, which only ever over-warns — never the reverse).
 - Proxy schemes: the `http` and `https` schemes are accepted
   case-insensitively (`HTTP://proxy:8080` works); the `socks` schemes
   (`socks5://`, `socks5h://`, `socks4://`, `socks4a://`) are matched
-  case-**sensitively** and lowercase-only — `SOCKS5://` is not
+  case-**sensitively** and lowercase-only - `SOCKS5://` is not
   recognized by the stack (a warning names it). A scheme-less bare
   authority is assumed `http`.
 - A set-but-empty variable counts as set and shadows its lowercase
-  twin: the fallback (if any) is used instead — when no fallback
-  exists, the run goes direct — and the warning names the outcome.
+  twin: the fallback (if any) is used instead - when no fallback
+  exists, the run goes direct - and the warning names the outcome.
 - A set `NO_PROXY` can bypass the proxy for some hosts: warned about
   when a proxy is in use.
 - A set `REQUEST_METHOD` (the stack's CGI marker) makes the stack
@@ -75,7 +75,7 @@ HTTPS_PROXY=socks5h://127.0.0.1:9050 git2mail scan --url "$TARGET_URL" --token-f
 `socks5h` asks the proxy to resolve hostnames (verified against the
 bundled HTTP stack: the `socks5h` scheme maps to proxy-side DNS
 resolution); plain `socks5` resolves hostnames locally, which leaks
-every lookup's hostname to the local resolver — prefer `socks5h` for
+every lookup's hostname to the local resolver - prefer `socks5h` for
 Tor.
 
 Two honesty notes, stated plainly:
@@ -110,7 +110,7 @@ spent, and which quota decides the reaction:
   **parked** until the instant the `x-ratelimit-reset` header names (capped
   at one hour so a hostile header cannot park it indefinitely), then
   returns automatically, and the request is retried with the next available
-  token. A spent allowance is a pause, not a death: a long parallel scan
+  token. A spent quota is a pause, not a death: a long parallel scan
   gets its token back at the reset. When the header is absent (a middlebox
   stripped it), there is no known window to wait for: the token is
   **retired** (removed from the allocation pool for the rest of the run)
@@ -130,8 +130,12 @@ windows stops with the dedicated paused message ("wait a few minutes",
 `RateLimitPaused`).
 
 A `403` with `x-ratelimit-remaining` above `0` is a genuine refusal (for
-example a private or missing resource) and is **not** treated as rate limiting, unless it carries a `Retry-After` header, the secondary-limit body, or a primary-limit body whose quota header a middlebox stripped (the body text "API rate limit exceeded" is treated as transient too, since the missing header makes the two indistinguishable); those cases park the token
-instead (see below).
+example a private or missing resource) and is **not** treated as rate
+limiting, unless it carries a `Retry-After` header, the secondary-limit
+body, or a primary-limit body whose quota header a middlebox stripped
+(the body text "API rate limit exceeded" is treated as transient too,
+since the missing header makes the two indistinguishable). Any of these
+three park the token instead (see below).
 
 ### Secondary limit (abuse detection)
 

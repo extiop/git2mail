@@ -10,7 +10,7 @@ git2mail org "acme" --token-file tokens.json
 
 As with the user investigation, a token is strongly recommended: an org
 scan walks every listed repository and aborts on a spent anonymous
-allowance. Forked repositories are skipped with a warning (like the
+quota. Forked repositories are skipped with a warning (like the
 `user` investigation): their commit history mirrors the upstream
 project's, so scanning them would report other projects' developers.
 Pass `--include-forks` to scan them too when the forks themselves are
@@ -38,7 +38,7 @@ REPOSITORIES / EMAILS) and in the opt-in JSON report.
   the parallel `search`, reported per repository and globally (noreply
   addresses excluded, like every scan). The found addresses are also
   saved to `results/org/<org>.log`, one per line, the same paste-able
-  file the scan subcommands write. For an exposure audit, the
+  file the scan and user subcommands write. For an exposure audit, the
   `per_repository` map is the finding: it tells you which repository
   leaks which addresses; attribute a person to an address with
   `git2mail email <address>` before contacting them.
@@ -81,5 +81,5 @@ scan and search reports, aggregating the developers found across the
 organization's repositories. A repository that is private, deleted or
 empty is skipped with a warning; a rate-limit or transport failure
 aborts the investigation, and so does a dedicated token dying mid-scan
-(a revoked token is not a spent allowance: the run aborts with the
+(a revoked token is not a spent quota: the run aborts with the
 token's real error instead of writing a complete-looking report).

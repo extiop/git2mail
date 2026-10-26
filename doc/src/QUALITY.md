@@ -17,7 +17,7 @@ commit URL as `https://github.com/<owner>/<repo>/commit/<sha>`. The
 sha, so the reverse lookup is the evidence step.
 
 A note on pull requests: when a contributor's pull request was
-squash-merged through GitHub's web interface, the squashed commit's
+squash-merged (combined into one commit) through GitHub's web interface, the squashed commit's
 **author** email is the contributor's private
 `id+username@users.noreply.github.com` alias (GitHub stamps its own
 web-flow identity, `noreply@github.com`, as the **committer**). The

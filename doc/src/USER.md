@@ -8,8 +8,8 @@ git2mail user "jane-doe" --token "$YOUR_TOKEN"
 ```
 
 This investigation walks many pages: a token is strongly recommended (an
-anonymous account gets only 60 requests per hour and the walk aborts
-when the allowance is spent).
+anonymous account gets only 60 requests per hour and the walk (the
+page-by-page listing traversal) aborts when the quota is spent).
 
 It accepts the shared `--token`/`--token-file`/`--json` flags and
 reports, both in the terminal log and in the opt-in JSON report. The
@@ -102,7 +102,8 @@ write.
   repositories found.
 
 Like every repository scan, each target repository's commit walk covers
-the full default-branch history with no local budget: the walk ends when
+the full default-branch history (the branch a project presents as its
+main line) with no local budget: the walk ends when
 GitHub's listing ends, so the report never silently pretends it saw only
 part of a history.
 

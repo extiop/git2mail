@@ -118,7 +118,8 @@ write to a timestamped file name and swap the symlink yourself.
 ```
 
 `request` appears only on a `search` report (the query provenance: the
-qualifiers that were not provided are omitted, not `null`);
+qualifiers that were not provided are omitted, not `null`).
+
 Forked repositories are skipped on the `user`, `org` and `search` subcommands (a warning names the
 `--include-forks` opt-in when the skip fires). The reverse-email candidate search keeps forks: it
 wants any repository carrying the address, including forks of the subject's own work.
@@ -138,7 +139,7 @@ multi-token scan this follows worker completion order and may vary between
 runs), and the total number of hits. `last_commit_date` is the most
 recent commit author date seen for the author (the raw ISO 8601 UTC stamp
 of the API payload): a freshness indicator for the exposure (self-declared,
-forgeable commit metadata, exactly like the author name — never a proof).
+forgeable commit metadata, exactly like the author name - never a proof).
 `scan`, `search` and `org` can also
 export this same per-author report as a CSV spreadsheet with `--csv
 <path>` (one row per author: `author_name, emails, repositories,
@@ -188,7 +189,9 @@ as the scan subcommands, at `results/org/<org>.log` and
   length), so re-running the interrupted lookups needs no diff of two
   files. Every report carries `generated_at` and `tool_version`. The bulk
   run has no CSV deliverable (its report carries no per-author
-  correlation): the `--json` report is its file output.
+  correlation): the `--json` report is its file output. On the other
+  subcommands (`user`, `email`, `emails`) `--csv` is accepted, warned
+  about, and ignored.
 
 ## Developer correlation
 
@@ -280,7 +283,7 @@ Scan targets become file names after sanitization:
   still refreshes its own file by design). An unchanged name keeps its
   exact file name, whatever its case; on a case-insensitive filesystem
   (macOS APFS, Windows NTFS) two targets differing only by case share one
-  file name — the exact target is visible in every report line and in the
+  file name - the exact target is visible in every report line and in the
   JSON report;
 - a name longer than 200 bytes is cut on a character boundary and carries
   the same hash (taken over the full raw name, so two distinct long queries sharing a prefix stay distinct), and the write can no longer fail after

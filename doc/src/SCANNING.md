@@ -12,7 +12,7 @@ git2mail scan --url https://github.com/denoland/deno
 git2mail scan --url https://github.com/denoland
 ```
 
-Use a specific token to be authenticated and fetch a large amount of
+Use a token to authenticate and fetch many more
 commits:
 
 ```bash
@@ -27,7 +27,7 @@ warning is logged (a whitespace-only `--token` counts as absent and falls
 back to `--token-file`).
 
 If you don't have a token yet, you can still try the tool: simply leave
-`--token` out. GitHub then allows only about 60 lookups per hour, so a
+`--token` out. GitHub then allows only about 60 requests per hour, so a
 token is recommended for any real scan.
 
 ### Repository URL rules

@@ -17,8 +17,9 @@ default-branch history of every candidate repository (until a
 `commit-author` match ends the lookup early), far beyond the anonymous
 60-requests-per-hour budget.
 
-GitHub exposes no email search API, so this subcommand is a **documented
-heuristic**, 100% API (no clone, no scraping).
+GitHub exposes no email search API, so this subcommand is a
+**documented heuristic** - a stated, test-pinned search strategy, not
+an exact index - 100% API (no clone, no scraping).
 
 ## How the heuristic works
 
