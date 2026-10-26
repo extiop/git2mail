@@ -200,12 +200,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
-      - name: Publish to crates.io
-        # git2mail-core's FIRST release goes out by hand: crates.io cannot
-        # attach a Trusted Publisher to a name that does not exist yet
-        # (pending publishers are a deferred item in RFC 3691). Once core
-        # exists and its trusted publisher is configured on crates.io, this
-        # job publishes both crates - core first, then the CLI.
+      - name: Publish the core crate to crates.io
+        # core first: the CLI's dependency resolution needs it on the
+        # registry before `cargo publish --package git2mail` runs. Both
+        # publishes go through the crate's Trusted Publisher (registered
+        # once 0.8.0 had landed core's first, hand-pushed release)
+        run: cargo publish --package git2mail-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: Publish the CLI to crates.io
         run: cargo publish --package git2mail
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
