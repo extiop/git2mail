@@ -1869,6 +1869,91 @@ mod tests {
     }
 
     #[test]
+    fn a_search_quota_403_with_an_unremarkable_body_still_parks() {
+        use crate::github::mock::serve_requests;
+        // The mutation-resistant pin for the spent-search-quota disjunct:
+        // every OTHER parking path is silent here - the status is 403 (not
+        // a 429), there is no Retry-After header, and the body announces
+        // nothing rate-limit shaped. Only `exhausted + the search
+        // resource` can explain the parking: deleting
+        // `|| spent_search_quota` from the classification retires the
+        // token instead and this test fails.
+        let (address, server) = serve_requests(move |index, _request| {
+            if index == 0 {
+                return (
+                    403,
+                    vec![
+                        ("X-RateLimit-Remaining".to_string(), "0".to_string()),
+                        ("X-RateLimit-Resource".to_string(), "search".to_string()),
+                    ],
+                    "your proxy refused this for its own reasons".to_string(),
+                );
+            }
+            (200, vec![], r#"{"ok": true}"#.to_string())
+        });
+
+        let pool = TokenPool::from_token_file(&crate::github::mock::temp_token_file(
+            r#"{"0": "ghp_a", "1": "ghp_b"}"#,
+            30,
+        ))
+        .expect("token file must load");
+        let client = Client::new(pool).expect("client must build");
+        let json = client
+            .get_json(&format!("{address}/search/repositories?q=x"))
+            .expect("the search-quota blip must rotate to the healthy token");
+        assert_eq!(json["ok"], serde_json::json!(true));
+
+        let exhausted = client.tokens.exhausted.lock().expect("unpoisoned lock");
+        assert!(
+            matches!(exhausted.get(&0), Some(Some(_))),
+            "the unremarkable body must not change the search-exemption contract: {:?}",
+            exhausted.get(&0)
+        );
+        drop(exhausted);
+        server.join();
+    }
+
+    #[test]
+    fn a_core_quota_403_with_an_unremarkable_body_retires() {
+        use crate::github::mock::serve_requests;
+        // The control of the pin above: the same spent headers on a CORE
+        // endpoint, with the same body that announces nothing - the
+        // primary classification must retire the token (the hourly quota
+        // is spent), proving the parking test above comes from the search
+        // exemption and not from anything body- or status-shaped.
+        let (address, server) = serve_requests(move |index, _request| {
+            if index == 0 {
+                return (
+                    403,
+                    vec![("X-RateLimit-Remaining".to_string(), "0".to_string())],
+                    "your proxy refused this for its own reasons".to_string(),
+                );
+            }
+            (200, vec![], r#"{"ok": true}"#.to_string())
+        });
+
+        let pool = TokenPool::from_token_file(&crate::github::mock::temp_token_file(
+            r#"{"0": "ghp_a", "1": "ghp_b"}"#,
+            30,
+        ))
+        .expect("token file must load");
+        let client = Client::new(pool).expect("client must build");
+        let json = client
+            .get_json(&format!("{address}/repos/owner/repo/commits?per_page=100"))
+            .expect("the retired token must rotate to the healthy one");
+        assert_eq!(json["ok"], serde_json::json!(true));
+
+        let exhausted = client.tokens.exhausted.lock().expect("unpoisoned lock");
+        assert!(
+            matches!(exhausted.get(&0), Some(None)),
+            "a spent core quota with an unremarkable body must retire the token: {:?}",
+            exhausted.get(&0)
+        );
+        drop(exhausted);
+        server.join();
+    }
+
+    #[test]
     fn from_token_rejects_internal_whitespace_in_the_value() {
         // a space is a legal header-value byte: a token like `ghp_ abc`
         // used to pass load-time validation, be sent verbatim in the

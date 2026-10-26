@@ -250,6 +250,43 @@ fn variant_pattern_value(pattern: &str) -> Result<String, String> {
 /// Writes one JSON report when a `--json` path was requested, warning (not
 /// failing) on a write error: the caller surfaces its own primary error
 /// instead (the findings must not vanish from both outputs at once).
+/// Whether an aborted bulk run's partial report carries anything worth
+/// preserving: a run stopped before its FIRST lookup completed has an
+/// empty `results` and an empty `skipped_addresses`, and writing it over
+/// a previous good report would destroy the user's earlier deliverable.
+fn should_preserve_partial_report(report: &email::BulkReport) -> bool {
+    !report.results.is_empty() || !report.skipped_addresses.is_empty()
+}
+
+/// The process exit code a failed run ends with: `3` distinguishes a live
+/// target that simply exposed nothing (an empty `scan` or `search` - the
+/// JSON report is still written when `--json` was requested) from a real
+/// failure (`1`), so scripting can branch on it (the guide's exit-code
+/// section documents the contract). `0` is success and `2` is clap's own
+/// argument-error code, neither of which runs through this map.
+fn exit_code_for(error: &Error) -> i32 {
+    if matches!(error, Error::NoResults) {
+        3
+    } else {
+        1
+    }
+}
+
+/// The `--csv` no-effect notice for the subcommands whose reports carry no
+/// per-author correlation, or `None` when the flag applies (scan, search,
+/// org) or was not requested.
+fn csv_no_effect_notice(requested: bool, command: &Command) -> Option<&'static str> {
+    if !requested {
+        return None;
+    }
+    match command {
+        Command::Scan { .. } | Command::Search { .. } | Command::Org { .. } => None,
+        _ => Some(
+            "--csv has no effect here: the CSV export applies to scan, search and org only (use --json for this subcommand's report)",
+        ),
+    }
+}
+
 fn write_json_best_effort<T: serde::Serialize>(path: Option<&PathBuf>, report: &T) {
     if let Some(path) = path
         && let Err(json_err) = output::write_report_json(path, report)
@@ -306,14 +343,8 @@ fn run() -> Result<(), Error> {
     // a per-author correlation): on the other subcommands the flag is
     // pre-validated above but never written, so say so instead of a silent
     // no-op
-    let csv_supported = matches!(
-        cli.command,
-        Command::Scan { .. } | Command::Search { .. } | Command::Org { .. }
-    );
-    if csv.is_some() && !csv_supported {
-        log::warn!(
-            "--csv has no effect here: the CSV export applies to scan, search and org only (use --json for this subcommand's report)"
-        );
+    if let Some(notice) = csv_no_effect_notice(csv.is_some(), &cli.command) {
+        log::warn!("{}", notice);
     }
 
     match cli.command {
@@ -364,7 +395,7 @@ fn run() -> Result<(), Error> {
                     // FIRST lookup completed has nothing to preserve, and
                     // overwriting a previous good report with an empty one
                     // would destroy the user's earlier deliverable
-                    if !report.results.is_empty() || !report.skipped_addresses.is_empty() {
+                    if should_preserve_partial_report(&report) {
                         write_json_best_effort(Some(path), &report);
                     }
                 } else {
@@ -696,12 +727,7 @@ fn main() {
         // scan/search result): scripting branches on it to tell a live but
         // email-less target apart from a real failure (documented in the
         // user guide's exit-code and scripting-notes sections)
-        let code = if matches!(err, Error::NoResults) {
-            3
-        } else {
-            1
-        };
-        std::process::exit(code);
+        std::process::exit(exit_code_for(&err));
     }
 }
 
@@ -1257,6 +1283,215 @@ mod tests {
                 .expect("report must be valid JSON");
         assert_eq!(report["emails"], serde_json::json!([]));
         std::fs::remove_file(&json_path).ok();
+    }
+
+    #[test]
+    fn write_outputs_writes_the_csv_deliverable_and_the_header_only_when_empty() {
+        // the CSV contract is scan/search/org only: the correlation lands
+        // as `;`-joined rows under the pinned header, and an empty
+        // correlation still writes the file (header alone) - a missing file
+        // would read as a crash, not as "no authors found"
+        // `write_text` lays out `results/` relative to the process CWD, and
+        // sibling tests chdir the whole process (the blocked-text-write test
+        // even plants a file named `results`): the run must hold the same
+        // CWD lock, or the relative layout races their temp directory
+        in_temp_cwd(|| {
+            let scanner = Scanner::new(None, None).expect("anonymous scanner must build");
+            let mut outcome = ScanOutcome {
+                emails: vec!["dev@example.com".to_string()],
+                repos_scanned: 1,
+                ..ScanOutcome::default()
+            };
+            outcome.correlation = git2mail::correlate::Correlation {
+                authors: vec![git2mail::correlate::AuthorReport {
+                    author: "Jane Doe".to_string(),
+                    emails: vec!["jane@example.com".to_string()],
+                    repos: vec![],
+                    languages: vec![],
+                    first_seen_repo: "owner/repo".to_string(),
+                    total_hits: 1,
+                    last_commit_date: None,
+                }],
+            };
+            let csv_path = std::env::temp_dir().join(format!(
+                "git2mail_main_test_{}_correlation.csv",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&csv_path);
+            let json_path = std::env::temp_dir().join(format!(
+                "git2mail_main_test_{}_correlation.json",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&json_path);
+
+            write_outputs(
+                OutputNaming {
+                    target: "target",
+                    mode: "repository",
+                    directory: "repository",
+                    file_name: "acme_lib".to_string(),
+                    request: None,
+                },
+                outcome,
+                Some(json_path),
+                Some(csv_path.clone()),
+                &scanner,
+            )
+            .expect("a non-empty scan with both deliverables must succeed");
+
+            let csv = std::fs::read_to_string(&csv_path).expect("the CSV must exist");
+            let mut lines = csv.lines();
+            assert_eq!(
+                lines.next(),
+                Some("author_name,emails,repositories,dominant_language,commits"),
+                "the pinned header row must open the file"
+            );
+            assert!(
+                lines
+                    .next()
+                    .expect("the correlation row")
+                    .contains("Jane Doe"),
+                "the author row must follow"
+            );
+            std::fs::remove_file(&csv_path).ok();
+
+            // the empty scan: the CSV exists, header alone
+            let outcome = ScanOutcome::default();
+            let error = write_outputs(
+                OutputNaming {
+                    target: "target",
+                    mode: "search",
+                    directory: "keyword",
+                    file_name: "query".to_string(),
+                    request: None,
+                },
+                outcome,
+                None,
+                Some(csv_path.clone()),
+                &scanner,
+            )
+            .expect_err("an empty scan must still report no result");
+            assert!(matches!(error, Error::NoResults));
+            let csv = std::fs::read_to_string(&csv_path).expect("the header-only CSV must exist");
+            assert_eq!(
+                csv.lines().collect::<Vec<_>>(),
+                vec!["author_name,emails,repositories,dominant_language,commits"],
+                "an empty correlation writes the header alone"
+            );
+            std::fs::remove_file(&csv_path).ok();
+        });
+    }
+
+    fn shared_args() -> SharedArgs {
+        SharedArgs {
+            token: None,
+            token_file: None,
+            json: None,
+            csv: None,
+        }
+    }
+
+    #[test]
+    fn the_csv_no_effect_notice_names_the_subcommands_that_carry_it() {
+        // byte-exact: the notice is the only place the visitor learns the
+        // flag was accepted but will not produce a file
+        assert_eq!(
+            csv_no_effect_notice(
+                true,
+                &Command::Email {
+                    shared: shared_args(),
+                    address: "a@b.c".to_string(),
+                }
+            ),
+            Some(
+                "--csv has no effect here: the CSV export applies to scan, search and org only (use --json for this subcommand's report)"
+            )
+        );
+        // not requested: silent, whatever the subcommand
+        assert_eq!(
+            csv_no_effect_notice(
+                false,
+                &Command::Email {
+                    shared: shared_args(),
+                    address: "a@b.c".to_string(),
+                }
+            ),
+            None
+        );
+        // the deliverable subcommands: silent even when requested
+        assert_eq!(
+            csv_no_effect_notice(
+                true,
+                &Command::Scan {
+                    url: "https://github.com/o/r".to_string(),
+                    shared: shared_args(),
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_exit_code_map_separates_a_live_empty_target_from_a_failure() {
+        // the scripting contract (guide, exit-code section): 3 is "the run
+        // completed but found nothing", 1 is everything else - clap owns 2
+        // and success is 0, neither runs through this map
+        assert_eq!(exit_code_for(&Error::NoResults), 3);
+        assert_eq!(
+            exit_code_for(&Error::InvalidUrl("not a url".to_string())),
+            1
+        );
+    }
+
+    #[test]
+    fn an_aborted_bulk_report_is_preserved_only_when_it_carries_something() {
+        // the guard behind the bulk --json best-effort write: a report with
+        // results or skipped addresses is worth the file, an empty one
+        // would overwrite a previous good deliverable with nothing
+        let carried = email::BulkReport {
+            provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
+            results: vec![email::EmailReport {
+                provenance: crate::output::Provenance::now(env!("CARGO_PKG_VERSION")),
+                email: "a@b.c".to_string(),
+                account: None,
+                evidence: None,
+                candidate_accounts: vec![],
+            }],
+            skipped_addresses: vec![],
+            summary: email::BulkSummary {
+                total: 1,
+                matched: 0,
+                unmatched: 1,
+                skipped: 0,
+            },
+        };
+        assert!(should_preserve_partial_report(&carried));
+
+        let skipped_only = email::BulkReport {
+            provenance: carried.provenance.clone(),
+            results: vec![],
+            skipped_addresses: vec!["never-reached@b.c".to_string()],
+            summary: email::BulkSummary {
+                total: 1,
+                matched: 0,
+                unmatched: 0,
+                skipped: 1,
+            },
+        };
+        assert!(should_preserve_partial_report(&skipped_only));
+
+        let empty = email::BulkReport {
+            provenance: carried.provenance.clone(),
+            results: vec![],
+            skipped_addresses: vec![],
+            summary: email::BulkSummary {
+                total: 0,
+                matched: 0,
+                unmatched: 0,
+                skipped: 0,
+            },
+        };
+        assert!(!should_preserve_partial_report(&empty));
     }
 
     /// A CWD-isolated body for the tests that exercise the legacy
