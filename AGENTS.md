@@ -42,7 +42,7 @@ an async runtime "just this once".
 1. **Dependency budgets are per crate, and small.** The CLI crate
    (`git2mail`, published): **≤ 7 external direct dependencies, all
    `default-features = false`** - `clap`, `regex`, `reqwest`, `serde`,
-   `serde_json`, `log`, `pretty_env_logger` - plus the workspace's own
+   `serde_json`, `log`, `env_logger` - plus the workspace's own
    `git2mail-core` path dependency (not an external dependency: it is
    this repo's code). **No new external dependency ever**,
    including dev-dependencies. Need percent-encoding, date math, JSON

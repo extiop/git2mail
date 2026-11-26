@@ -670,7 +670,7 @@ fn write_outputs(
 /// `filter_level` directive is replaced by the ones parsed from
 /// `RUST_LOG`). Returned unbuilt so tests can pin the effective default
 /// filter without installing a global logger.
-fn build_logger() -> pretty_env_logger::env_logger::Builder {
+fn build_logger() -> env_logger::Builder {
     // the value is only read: mutating the environment in tests would race
     // the other tests' concurrent `getenv` calls (which is why `set_var` is
     // `unsafe`), so the ambient value is injected as a parameter instead
@@ -681,13 +681,11 @@ fn build_logger() -> pretty_env_logger::env_logger::Builder {
 /// blank value) leaves the default `info` filter, a set value replaces it
 /// entirely (the same semantics as parsing the variable). Tests inject the
 /// value instead of mutating the process environment.
-fn build_logger_with_ambient_filter(
-    rust_log: Option<&str>,
-) -> pretty_env_logger::env_logger::Builder {
-    // `pretty_env_logger` re-exports its `env_logger` dependency
-    // (`#[doc(hidden)] pub extern crate`), which lets the helper name the
-    // returned builder type without adding a direct dependency
-    let mut builder = pretty_env_logger::formatted_builder();
+fn build_logger_with_ambient_filter(rust_log: Option<&str>) -> env_logger::Builder {
+    // `env_logger` is a direct dependency: the returned builder type comes
+    // from here, and the pretty wrapper (`pretty_env_logger`) is not needed
+    // because this helper installs its own format below
+    let mut builder = env_logger::Builder::new();
     // The terminal report vocabulary is `[+]` success / `[-]` error /
     // `[!]` warning / `[.]` informational listing, so a
     // warning must carry its own scannable marker (`[!]`) - otherwise a
