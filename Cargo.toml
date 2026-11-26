@@ -54,7 +54,7 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 # logging
 log = { version = "0.4", default-features = false, features = ["std"] }
-pretty_env_logger = { version = "0.5", default-features = false }
+env_logger = { version = "0.10", default-features = false, features = ["regex"] }
 # the pure core (URL parsing, email rules, sanitization, correlation,
 # variants, payload parsing) extracted so the web bindings can compile it
 # to wasm32-unknown-unknown
